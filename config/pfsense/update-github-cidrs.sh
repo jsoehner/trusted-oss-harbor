@@ -5,7 +5,30 @@
 # ==============================================================================
 set -euo pipefail
 
-OUTPUT_FILE="${1:-/tmp/github_actions_cidrs.txt}"
+OUTPUT_FILE="/tmp/github_actions_cidrs.txt"
+DRY_RUN="false"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN="true"
+      shift
+      ;;
+    -o|--output)
+      OUTPUT_FILE="$2"
+      shift 2
+      ;;
+    -*)
+      echo "[ERROR] Unknown option: $1" >&2
+      exit 1
+      ;;
+    *)
+      OUTPUT_FILE="$1"
+      shift
+      ;;
+  esac
+done
+
 TMP_FILE="$(mktemp)"
 trap 'rm -f "${TMP_FILE}"' EXIT
 
@@ -20,7 +43,12 @@ if [[ "${LINE_COUNT}" -lt 10 ]]; then
   exit 1
 fi
 
-mkdir -p "$(dirname "${OUTPUT_FILE}")"
+if [[ "${DRY_RUN}" == "true" ]]; then
+  echo "[DRY-RUN] Verified ${LINE_COUNT} GitHub Actions CIDRs (would write to ${OUTPUT_FILE})"
+  exit 0
+fi
+
+mkdir -p "$(dirname -- "${OUTPUT_FILE}")"
 mv "${TMP_FILE}" "${OUTPUT_FILE}"
 chmod 0644 "${OUTPUT_FILE}"
 echo "[OK] Wrote ${LINE_COUNT} GitHub Actions CIDRs to ${OUTPUT_FILE}"

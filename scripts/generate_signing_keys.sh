@@ -7,6 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+CALLER_OSS_DATA_ROOT="${OSS_DATA_ROOT:-}"
 if [[ -f "${PROJECT_ROOT}/.env" ]]; then
   # shellcheck disable=SC1091
   source "${PROJECT_ROOT}/.env"
@@ -15,7 +16,7 @@ else
   source "${PROJECT_ROOT}/.env.example"
 fi
 
-OSS_DATA_ROOT="${OSS_DATA_ROOT:-/home/jsoehner/trusted-oss-data}"
+OSS_DATA_ROOT="${CALLER_OSS_DATA_ROOT:-${OSS_DATA_ROOT:-/home/jsoehner/trusted-oss-data}}"
 GNUPGHOME="${OSS_DATA_ROOT}/keys/gnupg"
 PUBLIC_KEYS_DIR="${OSS_DATA_ROOT}/keys/public"
 GPG_KEY_NAME="${GPG_KEY_NAME:-Trusted OSS Supply Chain Authority}"

@@ -3,6 +3,7 @@
 from contextlib import asynccontextmanager
 import json
 from pathlib import Path
+import secrets
 from typing import Annotated, Any
 
 import httpx
@@ -170,7 +171,9 @@ async def ingest_artifact(
     x_simulated_cvss: Annotated[float, Header()] = 0.0,
 ) -> JSONResponse:
     """Ingest, ClamAV-scan, CVE-verify, GPG-sign, and promote a Maven or PyPI artifact."""
-    if x_gatekeeper_token != settings.gatekeeper_admin_token:
+    if not x_gatekeeper_token or not secrets.compare_digest(
+        x_gatekeeper_token, settings.gatekeeper_admin_token
+    ):
         raise HTTPException(status_code=403, detail="Invalid gatekeeper admin token")
 
     if ecosystem == "maven":
@@ -283,7 +286,7 @@ async def get_pypi_trusted_package_file(
     filename: str,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> FileResponse:
-    """Serve only GPG-signed Python wheels/sdists and their .asc signatures."""
+    """Serve only GPG-signed Python wheels/sdists and their .asc/.sha256/.sha512 files."""
     try:
         norm_pkg = normalize_pypi_name(package)
         rel_path = f"{norm_pkg}/{filename}"
@@ -291,14 +294,41 @@ async def get_pypi_trusted_package_file(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    base_filename = filename
+    for suffix in (".asc", ".sha256", ".sha512"):
+        if filename.endswith(suffix):
+            base_filename = filename[: -len(suffix)]
+            break
+
+    base_rel_path = f"{norm_pkg}/{base_filename}"
+    base_file = resolve_safe_relative_path(settings.trusted_pypi_dir, base_rel_path)
+
+    if not base_file.exists() and settings.auto_promote_clean_artifacts:
+        upstream_url = f"{settings.upstream_pypi_simple_url.rstrip('/')}/{base_rel_path}"
+        staged_file = resolve_safe_relative_path(
+            settings.quarantine_dir, f"pypi/{base_rel_path}"
+        )
+        staged_file.parent.mkdir(parents=True, exist_ok=True)
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+            resp = await client.get(upstream_url)
+            if resp.status_code != 200:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"PyPI artifact not found in trusted store or upstream: {base_rel_path}",
+                )
+            staged_file.write_bytes(resp.content)
+
+        await quarantine_scan_sign_and_promote(
+            staged_file=staged_file,
+            dest_file=base_file,
+            ecosystem="pypi",
+            artifact_rel_path=base_rel_path,
+            settings=settings,
+        )
+
     if not requested_file.exists():
         raise HTTPException(status_code=404, detail="Trusted PyPI artifact not found")
 
-    base_file = (
-        requested_file.with_name(requested_file.name[:-4])
-        if requested_file.name.endswith(".asc")
-        else requested_file
-    )
     base_sig = base_file.with_name(f"{base_file.name}.asc")
     if not verify_artifact_signature(base_file, base_sig, settings.gnupghome):
         raise HTTPException(
