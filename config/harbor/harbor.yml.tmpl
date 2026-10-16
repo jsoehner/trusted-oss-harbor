@@ -11,8 +11,24 @@ https:
   certificate: ${OSS_DATA_ROOT}/harbor/secret/cert/server.crt
   private_key: ${OSS_DATA_ROOT}/harbor/secret/cert/server.key
 
-# Persistent host volume where all OCI blobs, manifests, DB, and Redis live
+# Persistent host volume where all OCI blobs, manifests, DB, and Redis live.
+# Phase 1 (Current): /home/jsoehner/trusted-oss-data/harbor
+# Phase 2 (Roadmap): /mnt/truenas-iscsi-oss/harbor (TrueNAS iSCSI block storage LUN)
 data_volume: ${OSS_DATA_ROOT}/harbor
+
+# Optional Phase 3 Roadmap: External Object Storage (e.g., TrueNAS MinIO/S3 or iSCSI-backed S3)
+# When using a dedicated TrueNAS iSCSI block device mounted at ${OSS_DATA_ROOT}, Harbor's
+# default filesystem driver writes directly to the XFS/ZFS-backed iSCSI block mount.
+# Uncomment storage_service below only if switching Harbor's registry blobs to S3 API:
+# storage_service:
+#   s3:
+#     bucket: trusted-oss-registry
+#     regionendpoint: https://truenas-s3.internal.lan:9000
+#     accesskey: ${TRUENAS_S3_ACCESS_KEY}
+#     secretkey: ${TRUENAS_S3_SECRET_KEY}
+#     secure: true
+#     v4auth: true
+#     rootdirectory: /harbor-registry
 
 harbor_admin_password: ${HARBOR_ADMIN_PASSWORD}
 

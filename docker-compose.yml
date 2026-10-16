@@ -6,7 +6,7 @@ services:
     container_name: oss-clamav
     restart: unless-stopped
     volumes:
-      - ${OSS_DATA_ROOT:-/srv/trusted-oss}/scanners/clamav:/var/lib/clamav
+      - ${OSS_DATA_ROOT:-/home/jsoehner/trusted-oss-data}/scanners/clamav:/var/lib/clamav
       - ./config/clamav/clamd.conf:/etc/clamav/clamd.conf:ro
       - ./config/clamav/freshclam.conf:/etc/clamav/freshclam.conf:ro
     expose:
@@ -57,7 +57,7 @@ services:
       COSIGN_PASSWORD: ${COSIGN_PASSWORD:-}
       GATEKEEPER_ADMIN_TOKEN: ${GATEKEEPER_ADMIN_TOKEN:-ChangeMe_GatekeeperToken_2026!}
     volumes:
-      - ${OSS_DATA_ROOT:-/srv/trusted-oss}:/data/trusted-oss
+      - ${OSS_DATA_ROOT:-/home/jsoehner/trusted-oss-data}:/data/trusted-oss
     expose:
       - "8000"
     healthcheck:
@@ -79,9 +79,9 @@ services:
       - "8080:8080"
     volumes:
       - ./config/nginx/oss-gateway.conf:/etc/nginx/conf.d/default.conf:ro
-      - ${OSS_DATA_ROOT:-/srv/trusted-oss}/packages/trusted-maven:/var/www/trusted-maven:ro
-      - ${OSS_DATA_ROOT:-/srv/trusted-oss}/packages/trusted-pypi:/var/www/trusted-pypi:ro
-      - ${OSS_DATA_ROOT:-/srv/trusted-oss}/keys/public:/var/www/keys:ro
+      - ${OSS_DATA_ROOT:-/home/jsoehner/trusted-oss-data}/packages/trusted-maven:/var/www/trusted-maven:ro
+      - ${OSS_DATA_ROOT:-/home/jsoehner/trusted-oss-data}/packages/trusted-pypi:/var/www/trusted-pypi:ro
+      - ${OSS_DATA_ROOT:-/home/jsoehner/trusted-oss-data}/keys/public:/var/www/keys:ro
     networks:
       - oss-trust-net
 

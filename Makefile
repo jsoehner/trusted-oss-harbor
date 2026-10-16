@@ -1,4 +1,4 @@
-.PHONY: help init-storage generate-keys sync-nvd bootstrap-harbor up down logs test verify-e2e
+.PHONY: help init-storage generate-keys sync-nvd bootstrap-harbor up down logs test verify-e2e iscsi-roadmap-dryrun
 
 SHELL := /usr/bin/bash
 include .env.example
@@ -8,7 +8,7 @@ export
 help: ## Display available commands
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-22s\033[0m %s\n", $$1, $$2}'
 
-init-storage: ## Create persistent storage directory hierarchy under OSS_DATA_ROOT
+init-storage: ## Create persistent storage directory hierarchy under OSS_DATA_ROOT (/home/jsoehner/trusted-oss-data)
 	bash scripts/bootstrap_host.sh --init-storage-only
 
 generate-keys: ## Generate Trusted OSS GPG keypair and Cosign OCI signing keypair
@@ -34,3 +34,6 @@ test: ## Run unit and integration test suite for the Quarantine-Scan-Sign Gateke
 
 verify-e2e: ## Run end-to-end verification of Quarantine -> ClamAV -> Trivy -> GPG Sign -> Trusted serve
 	bash scripts/verify_e2e_pipeline.sh
+
+iscsi-roadmap-dryrun: ## Preview TrueNAS iSCSI block storage attachment & migration commands
+	bash scripts/setup_truenas_iscsi_mount.sh --dry-run --migrate

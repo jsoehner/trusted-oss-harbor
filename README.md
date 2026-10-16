@@ -1,31 +1,34 @@
 # Trusted OSS Supply Chain Platform (`trusted-oss-harbor`)
 
-Self-hosted, containerized **Trusted Open-Source Software (OSS) Supply Chain Platform** combining **CNCF Harbor** (for OCI containers, Helm charts, and ORAS artifacts) with an automated **Quarantine $\rightarrow$ ClamAV Antivirus $\rightarrow$ Trivy/NVD Vulnerability Gate $\rightarrow$ GPG/Cosign Cryptographic Signer** for **Java (Maven)** and **Python (PyPI)** packages, designed to run behind a **pfSense** firewall with a single persistent host mount (`/srv/trusted-oss`).
+Self-hosted, containerized **Trusted Open-Source Software (OSS) Supply Chain Platform** combining **CNCF Harbor** (for OCI containers, Helm charts, and ORAS artifacts) with an automated **Quarantine $\rightarrow$ ClamAV Antivirus $\rightarrow$ Trivy/NVD Vulnerability Gate $\rightarrow$ GPG/Cosign Cryptographic Signer** for **Java (Maven)** and **Python (PyPI)** packages, designed to run behind a **pfSense** firewall with a persistent host mount (`/home/jsoehner/trusted-oss-data` now, with seamless migration to a **TrueNAS iSCSI** external block/object store).
 
 ---
 
 ## Architecture Highlights
 
-1. **Persistent Storage Mount (`OSS_DATA_ROOT=/srv/trusted-oss`)**:
+1. **Persistent Storage Mount (`OSS_DATA_ROOT=/home/jsoehner/trusted-oss-data`)**:
    - `harbor/`: Harbor OCI blobs, PostgreSQL metadata, Redis cache, and job logs.
-   - `packages/quarantine/`: Ephemeral staging area for dynamically fetched upstream Maven/PyPI artifacts.
-   - `packages/trusted-maven/` & `packages/trusted-pypi/`: Immutable, ClamAV-scanned, CVE-verified, and GPG-signed (`.asc`) package repositories.
+   - `packages/quarantine/`: Lightweight staging area for dynamically fetched upstream Maven/PyPI artifacts.
+   - `packages/trusted-maven/` & `packages/trusted-pypi/`: Immutable, ClamAV-scanned, CVE-verified, and GPG-signed (`.asc`) package repositories (with `AUTO_PROMOTE_CLEAN_ARTIFACTS=true`).
    - `scanners/`: Persistent ClamAV virus definitions (`freshclam`), Trivy DB, and OWASP NVD H2 cache (`jsoehner/nvd-cache`).
    - `audit/provenance.jsonl`: Append-only cryptographic provenance log for every promoted component.
 2. **Defense-in-Depth Quarantine & Signing Pipeline (`oss-gatekeeper`)**:
    - **Dynamic Pull-Through**: Automatically fetches requested dependencies on cache miss into `quarantine/`.
    - **Antivirus & Archive Inspection**: Streams artifacts over TCP `INSTREAM` to `clamd` (`clamav/clamav:1.4`) and inspects `.jar`/`.whl`/`.tar.gz` archives for Zip-Slip path traversal and symlinks.
-   - **Vulnerability Gate**: Blocks artifacts exceeding `CVSS_FAIL_THRESHOLD` (default `7.0`).
+   - **Vulnerability Gate & Auto-Approval**: Automatically promotes clean artifacts (`CVSS < 7.0`, `AUTO_PROMOTE_CLEAN_ARTIFACTS=true`) and blocks vulnerable or infected packages.
    - **Cryptographic Signing & Read-Time Verification**: Signs every promoted artifact with your **Trusted OSS GPG Key** (`.asc`) and verifies the detached signature before serving any file to a client.
 3. **pfSense Edge Security (`config/pfsense/`)**:
    - Terminates TLS + Client Certificate Authentication (**mTLS**) at **pfSense HAProxy** and restricts WAN ingress to GitHub Actions IP ranges (`config/pfsense/update-github-cidrs.sh`).
+4. **TrueNAS iSCSI Block & Object Storage Roadmap (`docs/roadmap/truenas-iscsi-storage-roadmap.md`)**:
+   - Currently operates out of `/home/jsoehner/trusted-oss-data`.
+   - Includes [`scripts/setup_truenas_iscsi_mount.sh`](scripts/setup_truenas_iscsi_mount.sh) and [`docs/roadmap/truenas-iscsi-storage-roadmap.md`](docs/roadmap/truenas-iscsi-storage-roadmap.md) to attach a **TrueNAS iSCSI Zvol LUN** at `/mnt/truenas-iscsi-oss` (or configure Harbor `storage_service.s3` against TrueNAS MinIO/S3) and migrate data with zero configuration drift.
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Copy and customize environment configuration
+# 1. Copy and customize environment configuration (defaults to /home/jsoehner/trusted-oss-data)
 cp .env.example .env
 
 # 2. Initialize persistent storage, seed NVD cache from jsoehner/nvd-cache, and prepare Harbor
@@ -39,6 +42,9 @@ make up
 
 # 5. Run the automated verification suite
 make verify-e2e
+
+# 6. (Roadmap) Preview TrueNAS iSCSI external block storage mount & migration
+make iscsi-roadmap-dryrun
 ```
 
 ---

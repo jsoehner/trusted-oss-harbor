@@ -10,7 +10,7 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    oss_data_root: Path = Field(default=Path("/srv/trusted-oss"), alias="OSS_DATA_ROOT")
+    oss_data_root: Path = Field(default=Path("/home/jsoehner/trusted-oss-data"), alias="OSS_DATA_ROOT")
     clamav_host: str = Field(default="clamav", alias="CLAMAV_HOST")
     clamav_port: int = Field(default=3310, alias="CLAMAV_PORT")
     clamav_required: bool = Field(default=True, alias="CLAMAV_REQUIRED")
@@ -25,16 +25,16 @@ class Settings(BaseSettings):
         default="https://pypi.org/simple", alias="UPSTREAM_PYPI_SIMPLE_URL"
     )
     gnupghome: Path = Field(
-        default=Path("/srv/trusted-oss/keys/gnupg"), alias="GNUPGHOME"
+        default=Path("/home/jsoehner/trusted-oss-data/keys/gnupg"), alias="GNUPGHOME"
     )
     gpg_key_id: str = Field(default="", alias="GPG_KEY_ID")
     gpg_passphrase: str = Field(default="", alias="GPG_PASSPHRASE")
     cosign_private_key_path: Path = Field(
-        default=Path("/srv/trusted-oss/keys/cosign/cosign.key"),
+        default=Path("/home/jsoehner/trusted-oss-data/keys/cosign/cosign.key"),
         alias="COSIGN_PRIVATE_KEY_PATH",
     )
     cosign_public_key_path: Path = Field(
-        default=Path("/srv/trusted-oss/keys/cosign/cosign.pub"),
+        default=Path("/home/jsoehner/trusted-oss-data/keys/cosign/cosign.pub"),
         alias="COSIGN_PUBLIC_KEY_PATH",
     )
     gatekeeper_admin_token: str = Field(

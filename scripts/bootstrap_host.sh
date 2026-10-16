@@ -15,7 +15,7 @@ else
   source "${PROJECT_ROOT}/.env.example"
 fi
 
-OSS_DATA_ROOT="${OSS_DATA_ROOT:-/srv/trusted-oss}"
+OSS_DATA_ROOT="${OSS_DATA_ROOT:-/home/jsoehner/trusted-oss-data}"
 HARBOR_VERSION="${HARBOR_VERSION:-v2.12.2}"
 NVD_CACHE_RELEASE_URL="${NVD_CACHE_RELEASE_URL:-https://github.com/jsoehner/nvd-cache/releases/download/latest-nvd-data/odc.mv.db.zip}"
 

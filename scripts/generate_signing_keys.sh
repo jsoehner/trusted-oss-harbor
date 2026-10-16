@@ -15,7 +15,7 @@ else
   source "${PROJECT_ROOT}/.env.example"
 fi
 
-OSS_DATA_ROOT="${OSS_DATA_ROOT:-/srv/trusted-oss}"
+OSS_DATA_ROOT="${OSS_DATA_ROOT:-/home/jsoehner/trusted-oss-data}"
 GNUPGHOME="${OSS_DATA_ROOT}/keys/gnupg"
 PUBLIC_KEYS_DIR="${OSS_DATA_ROOT}/keys/public"
 GPG_KEY_NAME="${GPG_KEY_NAME:-Trusted OSS Supply Chain Authority}"
