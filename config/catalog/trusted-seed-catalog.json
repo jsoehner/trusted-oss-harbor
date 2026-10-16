@@ -1,0 +1,89 @@
+{
+  "description": "Trusted OSS Seed Catalog: Chainguard Zero-CVE Runtimes (JRE & Python) and Shared Spring Boot Components across jsoehner GitHub projects (enterprise-command-center, spring-ai-blog-agent)",
+  "chainguard_containers": [
+    {
+      "repository": "chainguard/jre",
+      "reference": "latest",
+      "purpose": "Zero-CVE Chainguard OpenJDK JRE runtime for Spring Boot microservices"
+    },
+    {
+      "repository": "chainguard/python",
+      "reference": "latest",
+      "purpose": "Zero-CVE Chainguard Python runtime for AI agents, Gatekeeper, and automation"
+    }
+  ],
+  "spring_boot_maven_components": [
+    {
+      "groupId": "org.springframework.boot",
+      "artifactId": "spring-boot-starter-web",
+      "version": "3.4.4",
+      "artifacts": [
+        "org/springframework/boot/spring-boot-starter-web/3.4.4/spring-boot-starter-web-3.4.4.pom",
+        "org/springframework/boot/spring-boot-starter-web/3.4.4/spring-boot-starter-web-3.4.4.jar"
+      ]
+    },
+    {
+      "groupId": "org.springframework.boot",
+      "artifactId": "spring-boot-starter-actuator",
+      "version": "3.4.4",
+      "artifacts": [
+        "org/springframework/boot/spring-boot-starter-actuator/3.4.4/spring-boot-starter-actuator-3.4.4.pom",
+        "org/springframework/boot/spring-boot-starter-actuator/3.4.4/spring-boot-starter-actuator-3.4.4.jar"
+      ]
+    },
+    {
+      "groupId": "org.springframework.boot",
+      "artifactId": "spring-boot-starter-security",
+      "version": "3.4.4",
+      "artifacts": [
+        "org/springframework/boot/spring-boot-starter-security/3.4.4/spring-boot-starter-security-3.4.4.pom",
+        "org/springframework/boot/spring-boot-starter-security/3.4.4/spring-boot-starter-security-3.4.4.jar"
+      ]
+    },
+    {
+      "groupId": "org.springframework.boot",
+      "artifactId": "spring-boot-starter-validation",
+      "version": "3.4.4",
+      "artifacts": [
+        "org/springframework/boot/spring-boot-starter-validation/3.4.4/spring-boot-starter-validation-3.4.4.pom",
+        "org/springframework/boot/spring-boot-starter-validation/3.4.4/spring-boot-starter-validation-3.4.4.jar"
+      ]
+    },
+    {
+      "groupId": "org.springframework.boot",
+      "artifactId": "spring-boot-starter-data-jpa",
+      "version": "3.4.4",
+      "artifacts": [
+        "org/springframework/boot/spring-boot-starter-data-jpa/3.4.4/spring-boot-starter-data-jpa-3.4.4.pom",
+        "org/springframework/boot/spring-boot-starter-data-jpa/3.4.4/spring-boot-starter-data-jpa-3.4.4.jar"
+      ]
+    },
+    {
+      "groupId": "org.springframework.boot",
+      "artifactId": "spring-boot-starter-amqp",
+      "version": "3.4.4",
+      "artifacts": [
+        "org/springframework/boot/spring-boot-starter-amqp/3.4.4/spring-boot-starter-amqp-3.4.4.pom",
+        "org/springframework/boot/spring-boot-starter-amqp/3.4.4/spring-boot-starter-amqp-3.4.4.jar"
+      ]
+    },
+    {
+      "groupId": "org.springframework.boot",
+      "artifactId": "spring-boot-starter-test",
+      "version": "3.4.4",
+      "artifacts": [
+        "org/springframework/boot/spring-boot-starter-test/3.4.4/spring-boot-starter-test-3.4.4.pom",
+        "org/springframework/boot/spring-boot-starter-test/3.4.4/spring-boot-starter-test-3.4.4.jar"
+      ]
+    },
+    {
+      "groupId": "org.slf4j",
+      "artifactId": "slf4j-api",
+      "version": "2.0.16",
+      "artifacts": [
+        "org/slf4j/slf4j-api/2.0.16/slf4j-api-2.0.16.pom",
+        "org/slf4j/slf4j-api/2.0.16/slf4j-api-2.0.16.jar"
+      ]
+    }
+  ]
+}

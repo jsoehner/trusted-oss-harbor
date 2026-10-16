@@ -35,5 +35,8 @@ test: ## Run unit and integration test suite for the Quarantine-Scan-Sign Gateke
 verify-e2e: ## Run end-to-end verification of Quarantine -> ClamAV -> Trivy -> GPG Sign -> Trusted serve
 	bash scripts/verify_e2e_pipeline.sh
 
+configure-harbor-chainguard: ## Provision Harbor 'chainguard-cache' Proxy Cache project for cgr.dev/chainguard/{jre,python}
+	bash scripts/configure_harbor_projects.sh
+
 iscsi-roadmap-dryrun: ## Preview TrueNAS iSCSI block storage attachment & migration commands
 	bash scripts/setup_truenas_iscsi_mount.sh --dry-run --migrate

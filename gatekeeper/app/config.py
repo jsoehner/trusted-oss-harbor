@@ -24,6 +24,16 @@ class Settings(BaseSettings):
     upstream_pypi_simple_url: str = Field(
         default="https://pypi.org/simple", alias="UPSTREAM_PYPI_SIMPLE_URL"
     )
+    upstream_chainguard_url: str = Field(
+        default="https://cgr.dev", alias="UPSTREAM_CHAINGUARD_URL"
+    )
+    seed_catalog_path: Path = Field(
+        default=Path(__file__).resolve().parents[2]
+        / "config"
+        / "catalog"
+        / "trusted-seed-catalog.json",
+        alias="SEED_CATALOG_PATH",
+    )
     gnupghome: Path = Field(
         default=Path("/home/jsoehner/trusted-oss-data/keys/gnupg"), alias="GNUPGHOME"
     )
@@ -52,6 +62,10 @@ class Settings(BaseSettings):
     @property
     def trusted_pypi_dir(self) -> Path:
         return self.oss_data_root / "packages" / "trusted-pypi"
+
+    @property
+    def harbor_oci_cache_dir(self) -> Path:
+        return self.oss_data_root / "harbor" / "registry" / "chainguard-cache"
 
     @property
     def public_keys_dir(self) -> Path:

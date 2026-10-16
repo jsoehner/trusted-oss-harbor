@@ -134,7 +134,17 @@ def mock_clamd_server():
 
 @pytest.fixture()
 def mock_upstream_registry():
-    """Start a local HTTP server simulating upstream Maven Central and PyPI file hosting."""
+    """Start a local HTTP server simulating Chainguard (cgr.dev), Maven Central, and PyPI."""
+    catalog_path = (
+        Path(__file__).resolve().parents[2]
+        / "config"
+        / "catalog"
+        / "trusted-seed-catalog.json"
+    )
+    import json as _json
+
+    catalog_data = _json.loads(catalog_path.read_text(encoding="utf-8"))
+
     artifacts: dict[str, bytes] = {
         "/maven2/org/slf4j/slf4j-api/2.0.16/slf4j-api-2.0.16.jar": build_sample_jar(
             {
@@ -151,11 +161,78 @@ def mock_upstream_registry():
         "/pypi/urllib3/urllib3-2.2.3-py3-none-any.whl": build_sample_jar(
             {"urllib3/__init__.py": b"__version__ = '2.2.3'\n"}
         ),
+        "/v2/chainguard/jre/manifests/latest": _json.dumps(
+            {
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "subject": "cgr.dev/chainguard/jre:latest",
+                "manifests": [
+                    {
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": "sha256:665d04353c8404fcb6649b39636f2b3b7b9870d29163654718d7059563feef7c",
+                        "platform": {"architecture": "amd64", "os": "linux"},
+                    }
+                ],
+            }
+        ).encode("utf-8"),
+        "/v2/chainguard/python/manifests/latest": _json.dumps(
+            {
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "subject": "cgr.dev/chainguard/python:latest",
+                "manifests": [
+                    {
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": "sha256:991b04353c8404fcb6649b39636f2b3b7b9870d29163654718d7059563feef88",
+                        "platform": {"architecture": "amd64", "os": "linux"},
+                    }
+                ],
+            }
+        ).encode("utf-8"),
     }
+
+    for comp in catalog_data.get("spring_boot_maven_components", []):
+        for rel in comp.get("artifacts", []):
+            key = f"/maven2/{rel}"
+            if key not in artifacts:
+                if rel.endswith(".pom"):
+                    artifacts[key] = (
+                        f"<project><groupId>{comp['groupId']}</groupId>"
+                        f"<artifactId>{comp['artifactId']}</artifactId>"
+                        f"<version>{comp['version']}</version></project>\n"
+                    ).encode("utf-8")
+                else:
+                    artifacts[key] = build_sample_jar(
+                        {
+                            "META-INF/MANIFEST.MF": b"Manifest-Version: 1.0\n",
+                            f"META-INF/spring/{comp['artifactId']}.imports": b"AutoConfiguration\n",
+                        }
+                    )
 
     class UpstreamHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
-            payload = artifacts.get(self.path)
+            path_only = self.path.split("?", 1)[0]
+            if path_only == "/token":
+                body = b'{"token":"chainguard-mock-bearer-token"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if path_only.startswith("/v2/chainguard/"):
+                auth = self.headers.get("Authorization", "")
+                if auth != "Bearer chainguard-mock-bearer-token":
+                    self.send_response(401)
+                    self.send_header(
+                        "WWW-Authenticate",
+                        'Bearer realm="/token",service="cgr.dev"',
+                    )
+                    self.end_headers()
+                    return
+
+            payload = artifacts.get(path_only)
             if payload is None:
                 self.send_response(404)
                 self.end_headers()
@@ -591,3 +668,121 @@ def test_concurrent_parallel_artifact_promotions(client: TestClient) -> None:
     assert results == [200] * 6
     audit = client.get("/audit/provenance").json()
     assert audit["count"] == 6
+
+
+# ==============================================================================
+# Suite G: Operational Harbor Chainguard (JRE & Python) + Spring Boot Catalog Cache
+# ==============================================================================
+
+
+def test_harbor_chainguard_jre_and_python_oci_proxy_cache_with_token_auth(
+    client: TestClient, test_settings: Settings, mock_upstream_registry: str
+) -> None:
+    """Verify Harbor OCI v2 Proxy Cache pulls, scans, signs, and caches chainguard/jre and chainguard/python."""
+    test_settings.auto_promote_clean_artifacts = True
+    test_settings.upstream_chainguard_url = mock_upstream_registry
+
+    v2_resp = client.get("/v2/")
+    assert v2_resp.status_code == 200
+    assert v2_resp.headers["Docker-Distribution-API-Version"] == "registry/2.0"
+
+    for repo in ("chainguard/jre", "chainguard/python"):
+        # First pull: MISS -> dynamically fetched via OCI Bearer token, scanned by clamd, GPG-signed
+        miss_resp = client.get(f"/v2/chainguard-cache/{repo}/manifests/latest")
+        assert miss_resp.status_code == 200
+        assert miss_resp.headers["X-Cache-Status"] == "MISS"
+        assert miss_resp.headers["Docker-Content-Digest"].startswith("sha256:")
+        assert f"cgr.dev/{repo}:latest" in miss_resp.text
+
+        # Second pull: HIT -> served directly from local Harbor persistent store
+        hit_resp = client.get(f"/v2/chainguard-cache/{repo}/manifests/latest")
+        assert hit_resp.status_code == 200
+        assert hit_resp.headers["X-Cache-Status"] == "HIT"
+
+        # Verify detached GPG signature (.asc) for the cached OCI manifest
+        asc_resp = client.get(f"/v2/chainguard-cache/{repo}/manifests/latest.asc")
+        assert asc_resp.status_code == 200
+        assert "BEGIN PGP SIGNATURE" in asc_resp.text
+
+
+def test_operational_harbor_warms_spring_boot_collection_and_chainguard_before_teardown(
+    client: TestClient, test_settings: Settings, mock_upstream_registry: str
+) -> None:
+    """Verify warming the full Chainguard (JRE+Python) and shared Spring Boot component catalog."""
+    test_settings.auto_promote_clean_artifacts = True
+    test_settings.upstream_chainguard_url = mock_upstream_registry
+    test_settings.upstream_maven_url = f"{mock_upstream_registry}/maven2"
+
+    # 1. Initial catalog status shows 0 cached items
+    initial_status = client.get("/catalog/status").json()
+    assert all(not c["cached"] for c in initial_status["chainguard_containers"])
+    assert all(not s["cached"] for s in initial_status["spring_boot_components"])
+
+    # 2. Warm the operational test Harbor cache (Chainguard JRE & Python + 8 Spring Boot components = 16 Maven files)
+    warm_miss = client.post(
+        "/catalog/warm",
+        headers={"X-Gatekeeper-Token": "test-secret-token"},
+    )
+    assert warm_miss.status_code == 200
+    warm_data = warm_miss.json()
+    assert warm_data["chainguard_containers_cached"] == 2
+    assert warm_data["spring_boot_artifacts_cached"] == 16
+    assert all(c["cache_status"] == "MISS" and c["signed"] for c in warm_data["chainguard_containers"])
+    assert all(s["cache_status"] == "MISS" and s["signed"] for s in warm_data["spring_boot_artifacts"])
+
+    # 3. Re-warm / verify all 18 remote components are now served as CACHE HITs with valid GPG signatures
+    warm_hit = client.post(
+        "/catalog/warm",
+        headers={"X-Gatekeeper-Token": "test-secret-token"},
+    ).json()
+    assert all(c["cache_status"] == "HIT" for c in warm_hit["chainguard_containers"])
+    assert all(s["cache_status"] == "HIT" for s in warm_hit["spring_boot_artifacts"])
+
+    final_status = client.get("/catalog/status").json()
+    assert all(
+        c["cached"] and c["signature_valid"] for c in final_status["chainguard_containers"]
+    )
+    assert all(
+        s["cached"] and s["signature_valid"] for s in final_status["spring_boot_components"]
+    )
+
+
+def test_live_remote_chainguard_cgr_and_maven_central_spring_boot_caching(
+    client: TestClient, test_settings: Settings
+) -> None:
+    """Pull real Chainguard (cgr.dev/chainguard/jre & python) and Spring Boot starters from Maven Central before teardown."""
+    test_settings.auto_promote_clean_artifacts = True
+    test_settings.upstream_chainguard_url = "https://cgr.dev"
+    test_settings.upstream_maven_url = "https://repo.maven.apache.org/maven2"
+
+    # 1. Live remote pull of Chainguard JRE & Python OCI manifests from https://cgr.dev
+    for repo in ("chainguard/jre", "chainguard/python"):
+        r_miss = client.get(f"/v2/chainguard-cache/{repo}/manifests/latest")
+        assert r_miss.status_code == 200
+        assert r_miss.headers["X-Cache-Status"] == "MISS"
+        assert "application/vnd.oci.image" in r_miss.text
+
+        r_hit = client.get(f"/v2/chainguard-cache/{repo}/manifests/latest")
+        assert r_hit.status_code == 200
+        assert r_hit.headers["X-Cache-Status"] == "HIT"
+
+    # 2. Live remote pull of shared Spring Boot starter JARs from Maven Central
+    spring_starters = [
+        "org/springframework/boot/spring-boot-starter-web/3.4.4/spring-boot-starter-web-3.4.4.jar",
+        "org/springframework/boot/spring-boot-starter-actuator/3.4.4/spring-boot-starter-actuator-3.4.4.jar",
+        "org/springframework/boot/spring-boot-starter-security/3.4.4/spring-boot-starter-security-3.4.4.jar",
+        "org/springframework/boot/spring-boot-starter-validation/3.4.4/spring-boot-starter-validation-3.4.4.jar",
+    ]
+    for rel_path in spring_starters:
+        sb_miss = client.get(f"/maven/trusted/{rel_path}")
+        assert sb_miss.status_code == 200
+        assert sb_miss.headers["X-Cache-Status"] == "MISS"
+
+        sb_hit = client.get(f"/maven/trusted/{rel_path}")
+        assert sb_hit.status_code == 200
+        assert sb_hit.headers["X-Cache-Status"] == "HIT"
+
+        sb_asc = client.get(f"/maven/trusted/{rel_path}.asc")
+        assert sb_asc.status_code == 200
+        assert "BEGIN PGP SIGNATURE" in sb_asc.text
+

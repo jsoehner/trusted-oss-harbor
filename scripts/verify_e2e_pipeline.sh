@@ -104,17 +104,21 @@ echo "  [PASS] GPG RSA-3072 key generation & idempotency verified (Fingerprint: 
 bash scripts/setup_truenas_iscsi_mount.sh --dry-run --migrate >/dev/null
 echo "  [PASS] TrueNAS iSCSI provisioning & migration script dry-run verified"
 
+bash scripts/configure_harbor_projects.sh --dry-run >/dev/null
+echo "  [PASS] Harbor Chainguard Proxy Cache project configuration script dry-run verified"
+
 bash config/pfsense/update-github-cidrs.sh --dry-run >/dev/null
 echo "  [PASS] pfSense GitHub Actions CIDR allowlist live fetch verified"
 
 echo "=============================================================================="
-echo " [STAGE 5/5] Live Uvicorn HTTP Server + External Client (curl + gpg --verify)"
+echo " [STAGE 5/5] Live Operational Harbor/Gatekeeper + Chainguard & Spring Boot Cache"
 echo "=============================================================================="
 PORT="$("${VENV_DIR}/bin/python3" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 
 OSS_DATA_ROOT="${HARNESS_TMP}/data" \
 GNUPGHOME="${HARNESS_TMP}/data/keys/gnupg" \
 CLAMAV_REQUIRED="false" \
+AUTO_PROMOTE_CLEAN_ARTIFACTS="true" \
 GATEKEEPER_ADMIN_TOKEN="live-e2e-token" \
 PYTHONPATH="${PROJECT_ROOT}/gatekeeper" \
   "${VENV_DIR}/bin/uvicorn" app.main:app --host 127.0.0.1 --port "${PORT}" >"${LIVE_LOG}" 2>&1 &
@@ -130,21 +134,23 @@ done
 HEALTH_JSON="$(curl -fsS "http://127.0.0.1:${PORT}/healthz")"
 echo "  [PASS] Live Gatekeeper healthz: ${HEALTH_JSON}"
 
-# Build a sample JAR on disk for live upload
-SAMPLE_JAR="${HARNESS_TMP}/client-sample.jar"
-"${VENV_DIR}/bin/python3" - "${SAMPLE_JAR}" <<'PYEOF'
-import sys, zipfile
-with zipfile.ZipFile(sys.argv[1], "w") as zf:
-    zf.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
-    zf.writestr("io/trusted/Service.class", b"\xca\xfe\xba\xbe\x00\x00\x00\x3d")
+# Warm the operational test instance with Chainguard (jre & python) and shared Spring Boot components
+WARM_JSON="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/catalog/warm" \
+  -H "X-Gatekeeper-Token: live-e2e-token")"
+"${VENV_DIR}/bin/python3" - "${WARM_JSON}" <<'PYEOF'
+import json, sys
+data = json.loads(sys.argv[1])
+assert data["chainguard_containers_cached"] == 2
+assert data["spring_boot_artifacts_cached"] == 16
+print(f"  [PASS] Warmed {data['chainguard_containers_cached']} Chainguard containers (jre, python) and {data['spring_boot_artifacts_cached']} Spring Boot Maven artifacts")
+for c in data["chainguard_containers"]:
+    print(f"         - OCI {c['image']} [{c['cache_status']}] sha256={c['sha256'][:16]}... signed={c['signed']}")
+for s in data["spring_boot_artifacts"]:
+    if s["artifact"].endswith(".jar"):
+        print(f"         - Maven {s['coordinate']} [{s['cache_status']}] sha256={s['sha256'][:16]}... signed={s['signed']}")
 PYEOF
 
-REL_PATH="io/trusted/core-service/2.1.0/core-service-2.1.0.jar"
-curl -fsS -X POST "http://127.0.0.1:${PORT}/ingest/maven/${REL_PATH}" \
-  -H "X-Gatekeeper-Token: live-e2e-token" \
-  -F "file=@${SAMPLE_JAR};type=application/java-archive" >/dev/null
-
-# Simulate downstream CI/CD runner downloading public key, artifact, .asc, and .sha256
+# Simulate downstream CI/CD runner downloading public key, cached Spring Boot JAR, and Chainguard manifest
 CLIENT_DIR="${HARNESS_TMP}/downstream-client"
 CLIENT_GNUPG="${CLIENT_DIR}/gnupg"
 mkdir -p "${CLIENT_GNUPG}"
@@ -153,24 +159,33 @@ chmod 0700 "${CLIENT_GNUPG}"
 curl -fsS "http://127.0.0.1:${PORT}/keys/trusted-oss-pubkey.asc" -o "${CLIENT_DIR}/trusted-oss-pubkey.asc"
 GNUPGHOME="${CLIENT_GNUPG}" gpg --batch --import "${CLIENT_DIR}/trusted-oss-pubkey.asc" 2>/dev/null
 
-curl -fsS "http://127.0.0.1:${PORT}/maven/trusted/${REL_PATH}" -o "${CLIENT_DIR}/core-service-2.1.0.jar"
-curl -fsS "http://127.0.0.1:${PORT}/maven/trusted/${REL_PATH}.asc" -o "${CLIENT_DIR}/core-service-2.1.0.jar.asc"
-curl -fsS "http://127.0.0.1:${PORT}/maven/trusted/${REL_PATH}.sha256" -o "${CLIENT_DIR}/core-service-2.1.0.jar.sha256"
+SB_JAR_PATH="org/springframework/boot/spring-boot-starter-web/3.4.4/spring-boot-starter-web-3.4.4.jar"
+curl -fsS "http://127.0.0.1:${PORT}/maven/trusted/${SB_JAR_PATH}" -o "${CLIENT_DIR}/spring-boot-starter-web-3.4.4.jar"
+curl -fsS "http://127.0.0.1:${PORT}/maven/trusted/${SB_JAR_PATH}.asc" -o "${CLIENT_DIR}/spring-boot-starter-web-3.4.4.jar.asc"
+curl -fsS "http://127.0.0.1:${PORT}/maven/trusted/${SB_JAR_PATH}.sha256" -o "${CLIENT_DIR}/spring-boot-starter-web-3.4.4.jar.sha256"
 
-# Client verifies detached GPG signature and SHA-256 digest
+# Client verifies detached GPG signature and SHA-256 digest on cached Spring Boot starter
 GNUPGHOME="${CLIENT_GNUPG}" gpg --batch --verify \
-  "${CLIENT_DIR}/core-service-2.1.0.jar.asc" \
-  "${CLIENT_DIR}/core-service-2.1.0.jar" 2>/dev/null
-echo "  [PASS] Downstream client verified GPG detached signature (.asc) via gpg --verify"
+  "${CLIENT_DIR}/spring-boot-starter-web-3.4.4.jar.asc" \
+  "${CLIENT_DIR}/spring-boot-starter-web-3.4.4.jar" 2>/dev/null
+echo "  [PASS] Downstream client verified GPG detached signature (.asc) on cached spring-boot-starter-web-3.4.4.jar"
 
-ACTUAL_SHA256="$(sha256sum "${CLIENT_DIR}/core-service-2.1.0.jar" | awk '{print $1}')"
-EXPECTED_SHA256="$(tr -d '[:space:]' < "${CLIENT_DIR}/core-service-2.1.0.jar.sha256")"
+ACTUAL_SHA256="$(sha256sum "${CLIENT_DIR}/spring-boot-starter-web-3.4.4.jar" | awk '{print $1}')"
+EXPECTED_SHA256="$(tr -d '[:space:]' < "${CLIENT_DIR}/spring-boot-starter-web-3.4.4.jar.sha256")"
 [[ "${ACTUAL_SHA256}" == "${EXPECTED_SHA256}" ]] || {
   echo "[FAIL] SHA-256 mismatch: ${ACTUAL_SHA256} != ${EXPECTED_SHA256}" >&2
   exit 1
 }
 echo "  [PASS] Downstream client verified SHA-256 digest (${ACTUAL_SHA256})"
 
+# Client verifies detached GPG signature on cached Chainguard JRE OCI manifest
+curl -fsS "http://127.0.0.1:${PORT}/v2/chainguard-cache/chainguard/jre/manifests/latest" -o "${CLIENT_DIR}/chainguard-jre-manifest.json"
+curl -fsS "http://127.0.0.1:${PORT}/v2/chainguard-cache/chainguard/jre/manifests/latest.asc" -o "${CLIENT_DIR}/chainguard-jre-manifest.json.asc"
+GNUPGHOME="${CLIENT_GNUPG}" gpg --batch --verify \
+  "${CLIENT_DIR}/chainguard-jre-manifest.json.asc" \
+  "${CLIENT_DIR}/chainguard-jre-manifest.json" 2>/dev/null
+echo "  [PASS] Downstream client verified GPG detached signature (.asc) on cached Chainguard JRE OCI manifest"
+
 echo "=============================================================================="
-echo " [SUCCESS] All 5 Verification Stages Passed!"
+echo " [SUCCESS] All 5 Verification Stages Passed (Tearing down test Harbor store)!"
 echo "=============================================================================="
