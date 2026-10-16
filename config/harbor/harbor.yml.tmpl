@@ -1,0 +1,51 @@
+# ==============================================================================
+# Harbor Configuration Template (Rendered by scripts/bootstrap_host.sh)
+# ==============================================================================
+hostname: ${HARBOR_DOMAIN}
+
+http:
+  port: 8880
+
+https:
+  port: 8843
+  certificate: ${OSS_DATA_ROOT}/harbor/secret/cert/server.crt
+  private_key: ${OSS_DATA_ROOT}/harbor/secret/cert/server.key
+
+# Persistent host volume where all OCI blobs, manifests, DB, and Redis live
+data_volume: ${OSS_DATA_ROOT}/harbor
+
+harbor_admin_password: ${HARBOR_ADMIN_PASSWORD}
+
+database:
+  password: ${HARBOR_DB_PASSWORD}
+  max_idle_conns: 100
+  max_open_conns: 900
+  pod_max_open_conns: 100
+
+trivy:
+  ignore_unfixed: false
+  skip_update: false
+  skip_java_db_update: false
+  offline_scan: false
+  security_check: vuln,config,secret
+  insecure: false
+
+jobservice:
+  max_job_workers: 10
+  job_loggers:
+    - STD_OUTPUT
+    - FILE
+  logger_sweeper_duration: 14
+
+notification:
+  webhook_job_max_retry: 3
+  webhook_job_http_client_timeout: 3
+
+log:
+  level: info
+  local:
+    rotate_count: 50
+    rotate_size: 200M
+    location: ${OSS_DATA_ROOT}/harbor/job_logs
+
+_version: 2.12.0

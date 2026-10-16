@@ -1,0 +1,91 @@
+name: trusted-oss-harbor
+
+services:
+  clamav:
+    image: clamav/clamav:1.4
+    container_name: oss-clamav
+    restart: unless-stopped
+    volumes:
+      - ${OSS_DATA_ROOT:-/srv/trusted-oss}/scanners/clamav:/var/lib/clamav
+      - ./config/clamav/clamd.conf:/etc/clamav/clamd.conf:ro
+      - ./config/clamav/freshclam.conf:/etc/clamav/freshclam.conf:ro
+    expose:
+      - "3310"
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    networks:
+      - oss-trust-net
+
+  harbor-scanner-clamav:
+    image: ghcr.io/antonagrarov/harbor-scanner-clamav:latest
+    container_name: harbor-scanner-clamav
+    restart: unless-stopped
+    depends_on:
+      - clamav
+    environment:
+      SCANNER_CLAMAV_HOST: clamav
+      SCANNER_CLAMAV_PORT: "3310"
+      SCANNER_API_SERVER_ADDR: ":8080"
+    expose:
+      - "8080"
+    networks:
+      - oss-trust-net
+
+  oss-gatekeeper:
+    build:
+      context: ./gatekeeper
+      dockerfile: Dockerfile
+    container_name: oss-gatekeeper
+    restart: unless-stopped
+    depends_on:
+      - clamav
+    environment:
+      OSS_DATA_ROOT: /data/trusted-oss
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: "3310"
+      CVSS_FAIL_THRESHOLD: ${CVSS_FAIL_THRESHOLD:-7.0}
+      AUTO_PROMOTE_CLEAN_ARTIFACTS: ${AUTO_PROMOTE_CLEAN_ARTIFACTS:-true}
+      UPSTREAM_MAVEN_URL: ${UPSTREAM_MAVEN_URL:-https://repo.maven.apache.org/maven2}
+      UPSTREAM_PYPI_SIMPLE_URL: ${UPSTREAM_PYPI_SIMPLE_URL:-https://pypi.org/simple}
+      GNUPGHOME: /data/trusted-oss/keys/gnupg
+      COSIGN_PRIVATE_KEY_PATH: /data/trusted-oss/keys/cosign/cosign.key
+      COSIGN_PUBLIC_KEY_PATH: /data/trusted-oss/keys/cosign/cosign.pub
+      COSIGN_PASSWORD: ${COSIGN_PASSWORD:-}
+      GATEKEEPER_ADMIN_TOKEN: ${GATEKEEPER_ADMIN_TOKEN:-ChangeMe_GatekeeperToken_2026!}
+    volumes:
+      - ${OSS_DATA_ROOT:-/srv/trusted-oss}:/data/trusted-oss
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    networks:
+      - oss-trust-net
+
+  oss-gateway:
+    image: nginx:1.27-alpine
+    container_name: oss-gateway
+    restart: unless-stopped
+    depends_on:
+      - oss-gatekeeper
+    ports:
+      - "8443:8443"
+      - "8080:8080"
+    volumes:
+      - ./config/nginx/oss-gateway.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${OSS_DATA_ROOT:-/srv/trusted-oss}/packages/trusted-maven:/var/www/trusted-maven:ro
+      - ${OSS_DATA_ROOT:-/srv/trusted-oss}/packages/trusted-pypi:/var/www/trusted-pypi:ro
+      - ${OSS_DATA_ROOT:-/srv/trusted-oss}/keys/public:/var/www/keys:ro
+    networks:
+      - oss-trust-net
+
+networks:
+  oss-trust-net:
+    name: oss-trust-net
+    driver: bridge

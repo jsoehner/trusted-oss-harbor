@@ -1,0 +1,21 @@
+<!-- Add to <build><plugins> in your GitHub project's pom.xml to enforce
+     that 100% of dependencies carry a valid detached signature (.asc) from
+     your Trusted OSS Supply Chain Authority -->
+<plugin>
+    <groupId>org.simplify4u.plugins</groupId>
+    <artifactId>pgpverify-maven-plugin</artifactId>
+    <version>1.18.2</version>
+    <configuration>
+        <pgpKeysServer>https://${HARBOR_DOMAIN}/keys/trusted-oss-pubkey.asc</pgpKeysServer>
+        <failNoSignature>true</failNoSignature>
+        <verifyPomFiles>true</verifyPomFiles>
+        <verifyPlugins>true</verifyPlugins>
+    </configuration>
+    <executions>
+        <execution>
+            <goals>
+                <goal>check</goal>
+            </goals>
+        </execution>
+    </executions>
+</plugin>

@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<settings xmlns="http://maven.apache.org/SETTINGS/1.2.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.2.0 https://maven.apache.org/xsd/settings-1.2.0.xsd">
+
+  <!-- Route ALL Maven artifact and plugin requests exclusively through the
+       Trusted OSS Harbor & Gatekeeper host behind pfSense -->
+  <mirrors>
+    <mirror>
+      <id>trusted-oss-harbor</id>
+      <name>Internal Trusted &amp; Cryptographically Signed OSS Repository</name>
+      <url>https://${HARBOR_DOMAIN}/maven/trusted</url>
+      <mirrorOf>*</mirrorOf>
+    </mirror>
+  </mirrors>
+
+  <profiles>
+    <profile>
+      <id>trusted-oss-enforcement</id>
+      <repositories>
+        <repository>
+          <id>central</id>
+          <url>https://${HARBOR_DOMAIN}/maven/trusted</url>
+          <releases>
+            <enabled>true</enabled>
+            <checksumPolicy>fail</checksumPolicy>
+          </releases>
+          <snapshots>
+            <enabled>false</enabled>
+          </snapshots>
+        </repository>
+      </repositories>
+      <pluginRepositories>
+        <pluginRepository>
+          <id>central</id>
+          <url>https://${HARBOR_DOMAIN}/maven/trusted</url>
+          <releases>
+            <enabled>true</enabled>
+            <checksumPolicy>fail</checksumPolicy>
+          </releases>
+          <snapshots>
+            <enabled>false</enabled>
+          </snapshots>
+        </pluginRepository>
+      </pluginRepositories>
+    </profile>
+  </profiles>
+
+  <activeProfiles>
+    <activeProfile>trusted-oss-enforcement</activeProfile>
+  </activeProfiles>
+</settings>

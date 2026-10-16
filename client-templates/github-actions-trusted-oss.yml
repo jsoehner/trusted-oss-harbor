@@ -1,0 +1,19 @@
+# ==============================================================================
+# GitHub Actions Snippet: Fetch & Verify Signed-Only Components from Trusted OSS
+# ==============================================================================
+steps:
+  - name: Configure mTLS & Import Trusted OSS GPG Public Key
+    env:
+      HARBOR_DOMAIN: ${{ vars.HARBOR_DOMAIN }}
+      OSS_MTLS_CLIENT_CERT: ${{ secrets.OSS_MTLS_CLIENT_CERT }}
+      OSS_MTLS_CLIENT_KEY: ${{ secrets.OSS_MTLS_CLIENT_KEY }}
+    run: |
+      mkdir -p ~/.m2 ~/.oss-tls
+      printf '%s\n' "$OSS_MTLS_CLIENT_CERT" > ~/.oss-tls/client.crt
+      printf '%s\n' "$OSS_MTLS_CLIENT_KEY" > ~/.oss-tls/client.key
+      chmod 0600 ~/.oss-tls/client.key
+
+      curl -fsSL --cert ~/.oss-tls/client.crt --key ~/.oss-tls/client.key \
+        "https://${HARBOR_DOMAIN}/keys/trusted-oss-pubkey.asc" -o ~/.oss-tls/trusted-oss-pubkey.asc
+      gpg --batch --import ~/.oss-tls/trusted-oss-pubkey.asc
+      sed "s/\${HARBOR_DOMAIN}/${HARBOR_DOMAIN}/g" client-templates/maven-settings.xml > ~/.m2/settings.xml

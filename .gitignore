@@ -1,0 +1,24 @@
+# Environment & Secrets
+.env
+*.key
+*.pem
+*.p12
+*.pfx
+config/harbor/harbor.yml
+keys/
+
+# Local Storage / Runtime Data
+data/
+oss-store/
+harbor-installer/
+*.tar.gz
+*.zip
+
+# Python / Test Artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.coverage
+htmlcov/

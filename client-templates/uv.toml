@@ -1,0 +1,3 @@
+# Drop-in uv.toml for Python projects to fetch exclusively from the Trusted OSS PEP 503 index
+index-url = "https://oss.example.com/pypi/trusted/simple"
+no-build = true
