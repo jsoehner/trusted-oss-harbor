@@ -1,0 +1,28 @@
+name: Trusted OSS Harbor Verification CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-supply-chain-harness:
+    name: 5-Stage Security & E2E Cache Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Run 5-Stage Verification & Chainguard/Spring Boot Cache Harness
+        run: bash scripts/verify_e2e_pipeline.sh
