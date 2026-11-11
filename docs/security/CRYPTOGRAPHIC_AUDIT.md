@@ -1,35 +1,37 @@
 ## 🛡️ Cryptographic Bill of Materials (CBOM) & PQC Migration Assessment
 
-**Format**: CycloneDX (v1.6) | **First-Party Code Crypto Assets**: 4 | **Total Tracked Crypto Assets**: 7
+**Format**: CycloneDX (v1.6) | **First-Party Code Crypto Assets**: 6 | **Total Tracked Crypto Assets**: 9
 
 ### 📊 Post-Quantum Migration Scorecard
 
 | Metric | Count | Migration Status |
 |---|---|---|
-| **Post-Quantum Ready (PQC)** | **0** | 🟢 Quantum-Resistant (NIST FIPS 203/204/205) |
+| **Post-Quantum Ready (PQC)** | **1** | 🟢 Quantum-Resistant (NIST FIPS 203/204/205) |
 | **Quantum-Vulnerable (Backlog)** | **3** | 🔴 At Risk of 'Harvest Now, Decrypt Later' |
-| **Classical Symmetric / Digest** | **4** | 🟡 Classical Security (Requires AES-256 / SHA-256+) |
-| **Asymmetric PQC Migration Progress** | **0.0%** | (0 of 3 asymmetric/vulnerable primitives migrated) |
+| **Classical Symmetric / Digest** | **5** | 🟡 Classical Security (Requires AES-256 / SHA-256+) |
+| **Asymmetric PQC Migration Progress** | **25.0%** | (1 of 4 asymmetric/vulnerable primitives migrated) |
 
 ### 🎯 Cryptographic Supply Chain Coverage & Confidence
 
 | Evaluation Layer | Coverage / Status | Audit Confidence Assessment |
 |---|---|---|
-| **First-Party Code (`src/`, `scripts/`)** | **100% Audited** (4 Crypto Primitive(s) Inventoried across Python (37), Shell (7)) | 🟢 **HIGH** (Direct AST & SAST verified) |
-| **Third-Party Supply Chain** | **93.3%** (14 of 15 dependencies cataloged) | 🟢 HIGH (Known profiles assimilated) |
-| **Overall Audit Confidence Score** | **93.8%** | 🟢 HIGH (1 unassimilated supply chain dependencies) |
+| **First-Party Code (`src/`, `scripts/`)** | **100% Audited** (6 Crypto Primitive(s) Inventoried across Python (101), Shell (24)) | 🟢 **HIGH** (Direct AST & SAST verified) |
+| **Third-Party Supply Chain** | **87.5%** (14 of 16 dependencies cataloged) | 🟢 HIGH (Known profiles assimilated) |
+| **Overall Audit Confidence Score** | **88.2%** | 🟢 HIGH (2 unassimilated supply chain dependencies) |
 
 | **System OS Inventory** | **Pending Update** | 🟡 **Warning** (Local OS crypto components not yet inventoried) |
 
 ### ✅ Post-Quantum Ready Assets
 
-> ⚠️ **No Post-Quantum Ready assets detected.** Immediate migration planning recommended for asymmetric key exchanges and digital signatures.
+| Component Name | Primitive | Key/Parameter Set | PQC Standard | Provenance / Location(s) |
+|---|---|---|---|---|
+| `ML-DSA-65` | signature | 65 | ML-DSA (FIPS 204) | First-Party Code (SAST/AST)<br>`gatekeeper/app/signer.py:1`<br>`gatekeeper/app/signer.py:13`<br>`gatekeeper/app/signer.py:21`<br>`gatekeeper/app/signer.py:24`<br>`gatekeeper/app/signer.py:28`<br>`gatekeeper/app/signer.py:31`<br>`gatekeeper/app/signer.py:35`<br>`gatekeeper/app/signer.py:55`<br>`gatekeeper/app/signer.py:60`<br>`gatekeeper/app/signer.py:61`<br>`gatekeeper/app/signer.py:62`<br>`gatekeeper/app/signer.py:65`<br>`gatekeeper/app/signer.py:83`<br>`gatekeeper/app/signer.py:84`<br>`gatekeeper/app/signer.py:89`<br>`gatekeeper/app/signer.py:95`<br>`gatekeeper/app/signer.py:97`<br>`gatekeeper/app/signer.py:111`<br>`gatekeeper/app/signer.py:119`<br>`gatekeeper/app/main.py:90`<br>`gatekeeper/app/main.py:105`<br>`gatekeeper/app/main.py:163`<br>`gatekeeper/app/main.py:302`<br>`gatekeeper/app/main.py:315`<br>`gatekeeper/app/main.py:319`<br>`gatekeeper/app/main.py:332`<br>`gatekeeper/app/main.py:480`<br>`gatekeeper/app/main.py:484`<br>`gatekeeper/app/main.py:487`<br>`gatekeeper/app/main.py:491`<br>`gatekeeper/app/main.py:495`<br>`gatekeeper/app/main.py:497`<br>`gatekeeper/app/main.py:499`<br>`gatekeeper/app/main.py:576`<br>`gatekeeper/app/main.py:588`<br>`gatekeeper/app/main.py:592`<br>`gatekeeper/app/main.py:633`<br>`gatekeeper/app/main.py:670`<br>`gatekeeper/app/main.py:674`<br>`gatekeeper/app/config.py:77`<br>`gatekeeper/app/config.py:81`<br>`gatekeeper/app/config.py:85`<br>`gatekeeper/app/storage.py:82`<br>`gatekeeper/app/storage.py:87`<br>`gatekeeper/app/storage.py:97`<br>`gatekeeper/app/storage.py:127`<br>`gatekeeper/app/storage.py:134`<br>`client-templates/pqc-verify.py:60`<br>`client-templates/pqc-verify.py:63`<br>`client-templates/pqc-verify.py:73`<br>`scripts/verify_e2e_pipeline.sh:182`<br>`scripts/verify_e2e_pipeline.sh:183`<br>`scripts/verify_e2e_pipeline.sh:186`<br>`scripts/verify_e2e_pipeline.sh:187`<br>`scripts/verify_e2e_pipeline.sh:188`<br>`scripts/generate_signing_keys.sh:52`<br>`scripts/generate_signing_keys.sh:56`<br>`scripts/generate_signing_keys.sh:57`<br>`scripts/generate_signing_keys.sh:62`<br>`scripts/generate_signing_keys.sh:63`<br>`scripts/generate_signing_keys.sh:64`<br>`scripts/generate_signing_keys.sh:65`<br>`scripts/generate_signing_keys.sh:66`<br>`scripts/generate_signing_keys.sh:71` |
 
 ### ⚠️ Quantum-Vulnerable Assets & Remediation Plan
 
 | Component / Algorithm | Type / Primitive | Key Length / Curve | Recommended Target | Provenance / Context |
 |---|---|---|---|---|
-| **`RSA-2048`**<br><sub>RSA-2048</sub> | algorithm / signature | 2048 | **ML-KEM-768 / Kyber (FIPS 203)** | First-Party Code (SAST/AST)<br>`gatekeeper/app/signer.py:40`<br><sub><code>"Key-Type: RSA\n"</code></sub><br><br>`scripts/generate_signing_keys.sh:33`<br><sub><code>Key-Type: RSA</code></sub> |
+| **`RSA-2048`**<br><sub>RSA-2048</sub> | algorithm / signature | 2048 | **ML-KEM-768 / Kyber (FIPS 203)** | First-Party Code (SAST/AST)<br>`gatekeeper/app/signer.py:147`<br><sub><code>"Key-Type: RSA\n"</code></sub><br><br>`scripts/generate_signing_keys.sh:33`<br><sub><code>Key-Type: RSA</code></sub> |
 | **`RSA-3072`**<br><sub>RSA-3072</sub> | algorithm / signature | 3072 | **ML-KEM-768 / Kyber (FIPS 203)** | First-Party Code (SAST/AST)<br>`scripts/verify_e2e_pipeline.sh:102`<br><sub><code>echo "  [PASS] GPG RSA-3072 key generation & idempotency verified (Fingerprint: ${FPR_FIRST})"</code></sub><br><br>`scripts/generate_signing_keys.sh:30`<br><sub><code>echo "[INFO] Generating RSA-3072 GPG Signing Key for ${GPG_KEY_NAME} <${GPG_KEY_EMAIL}>..."</code></sub> |
 | **`certifi (Certifi Mozilla Root CA Bundle (RSA-2048/4096 & ECDSA P-256/P-384))`**<br><sub>RSA-2048 / ECDSA-P256</sub> | certificate / certificate | 2048-4096 | **Track Mozilla CA program transition to ML-DSA / SLH-DSA root trust anchors** | Assimilated Upstream CBOM: Certifi Mozilla CA Root Bundle<br>`Dependency: certifi@2025.1.31` |
 
@@ -37,8 +39,9 @@
 
 | Component Name | Primitive | Key Length | Quantum Resistance Assessment | Provenance / Location(s) |
 |---|---|---|---|---|
-| `SHA-256` | hash | 256 | Quantum-Resistant (Grover's proof) | First-Party Code (SAST/AST)<br>`gatekeeper/app/signer.py:138`<br>`gatekeeper/app/signer.py:150`<br>`gatekeeper/app/signer.py:157`<br>`gatekeeper/app/signer.py:158`<br>`gatekeeper/app/main.py:130`<br>`gatekeeper/app/main.py:292`<br>`gatekeeper/app/main.py:305`<br>`gatekeeper/app/main.py:336`<br>`gatekeeper/app/main.py:337`<br>`gatekeeper/app/main.py:345`<br>`gatekeeper/app/main.py:356`<br>`gatekeeper/app/main.py:357`<br>`gatekeeper/app/main.py:366`<br>`gatekeeper/app/storage.py:18`<br>`gatekeeper/app/storage.py:59`<br>`gatekeeper/app/storage.py:85`<br>`gatekeeper/app/storage.py:86`<br>`gatekeeper/app/storage.py:102`<br>`gatekeeper/app/storage.py:112`<br>`gatekeeper/app/storage.py:118`<br>`scripts/verify_e2e_pipeline.sh:165`<br>`scripts/verify_e2e_pipeline.sh:174`<br>`scripts/verify_e2e_pipeline.sh:176`<br>`scripts/verify_e2e_pipeline.sh:179` |
-| `SHA-512` | hash | 512 | Quantum-Resistant (Grover's proof) | First-Party Code (SAST/AST)<br>`gatekeeper/app/signer.py:139`<br>`gatekeeper/app/signer.py:151`<br>`gatekeeper/app/main.py:131`<br>`gatekeeper/app/main.py:273`<br>`gatekeeper/app/main.py:297`<br>`gatekeeper/app/main.py:518`<br>`gatekeeper/app/main.py:560`<br>`gatekeeper/app/main.py:569`<br>`gatekeeper/app/storage.py:19`<br>`gatekeeper/app/storage.py:58`<br>`gatekeeper/app/storage.py:60`<br>`gatekeeper/app/storage.py:65`<br>`gatekeeper/app/storage.py:74`<br>`gatekeeper/app/storage.py:88`<br>`gatekeeper/app/storage.py:89`<br>`gatekeeper/app/storage.py:109` |
+| `SHA-256` | hash | 256 | Quantum-Resistant (Grover's proof) | First-Party Code (SAST/AST)<br>`gatekeeper/app/signer.py:72`<br>`gatekeeper/app/signer.py:74`<br>`gatekeeper/app/signer.py:245`<br>`gatekeeper/app/signer.py:259`<br>`gatekeeper/app/main.py:157`<br>`gatekeeper/app/main.py:327`<br>`gatekeeper/app/main.py:340`<br>`gatekeeper/app/main.py:371`<br>`gatekeeper/app/main.py:372`<br>`gatekeeper/app/main.py:380`<br>`gatekeeper/app/main.py:391`<br>`gatekeeper/app/main.py:392`<br>`gatekeeper/app/main.py:401`<br>`gatekeeper/app/storage.py:18`<br>`gatekeeper/app/storage.py:60`<br>`gatekeeper/app/storage.py:69`<br>`gatekeeper/app/storage.py:99`<br>`gatekeeper/app/storage.py:100`<br>`gatekeeper/app/storage.py:120`<br>`gatekeeper/app/storage.py:130`<br>`gatekeeper/app/storage.py:138`<br>`scripts/verify_e2e_pipeline.sh:165`<br>`scripts/verify_e2e_pipeline.sh:174`<br>`scripts/verify_e2e_pipeline.sh:176`<br>`scripts/verify_e2e_pipeline.sh:179`<br>`scripts/generate_signing_keys.sh:72`<br>`scripts/generate_signing_keys.sh:74` |
+| `SHA-384` | hash | 384 | Quantum-Resistant (Grover's proof) | First-Party Code (SAST/AST)<br>`gatekeeper/app/signer.py:73`<br>`gatekeeper/app/signer.py:250`<br>`gatekeeper/app/signer.py:260`<br>`gatekeeper/app/signer.py:269`<br>`gatekeeper/app/signer.py:270`<br>`gatekeeper/app/main.py:158`<br>`gatekeeper/app/main.py:495`<br>`gatekeeper/app/storage.py:20`<br>`gatekeeper/app/storage.py:61`<br>`gatekeeper/app/storage.py:71`<br>`gatekeeper/app/storage.py:102`<br>`gatekeeper/app/storage.py:103`<br>`gatekeeper/app/storage.py:104`<br>`scripts/generate_signing_keys.sh:73` |
+| `SHA-512` | hash | 512 | Quantum-Resistant (Grover's proof) | First-Party Code (SAST/AST)<br>`gatekeeper/app/signer.py:246`<br>`gatekeeper/app/signer.py:261`<br>`gatekeeper/app/main.py:159`<br>`gatekeeper/app/main.py:302`<br>`gatekeeper/app/main.py:332`<br>`gatekeeper/app/main.py:576`<br>`gatekeeper/app/main.py:624`<br>`gatekeeper/app/main.py:633`<br>`gatekeeper/app/storage.py:19`<br>`gatekeeper/app/storage.py:59`<br>`gatekeeper/app/storage.py:62`<br>`gatekeeper/app/storage.py:70`<br>`gatekeeper/app/storage.py:82`<br>`gatekeeper/app/storage.py:106`<br>`gatekeeper/app/storage.py:107`<br>`gatekeeper/app/storage.py:127` |
 | `httpcore (HTTPS Session TLS 1.2 / 1.3 Client)` | protocol | 256 | Quantum-Resistant (Grover's proof) | Assimilated Upstream CBOM: Python HTTPS/TLS & Cloud SDK Transport Profile<br>`Dependency: httpcore@1.0.7` |
 | `httpx (HTTPS Session TLS 1.2 / 1.3 Client)` | protocol | 256 | Quantum-Resistant (Grover's proof) | Assimilated Upstream CBOM: Python HTTPS/TLS & Cloud SDK Transport Profile<br>`Dependency: httpx@0.27.2` |
 
@@ -48,6 +51,7 @@
 
 | Dependency Name | Version | Package URL (purl) | Status |
 |---|---|---|---|
+| `dilithium-py` | 1.5.1 | `pkg:pypi/dilithium-py@1.5.1` | 🟡 Unassimilated (No upstream CBOM) |
 | `pydantic-settings` | 2.6.0 | `pkg:pypi/pydantic-settings@2.6.0` | 🟡 Unassimilated (No upstream CBOM) |
 
 ### ⚛️ Post-Quantum Cryptography (PQC) Modernization Roadmap
