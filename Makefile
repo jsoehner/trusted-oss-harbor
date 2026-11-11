@@ -1,4 +1,4 @@
-.PHONY: help init-storage generate-keys sync-nvd bootstrap-harbor up down logs test verify-e2e iscsi-roadmap-dryrun
+.PHONY: help init-storage generate-keys sync-nvd bootstrap-harbor up down logs test verify-e2e iscsi-roadmap-dryrun build-appliance run-appliance push-appliance
 
 SHELL := /usr/bin/bash
 include .env.example
@@ -40,3 +40,17 @@ configure-harbor-chainguard: ## Provision Harbor 'chainguard-cache' Proxy Cache 
 
 iscsi-roadmap-dryrun: ## Preview TrueNAS iSCSI block storage attachment & migration commands
 	bash scripts/setup_truenas_iscsi_mount.sh --dry-run --migrate
+
+build-appliance: ## Build standalone all-in-one NAS appliance Docker image
+	docker build -t ghcr.io/jsoehner/trusted-oss-gatekeeper:latest -t ghcr.io/jsoehner/trusted-oss-gatekeeper:$$(cat VERSION) .
+
+run-appliance: ## Run standalone all-in-one NAS appliance container locally on port 8080
+	docker run --rm -it \
+		--name trusted-oss-gatekeeper \
+		-p 8080:8080 \
+		-v $${OSS_DATA_ROOT:-/home/jsoehner/trusted-oss-data}:/data \
+		ghcr.io/jsoehner/trusted-oss-gatekeeper:latest
+
+push-appliance: ## Push standalone NAS appliance image to GitHub Container Registry
+	docker push ghcr.io/jsoehner/trusted-oss-gatekeeper:latest
+	docker push ghcr.io/jsoehner/trusted-oss-gatekeeper:$$(cat VERSION)

@@ -1,7 +1,7 @@
 """Configuration settings for the Trusted OSS Gatekeeper service."""
 
 from pathlib import Path
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -51,6 +51,30 @@ class Settings(BaseSettings):
         default="ChangeMe_GatekeeperToken_2026!", alias="GATEKEEPER_ADMIN_TOKEN"
     )
     pqc_signing_enabled: bool = Field(default=True, alias="PQC_SIGNING_ENABLED")
+
+    @model_validator(mode="after")
+    def resolve_dynamic_paths(self) -> "Settings":
+        """Dynamically re-anchor default child paths if oss_data_root was customized."""
+        default_root = Path("/home/jsoehner/trusted-oss-data")
+        if self.oss_data_root != default_root:
+            if self.gnupghome == default_root / "keys" / "gnupg":
+                self.gnupghome = self.oss_data_root / "keys" / "gnupg"
+            if self.cosign_private_key_path == default_root / "keys" / "cosign" / "cosign.key":
+                self.cosign_private_key_path = self.oss_data_root / "keys" / "cosign" / "cosign.key"
+            if self.cosign_public_key_path == default_root / "keys" / "cosign" / "cosign.pub":
+                self.cosign_public_key_path = self.oss_data_root / "keys" / "cosign" / "cosign.pub"
+
+        if not self.seed_catalog_path.is_file():
+            for candidate in (
+                Path("/app/config/catalog/trusted-seed-catalog.json"),
+                Path("/config/catalog/trusted-seed-catalog.json"),
+                Path(__file__).resolve().parents[1] / "config" / "catalog" / "trusted-seed-catalog.json",
+                Path(__file__).resolve().parents[2] / "config" / "catalog" / "trusted-seed-catalog.json",
+            ):
+                if candidate.is_file():
+                    self.seed_catalog_path = candidate
+                    break
+        return self
 
     @property
     def quarantine_dir(self) -> Path:

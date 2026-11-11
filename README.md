@@ -52,6 +52,55 @@ make iscsi-roadmap-dryrun
 
 ---
 
+## NAS Appliance Deployment (TrueNAS SCALE / Synology / Unraid)
+
+To run the entire platform as a 24/7 self-contained appliance on your NAS without maintaining multiple daemon containers:
+
+### 1. Pull the Published Image
+```bash
+docker pull ghcr.io/jsoehner/trusted-oss-gatekeeper:latest
+```
+
+### 2. Run via Docker CLI on your NAS
+```bash
+docker run -d \
+  --name trusted-oss-gatekeeper \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -v /mnt/tank/trusted-oss-data:/data \
+  -e CVSS_FAIL_THRESHOLD=7.0 \
+  -e AUTO_PROMOTE_CLEAN_ARTIFACTS=true \
+  -e GATEKEEPER_ADMIN_TOKEN="ChangeMe_GatekeeperToken_2026!" \
+  ghcr.io/jsoehner/trusted-oss-gatekeeper:latest
+```
+
+### 3. Or Deploy via Docker Compose on your NAS
+```yaml
+services:
+  trusted-oss-gatekeeper:
+    image: ghcr.io/jsoehner/trusted-oss-gatekeeper:latest
+    container_name: trusted-oss-gatekeeper
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - /mnt/tank/trusted-oss-data:/data
+    environment:
+      OSS_DATA_ROOT: /data
+      CVSS_FAIL_THRESHOLD: 7.0
+      AUTO_PROMOTE_CLEAN_ARTIFACTS: "true"
+      GATEKEEPER_ADMIN_TOKEN: "ChangeMe_GatekeeperToken_2026!"
+```
+
+The appliance automatically:
+- Initializes the `/data` directory hierarchy on your NAS ZFS pool.
+- Auto-generates RSA-3072 GPG and NIST FIPS 204 ML-DSA-65 PQC signing authorities on first boot.
+- Auto-downloads and updates ClamAV virus signatures with persistent caching in `/data/scanners/clamav`.
+- Serves the unified gateway on port `8080`.
+
+
+---
+
 ## Locking GitHub Projects to Signed-Only Components
 
 Drop the templates in [`client-templates/`](client-templates/) into your GitHub repositories:
