@@ -762,7 +762,9 @@ def test_live_remote_chainguard_cgr_and_maven_central_spring_boot_caching(
     """Pull real Chainguard (cgr.dev/chainguard/jre & python) and Spring Boot starters from Maven Central before teardown."""
     test_settings.auto_promote_clean_artifacts = True
     test_settings.upstream_chainguard_url = "https://cgr.dev"
-    test_settings.upstream_maven_url = "https://repo.maven.apache.org/maven2"
+    test_settings.upstream_maven_url = (
+        "https://maven-central.storage-download.googleapis.com/maven2,https://repo.maven.apache.org/maven2"
+    )
 
     # 1. Live remote pull of Chainguard JRE & Python OCI manifests from https://cgr.dev
     for repo in ("chainguard/jre", "chainguard/python"):

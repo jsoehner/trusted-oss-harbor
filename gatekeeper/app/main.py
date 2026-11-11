@@ -203,19 +203,33 @@ async def ensure_maven_artifact_cached(
     if not settings.auto_promote_clean_artifacts:
         raise HTTPException(status_code=404, detail="Trusted Maven artifact not found")
 
-    upstream_url = f"{settings.upstream_maven_url.rstrip('/')}/{base_rel_path}"
+    upstream_urls = [
+        u.strip() for u in settings.upstream_maven_url.split(",") if u.strip()
+    ]
     staged_file = resolve_safe_relative_path(
         settings.quarantine_dir, f"maven/{base_rel_path}"
     )
     staged_file.parent.mkdir(parents=True, exist_ok=True)
+    downloaded = False
     async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-        resp = await client.get(upstream_url)
-        if resp.status_code != 200:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Artifact not found in trusted store or upstream: {base_rel_path}",
-            )
-        staged_file.write_bytes(resp.content)
+        for base_url in upstream_urls:
+            candidate_url = f"{base_url.rstrip('/')}/{base_rel_path}"
+            try:
+                resp = await client.get(candidate_url)
+                if resp.status_code == 200:
+                    staged_file.write_bytes(resp.content)
+                    downloaded = True
+                    break
+            except Exception as e:
+                logger.warning(
+                    f"Failed to fetch maven artifact from {candidate_url}: {e}"
+                )
+
+    if not downloaded:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Artifact not found in trusted store or upstream: {base_rel_path}",
+        )
 
     await quarantine_scan_sign_and_promote(
         staged_file=staged_file,
@@ -640,19 +654,33 @@ async def get_pypi_trusted_package_file(
     cache_status = "HIT"
 
     if not base_file.exists() and settings.auto_promote_clean_artifacts:
-        upstream_url = f"{settings.upstream_pypi_simple_url.rstrip('/')}/{base_rel_path}"
+        upstream_urls = [
+            u.strip() for u in settings.upstream_pypi_simple_url.split(",") if u.strip()
+        ]
         staged_file = resolve_safe_relative_path(
             settings.quarantine_dir, f"pypi/{base_rel_path}"
         )
         staged_file.parent.mkdir(parents=True, exist_ok=True)
+        downloaded = False
         async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-            resp = await client.get(upstream_url)
-            if resp.status_code != 200:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"PyPI artifact not found in trusted store or upstream: {base_rel_path}",
-                )
-            staged_file.write_bytes(resp.content)
+            for base_url in upstream_urls:
+                candidate_url = f"{base_url.rstrip('/')}/{base_rel_path}"
+                try:
+                    resp = await client.get(candidate_url)
+                    if resp.status_code == 200:
+                        staged_file.write_bytes(resp.content)
+                        downloaded = True
+                        break
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to fetch PyPI artifact from {candidate_url}: {e}"
+                    )
+
+        if not downloaded:
+            raise HTTPException(
+                status_code=404,
+                detail=f"PyPI artifact not found in trusted store or upstream: {base_rel_path}",
+            )
 
         await quarantine_scan_sign_and_promote(
             staged_file=staged_file,

@@ -19,7 +19,8 @@ class Settings(BaseSettings):
         default=True, alias="AUTO_PROMOTE_CLEAN_ARTIFACTS"
     )
     upstream_maven_url: str = Field(
-        default="https://repo.maven.apache.org/maven2", alias="UPSTREAM_MAVEN_URL"
+        default="https://maven-central.storage-download.googleapis.com/maven2,https://repo.maven.apache.org/maven2,https://repo.spring.io/milestone",
+        alias="UPSTREAM_MAVEN_URL",
     )
     upstream_pypi_simple_url: str = Field(
         default="https://pypi.org/simple", alias="UPSTREAM_PYPI_SIMPLE_URL"
