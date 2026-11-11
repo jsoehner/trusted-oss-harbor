@@ -16,7 +16,13 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.main import app, initialize_storage_and_keys
 from app.scanner import EICAR_SIGNATURE, inspect_archive_safety, scan_with_clamd_instream
-from app.signer import ensure_gpg_signing_key, sign_artifact_detached_gpg
+from app.signer import (
+    ensure_gpg_signing_key,
+    ensure_mldsa_signing_key,
+    sign_artifact_detached_gpg,
+    sign_artifact_mldsa65,
+    verify_artifact_mldsa65,
+)
 from app.storage import (
     is_safe_subpath,
     normalize_pypi_name,
@@ -785,4 +791,82 @@ def test_live_remote_chainguard_cgr_and_maven_central_spring_boot_caching(
         sb_asc = client.get(f"/maven/trusted/{rel_path}.asc")
         assert sb_asc.status_code == 200
         assert "BEGIN PGP SIGNATURE" in sb_asc.text
+
+
+def test_mldsa65_post_quantum_key_generation_and_verification(test_settings: Settings) -> None:
+    """Validate NIST FIPS 204 ML-DSA-65 keypair generation, signing, and detached signature verification."""
+    pubkey_path = ensure_mldsa_signing_key(
+        mldsa_keys_dir=test_settings.mldsa_keys_dir,
+        public_keys_dir=test_settings.public_keys_dir,
+    )
+    assert pubkey_path.exists()
+    assert "-----BEGIN ML-DSA-65 PUBLIC KEY-----" in pubkey_path.read_text(encoding="utf-8")
+
+    fingerprint_path = test_settings.public_keys_dir / "trusted-oss-mldsa65.fingerprint"
+    assert fingerprint_path.exists()
+    assert "SHA256:" in fingerprint_path.read_text(encoding="utf-8")
+    assert "SHA384:" in fingerprint_path.read_text(encoding="utf-8")
+
+    test_settings.quarantine_dir.mkdir(parents=True, exist_ok=True)
+    dummy_artifact = test_settings.quarantine_dir / "test-component-1.0.jar"
+    dummy_artifact.write_bytes(b"PK\x03\x04test-post-quantum-artifact-payload")
+
+    sig_path = sign_artifact_mldsa65(dummy_artifact, test_settings.mldsa_private_key_path)
+    assert sig_path.exists()
+    assert "-----BEGIN ML-DSA-65 SIGNATURE-----" in sig_path.read_text(encoding="utf-8")
+
+    # Positive verification
+    assert verify_artifact_mldsa65(dummy_artifact, sig_path, pubkey_path) is True
+
+    # Tamper test
+    tampered_artifact = test_settings.quarantine_dir / "tampered.jar"
+    tampered_artifact.write_bytes(b"PK\x03\x04tampered-content")
+    assert verify_artifact_mldsa65(tampered_artifact, sig_path, pubkey_path) is False
+
+
+def test_mldsa65_dual_signing_and_http_endpoints(
+    client: TestClient, test_settings: Settings
+) -> None:
+    """Verify that artifact promotion generates dual signatures (.asc and .mldsa65) and serves /keys endpoints."""
+    # 1. Verify /keys/trusted-oss-mldsa65.pub
+    r_pub = client.get("/keys/trusted-oss-mldsa65.pub")
+    assert r_pub.status_code == 200
+    assert "-----BEGIN ML-DSA-65 PUBLIC KEY-----" in r_pub.text
+
+    # 2. Verify /keys/trusted-oss-mldsa65.fingerprint
+    r_fp = client.get("/keys/trusted-oss-mldsa65.fingerprint")
+    assert r_fp.status_code == 200
+    assert "SHA256:" in r_fp.text
+
+    # 3. Ingest artifact and verify dual-signing promotion
+    jar_data = build_sample_jar({"com/example/MyClass.class": b"\xca\xfe\xba\xbe\x00\x00"})
+    ingest_path = "/ingest/maven/com/example/pqc-demo/1.0.0/pqc-demo-1.0.0.jar"
+    resp = client.post(
+        ingest_path,
+        files={"file": ("pqc-demo-1.0.0.jar", jar_data, "application/java-archive")},
+        headers={"x-gatekeeper-token": test_settings.gatekeeper_admin_token},
+    )
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["signature_file"].endswith(".asc")
+    assert data["signature_file_mldsa"].endswith(".mldsa65")
+    assert data["pqc_status"] == "POST-QUANTUM READY"
+    assert "sha384" in data
+
+    # 4. Fetch artifact, GPG signature, and ML-DSA-65 signature
+    r_jar = client.get("/maven/trusted/com/example/pqc-demo/1.0.0/pqc-demo-1.0.0.jar")
+    assert r_jar.status_code == 200
+
+    r_asc = client.get("/maven/trusted/com/example/pqc-demo/1.0.0/pqc-demo-1.0.0.jar.asc")
+    assert r_asc.status_code == 200
+    assert "BEGIN PGP SIGNATURE" in r_asc.text
+
+    r_pqc = client.get("/maven/trusted/com/example/pqc-demo/1.0.0/pqc-demo-1.0.0.jar.mldsa65")
+    assert r_pqc.status_code == 200
+    assert "BEGIN ML-DSA-65 SIGNATURE" in r_pqc.text
+
+    # 5. Fetch sha384 Grover-resistant companion
+    r_sha384 = client.get("/maven/trusted/com/example/pqc-demo/1.0.0/pqc-demo-1.0.0.jar.sha384")
+    assert r_sha384.status_code == 200
+    assert len(r_sha384.text.strip()) == 96
 

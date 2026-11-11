@@ -16,8 +16,11 @@ from app.signer import (
     SigningError,
     append_provenance_record,
     ensure_gpg_signing_key,
+    ensure_mldsa_signing_key,
     sign_artifact_detached_gpg,
+    sign_artifact_mldsa65,
     verify_artifact_signature,
+    verify_artifact_mldsa65,
 )
 from app.storage import (
     atomic_promote_artifact,
@@ -46,16 +49,24 @@ def get_settings(request: Request) -> Settings:
 
 
 def initialize_storage_and_keys(settings: Settings) -> Path:
-    """Create persistent directory structure and ensure Trusted OSS GPG key exists."""
+    """Create persistent directory structure and ensure Trusted OSS GPG and PQC keys exist."""
     for directory in (
         settings.quarantine_dir,
         settings.trusted_maven_dir,
         settings.trusted_pypi_dir,
         settings.harbor_oci_cache_dir,
         settings.public_keys_dir,
+        settings.mldsa_keys_dir,
         settings.provenance_log_path.parent,
     ):
         directory.mkdir(parents=True, exist_ok=True)
+
+    if settings.pqc_signing_enabled:
+        ensure_mldsa_signing_key(
+            mldsa_keys_dir=settings.mldsa_keys_dir,
+            public_keys_dir=settings.public_keys_dir,
+        )
+
     return ensure_gpg_signing_key(
         gnupghome=settings.gnupghome,
         public_keys_dir=settings.public_keys_dir,
@@ -64,7 +75,7 @@ def initialize_storage_and_keys(settings: Settings) -> Path:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize storage directories and GPG signing authority on startup."""
+    """Initialize storage directories and GPG/PQC signing authorities on startup."""
     settings = getattr(app.state, "settings", None) or Settings()
     app.state.settings = settings
     initialize_storage_and_keys(settings)
@@ -75,9 +86,10 @@ app = FastAPI(
     title="Trusted OSS Supply Chain Gatekeeper",
     description=(
         "Dynamic pull-through quarantine, Harbor Chainguard OCI proxy cache, "
-        "ClamAV antivirus inspection, Trivy/NVD vulnerability gating, and GPG/Cosign signing."
+        "ClamAV antivirus inspection, Trivy/NVD vulnerability gating, GPG/Cosign signing, "
+        "and NIST FIPS 204 ML-DSA-65 Post-Quantum Cryptography dual-signing."
     ),
-    version="1.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -90,7 +102,7 @@ async def quarantine_scan_sign_and_promote(
     settings: Settings,
     simulated_cvss: float = 0.0,
 ) -> dict[str, Any]:
-    """Execute the Quarantine -> ClamAV -> CVE -> GPG Sign -> Trusted Promotion pipeline."""
+    """Execute the Quarantine -> ClamAV -> CVE -> GPG + ML-DSA-65 Dual Sign -> Trusted Promotion pipeline."""
     verdict = await evaluate_artifact_security(
         file_path=staged_file,
         clamav_host=settings.clamav_host,
@@ -113,25 +125,42 @@ async def quarantine_scan_sign_and_promote(
         staged_file.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    pqc_sig_file: Path | None = None
+    if settings.pqc_signing_enabled:
+        try:
+            pqc_sig_file = sign_artifact_mldsa65(
+                artifact_path=staged_file,
+                privkey_path=settings.mldsa_private_key_path,
+            )
+        except SigningError as exc:
+            staged_file.unlink(missing_ok=True)
+            sig_file.unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
     digests = compute_digests(staged_file)
     atomic_promote_artifact(
         staged_file=staged_file,
         sig_file=sig_file,
         dest_file=dest_file,
         digests=digests,
+        pqc_sig_file=pqc_sig_file,
     )
     staged_file.unlink(missing_ok=True)
     sig_file.unlink(missing_ok=True)
+    if pqc_sig_file:
+        pqc_sig_file.unlink(missing_ok=True)
 
     return append_provenance_record(
         provenance_log_path=settings.provenance_log_path,
         ecosystem=ecosystem,
         artifact_rel_path=artifact_rel_path,
         sha256=digests.sha256,
+        sha384=digests.sha384,
         sha512=digests.sha512,
         clamav_status=verdict.clamav_status,
         cve_status=verdict.cve_status,
         signature_file=f"{artifact_rel_path}.asc",
+        signature_file_mldsa=f"{artifact_rel_path}.mldsa65" if settings.pqc_signing_enabled else "",
     )
 
 
@@ -270,7 +299,7 @@ async def get_chainguard_cached_manifest(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     base_ref = reference
-    for suffix in (".asc", ".sha256", ".sha512"):
+    for suffix in (".asc", ".mldsa65", ".sha256", ".sha384", ".sha512"):
         if reference.endswith(suffix):
             base_ref = reference[: -len(suffix)]
             break
@@ -283,7 +312,13 @@ async def get_chainguard_cached_manifest(
         raise HTTPException(status_code=404, detail="Cached OCI manifest companion not found")
 
     base_sig = base_file.with_name(f"{base_file.name}.asc")
-    if not verify_artifact_signature(base_file, base_sig, settings.gnupghome):
+    if requested_file.name.endswith(".mldsa65") and settings.pqc_signing_enabled:
+        if not verify_artifact_mldsa65(base_file, requested_file, settings.mldsa_public_key_path):
+            raise HTTPException(
+                status_code=403,
+                detail="Integrity violation: OCI manifest lacks a valid Trusted OSS ML-DSA-65 PQC signature",
+            )
+    elif not verify_artifact_signature(base_file, base_sig, settings.gnupghome):
         raise HTTPException(
             status_code=403,
             detail="Integrity violation: OCI manifest lacks a valid Trusted OSS GPG signature",
@@ -294,7 +329,7 @@ async def get_chainguard_cached_manifest(
         sha256_file.read_text(encoding="utf-8").strip() if sha256_file.exists() else ""
     )
     media_type = "application/vnd.oci.image.index.v1+json"
-    if reference.endswith((".asc", ".sha256", ".sha512")):
+    if reference.endswith((".asc", ".mldsa65", ".sha256", ".sha384", ".sha512")):
         media_type = "text/plain; charset=utf-8"
 
     return FileResponse(
@@ -442,6 +477,29 @@ async def get_public_gpg_key(
     return pubkey.read_text(encoding="utf-8")
 
 
+@app.get("/keys/trusted-oss-mldsa65.pub", response_class=PlainTextResponse)
+async def get_public_mldsa65_key(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> str:
+    """Return the ASCII-armored Trusted OSS NIST FIPS 204 ML-DSA-65 Public Key."""
+    initialize_storage_and_keys(settings)
+    if not settings.mldsa_public_key_path.exists():
+        raise HTTPException(status_code=404, detail="ML-DSA-65 public key not initialized")
+    return settings.mldsa_public_key_path.read_text(encoding="utf-8")
+
+
+@app.get("/keys/trusted-oss-mldsa65.fingerprint", response_class=PlainTextResponse)
+async def get_mldsa65_fingerprint(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> str:
+    """Return SHA-256 and SHA-384 fingerprints for the ML-DSA-65 Public Key."""
+    initialize_storage_and_keys(settings)
+    fp_file = settings.public_keys_dir / "trusted-oss-mldsa65.fingerprint"
+    if not fp_file.exists():
+        raise HTTPException(status_code=404, detail="ML-DSA-65 fingerprint not initialized")
+    return fp_file.read_text(encoding="utf-8")
+
+
 @app.get("/audit/provenance")
 async def get_provenance_log(
     settings: Annotated[Settings, Depends(get_settings)],
@@ -513,9 +571,9 @@ async def get_maven_trusted_artifact(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Determine base artifact path if client requested .asc / .sha256 / .sha512
+    # Determine base artifact path if client requested .asc / .mldsa65 / .sha256 / .sha384 / .sha512
     base_rel_path = artifact_path
-    for suffix in (".asc", ".sha256", ".sha512"):
+    for suffix in (".asc", ".mldsa65", ".sha256", ".sha384", ".sha512"):
         if artifact_path.endswith(suffix):
             base_rel_path = artifact_path[: -len(suffix)]
             break
@@ -525,9 +583,15 @@ async def get_maven_trusted_artifact(
     if not requested_file.exists():
         raise HTTPException(status_code=404, detail="Trusted artifact not found")
 
-    # Enforce mandatory signature verification before serving any primary artifact
+    # Enforce mandatory signature verification before serving any primary artifact or companion
     base_sig = base_file.with_name(f"{base_file.name}.asc")
-    if not verify_artifact_signature(base_file, base_sig, settings.gnupghome):
+    if requested_file.name.endswith(".mldsa65") and settings.pqc_signing_enabled:
+        if not verify_artifact_mldsa65(base_file, requested_file, settings.mldsa_public_key_path):
+            raise HTTPException(
+                status_code=403,
+                detail="Integrity violation: artifact lacks a valid Trusted OSS ML-DSA-65 PQC signature",
+            )
+    elif not verify_artifact_signature(base_file, base_sig, settings.gnupghome):
         raise HTTPException(
             status_code=403,
             detail="Integrity violation: artifact lacks a valid Trusted OSS GPG signature",
@@ -566,7 +630,7 @@ async def get_pypi_trusted_package_file(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     base_filename = filename
-    for suffix in (".asc", ".sha256", ".sha512"):
+    for suffix in (".asc", ".mldsa65", ".sha256", ".sha384", ".sha512"):
         if filename.endswith(suffix):
             base_filename = filename[: -len(suffix)]
             break
@@ -603,7 +667,13 @@ async def get_pypi_trusted_package_file(
         raise HTTPException(status_code=404, detail="Trusted PyPI artifact not found")
 
     base_sig = base_file.with_name(f"{base_file.name}.asc")
-    if not verify_artifact_signature(base_file, base_sig, settings.gnupghome):
+    if requested_file.name.endswith(".mldsa65") and settings.pqc_signing_enabled:
+        if not verify_artifact_mldsa65(base_file, requested_file, settings.mldsa_public_key_path):
+            raise HTTPException(
+                status_code=403,
+                detail="Integrity violation: Python package lacks a valid Trusted OSS ML-DSA-65 PQC signature",
+            )
+    elif not verify_artifact_signature(base_file, base_sig, settings.gnupghome):
         raise HTTPException(
             status_code=403,
             detail="Integrity violation: Python package lacks a valid Trusted OSS GPG signature",
