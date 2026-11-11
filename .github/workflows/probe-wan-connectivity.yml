@@ -1,0 +1,31 @@
+name: Probe WAN Edge Connectivity
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: Test Inbound Connectivity to pfSense & Trusted OSS
+    runs-on: ubuntu-latest
+    steps:
+      - name: Display Runner Public IP
+        run: |
+          RUNNER_IP=$(curl -s https://api.ipify.org)
+          echo "GitHub Runner Public IP: ${RUNNER_IP}"
+
+      - name: Test TCP & HTTP Connectivity to jsigroup.ddns.net
+        run: |
+          echo "=== DNS Resolution ==="
+          dig +short jsigroup.ddns.net || nslookup jsigroup.ddns.net
+
+          echo -e "\n=== Testing Port 443 (HTTPS) ==="
+          curl -kv --connect-timeout 7 https://jsigroup.ddns.net/healthz 2>&1 || true
+
+          echo -e "\n=== Testing Port 8443 (HTTPS Alternative) ==="
+          curl -kv --connect-timeout 7 https://jsigroup.ddns.net:8443/healthz 2>&1 || true
+
+          echo -e "\n=== Testing Port 8080 (HTTP Port Forward) ==="
+          curl -v --connect-timeout 7 http://jsigroup.ddns.net:8080/healthz 2>&1 || true
+
+          echo -e "\n=== Testing Port 80 (HTTP) ==="
+          curl -v --connect-timeout 7 http://jsigroup.ddns.net/healthz 2>&1 || true
