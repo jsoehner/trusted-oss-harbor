@@ -13,7 +13,20 @@ steps:
       printf '%s\n' "$OSS_MTLS_CLIENT_KEY" > ~/.oss-tls/client.key
       chmod 0600 ~/.oss-tls/client.key
 
+      # 1. Fetch public keys using mTLS client credentials
       curl -fsSL --cert ~/.oss-tls/client.crt --key ~/.oss-tls/client.key \
         "https://${HARBOR_DOMAIN}/keys/trusted-oss-pubkey.asc" -o ~/.oss-tls/trusted-oss-pubkey.asc
       gpg --batch --import ~/.oss-tls/trusted-oss-pubkey.asc
+
+      # 2. Convert PEM to PKCS#12 Keystore for Maven / Java Native mTLS
+      openssl pkcs12 -export \
+        -in ~/.oss-tls/client.crt \
+        -inkey ~/.oss-tls/client.key \
+        -out ~/.oss-tls/client.p12 \
+        -passout pass:changeit
+
+      # 3. Export MAVEN_OPTS to GitHub Actions environment
+      echo "MAVEN_OPTS=-Djavax.net.ssl.keyStore=$HOME/.oss-tls/client.p12 -Djavax.net.ssl.keyStoreType=PKCS12 -Djavax.net.ssl.keyStorePassword=changeit" >> "$GITHUB_ENV"
+
+      # 4. Generate Maven Settings pointing to mTLS Gateway
       sed "s/\${HARBOR_DOMAIN}/${HARBOR_DOMAIN}/g" client-templates/maven-settings.xml > ~/.m2/settings.xml
