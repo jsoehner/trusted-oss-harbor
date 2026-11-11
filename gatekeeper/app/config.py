@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     gatekeeper_admin_token: str = Field(
         default="ChangeMe_GatekeeperToken_2026!", alias="GATEKEEPER_ADMIN_TOKEN"
     )
+    pqc_signing_enabled: bool = Field(default=True, alias="PQC_SIGNING_ENABLED")
 
     @property
     def quarantine_dir(self) -> Path:
@@ -70,6 +71,18 @@ class Settings(BaseSettings):
     @property
     def public_keys_dir(self) -> Path:
         return self.oss_data_root / "keys" / "public"
+
+    @property
+    def mldsa_keys_dir(self) -> Path:
+        return self.oss_data_root / "keys" / "mldsa"
+
+    @property
+    def mldsa_private_key_path(self) -> Path:
+        return self.mldsa_keys_dir / "trusted-oss-mldsa65.key"
+
+    @property
+    def mldsa_public_key_path(self) -> Path:
+        return self.public_keys_dir / "trusted-oss-mldsa65.pub"
 
     @property
     def provenance_log_path(self) -> Path:

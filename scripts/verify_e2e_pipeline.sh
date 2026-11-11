@@ -178,6 +178,15 @@ EXPECTED_SHA256="$(tr -d '[:space:]' < "${CLIENT_DIR}/spring-boot-starter-web-3.
 }
 echo "  [PASS] Downstream client verified SHA-256 digest (${ACTUAL_SHA256})"
 
+# Client verifies detached NIST FIPS 204 ML-DSA-65 post-quantum signature
+curl -fsS "http://127.0.0.1:${PORT}/keys/trusted-oss-mldsa65.pub" -o "${CLIENT_DIR}/trusted-oss-mldsa65.pub"
+curl -fsS "http://127.0.0.1:${PORT}/maven/trusted/${SB_JAR_PATH}.mldsa65" -o "${CLIENT_DIR}/spring-boot-starter-web-3.4.4.jar.mldsa65"
+"${VENV_DIR}/bin/python3" "${PROJECT_ROOT}/client-templates/pqc-verify.py" \
+  "${CLIENT_DIR}/spring-boot-starter-web-3.4.4.jar" \
+  "${CLIENT_DIR}/spring-boot-starter-web-3.4.4.jar.mldsa65" \
+  "${CLIENT_DIR}/trusted-oss-mldsa65.pub"
+echo "  [PASS] Downstream client verified NIST FIPS 204 ML-DSA-65 signature (.mldsa65) on cached spring-boot-starter-web-3.4.4.jar"
+
 # Client verifies detached GPG signature on cached Chainguard JRE OCI manifest
 curl -fsS "http://127.0.0.1:${PORT}/v2/chainguard-cache/chainguard/jre/manifests/latest" -o "${CLIENT_DIR}/chainguard-jre-manifest.json"
 curl -fsS "http://127.0.0.1:${PORT}/v2/chainguard-cache/chainguard/jre/manifests/latest.asc" -o "${CLIENT_DIR}/chainguard-jre-manifest.json.asc"
