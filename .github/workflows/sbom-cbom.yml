@@ -1,0 +1,35 @@
+name: Software & Cryptographic Bill of Materials (SBOM & CBOM)
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  pull-requests: write
+
+jobs:
+  generate-and-verify-boms:
+    name: Generate, Verify, and Upload BOMs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Run Multi-Language SBOM, CBOM & PQC Governance
+        uses: jsoehner/sbom-cbom-workflow@667ce68a7e71a0014cd800e8aca0f8ab82e9031b # v1.0.0
+        with:
+          target-dir: '.'
+          output-dir: 'oss'
+          publish-audit-report: 'true'
+          comment-pr: 'true'
+          upload-artifacts: 'true'
+          retention-days: '90'
