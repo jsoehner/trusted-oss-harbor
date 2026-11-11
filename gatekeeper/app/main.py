@@ -260,7 +260,7 @@ async def ensure_oci_manifest_cached(
     return base_file, "MISS"
 
 
-@app.get("/healthz")
+@app.api_route("/healthz", methods=["GET", "HEAD"])
 async def healthz(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, Any]:
@@ -468,7 +468,7 @@ async def get_catalog_cache_status(
     }
 
 
-@app.get("/keys/trusted-oss-pubkey.asc", response_class=PlainTextResponse)
+@app.api_route("/keys/trusted-oss-pubkey.asc", methods=["GET", "HEAD"], response_class=PlainTextResponse)
 async def get_public_gpg_key(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> str:
@@ -477,7 +477,7 @@ async def get_public_gpg_key(
     return pubkey.read_text(encoding="utf-8")
 
 
-@app.get("/keys/trusted-oss-mldsa65.pub", response_class=PlainTextResponse)
+@app.api_route("/keys/trusted-oss-mldsa65.pub", methods=["GET", "HEAD"], response_class=PlainTextResponse)
 async def get_public_mldsa65_key(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> str:
@@ -488,7 +488,7 @@ async def get_public_mldsa65_key(
     return settings.mldsa_public_key_path.read_text(encoding="utf-8")
 
 
-@app.get("/keys/trusted-oss-mldsa65.fingerprint", response_class=PlainTextResponse)
+@app.api_route("/keys/trusted-oss-mldsa65.fingerprint", methods=["GET", "HEAD"], response_class=PlainTextResponse)
 async def get_mldsa65_fingerprint(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> str:
@@ -558,7 +558,7 @@ async def ingest_artifact(
     return JSONResponse(status_code=201, content=record)
 
 
-@app.get("/maven/trusted/{artifact_path:path}")
+@app.api_route("/maven/trusted/{artifact_path:path}", methods=["GET", "HEAD"])
 async def get_maven_trusted_artifact(
     artifact_path: str,
     settings: Annotated[Settings, Depends(get_settings)],
@@ -600,7 +600,7 @@ async def get_maven_trusted_artifact(
     return FileResponse(requested_file, headers={"X-Cache-Status": cache_status})
 
 
-@app.get("/pypi/trusted/simple/{package}/", response_class=HTMLResponse)
+@app.api_route("/pypi/trusted/simple/{package}/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 async def get_pypi_simple_package_index(
     package: str,
     settings: Annotated[Settings, Depends(get_settings)],
@@ -615,7 +615,7 @@ async def get_pypi_simple_package_index(
     return render_pep503_simple_index(norm_pkg, pkg_dir)
 
 
-@app.get("/pypi/trusted/packages/{package}/{filename}")
+@app.api_route("/pypi/trusted/packages/{package}/{filename}", methods=["GET", "HEAD"])
 async def get_pypi_trusted_package_file(
     package: str,
     filename: str,

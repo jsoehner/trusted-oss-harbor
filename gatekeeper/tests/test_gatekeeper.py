@@ -609,6 +609,9 @@ def test_dynamic_upstream_pull_through_maven_and_pypi(
 
     # 1. Clean Maven artifact dynamically fetched, scanned, signed, and served on first GET
     slf4j_path = "org/slf4j/slf4j-api/2.0.16/slf4j-api-2.0.16.jar"
+    head_pre_resp = client.head(f"/maven/trusted/{slf4j_path}")
+    assert head_pre_resp.status_code == 200
+
     maven_resp = client.get(f"/maven/trusted/{slf4j_path}")
     assert maven_resp.status_code == 200
     asc_resp = client.get(f"/maven/trusted/{slf4j_path}.asc")
