@@ -20,16 +20,25 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Run Multi-Language SBOM, CBOM & PQC Governance
-        uses: jsoehner/jsi-bom-actions@ac3f2a1bee0f6206b31acba1d107520f4cd4c06f # v1.1.0
+        uses: jsoehner/jsi-bom-actions@v1.1.0
         with:
           target-dir: '.'
           output-dir: 'oss'
-          publish-audit-report: 'true'
-          comment-pr: 'true'
-          upload-artifacts: 'true'
-          retention-days: '90'
+          publish_audit_report: 'true'
+          comment_pr: 'true'
+          upload_artifacts: 'true'
+          retention_days: '90'
+
+      - name: Fetch OCI Image CBOM
+        run: python3 scripts/fetch_oci_cbom.py docker.io/library/alpine:latest
+
+      - name: Analyze CBOM & PQC Risk
+        run: python3 scripts/analyze_cbom.py oss/cbom.cyclonedx.json -o oss/pqc_risk_report.md
+
+      - name: Enrich Python SBOM
+        run: python3 scripts/enrich_sbom_python.py oss/sbom.cyclonedx.json .
