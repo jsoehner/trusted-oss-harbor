@@ -55,6 +55,10 @@ sync_nvd() {
 }
 
 render_harbor_config() {
+  if [[ ! -f "${PROJECT_ROOT}/.env" ]]; then
+    echo "[ERROR] ${PROJECT_ROOT}/.env is required before rendering Harbor config (copy .env.example and replace all ChangeMe_* secrets)." >&2
+    exit 1
+  fi
   echo "[INFO] Rendering config/harbor/harbor.yml from template..."
   sed \
     -e "s|\${HARBOR_DOMAIN}|${HARBOR_DOMAIN}|g" \

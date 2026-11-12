@@ -238,6 +238,21 @@ def verify_artifact_signature(
     return proc.returncode == 0
 
 
+def ensure_provenance_hmac_key(key_path: Path, configured_key: str = "") -> bytes:
+    """Return configured HMAC key or generate/load a persistent instance-unique key."""
+    if configured_key:
+        return configured_key.encode("utf-8")
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    if key_path.exists():
+        raw = key_path.read_bytes().strip()
+        if raw:
+            return raw
+    new_key = os.urandom(32).hex().encode("ascii")
+    key_path.write_bytes(new_key)
+    os.chmod(key_path, 0o600)
+    return new_key
+
+
 def append_provenance_record(
     provenance_log_path: Path,
     ecosystem: str,
@@ -249,9 +264,11 @@ def append_provenance_record(
     signature_file: str,
     sha384: str = "",
     signature_file_mldsa: str = "",
+    hmac_key: bytes | None = None,
 ) -> dict[str, Any]:
     """Append an immutable provenance record to provenance.jsonl."""
     provenance_log_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_key = hmac_key if hmac_key else os.urandom(32)
     record = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "ecosystem": ecosystem,
@@ -265,7 +282,7 @@ def append_provenance_record(
         "signature_file_mldsa": signature_file_mldsa,
         "pqc_status": "POST-QUANTUM READY" if signature_file_mldsa else "CLASSICAL",
         "attestation_hmac": hmac.new(
-            b"trusted-oss-provenance-v1",
+            resolved_key,
             f"{ecosystem}:{artifact_rel_path}:{sha256}:{sha384}".encode("utf-8"),
             hashlib.sha384 if sha384 else hashlib.sha256,
         ).hexdigest(),

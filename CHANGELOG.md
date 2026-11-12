@@ -5,6 +5,16 @@ All notable changes to `trusted-oss-harbor` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- **Fail-Closed Admin Authentication**: Removed default `ChangeMe_GatekeeperToken_2026!` fallback from `Settings` and `docker-compose.yml`; admin endpoints now return HTTP `503` if `GATEKEEPER_ADMIN_TOKEN` is unset or a known placeholder, and `scripts/bootstrap_host.sh` requires `.env` before rendering `harbor.yml`.
+- **Trivy Vulnerability Gate & Simulation Guard**: Added `trivy fs` vulnerability scanning in `gatekeeper/app/scanner.py` (`TRIVY_REQUIRED` support) and gated `X-Simulated-Cvss` behind `ALLOW_SIMULATED_CVSS=false` by default.
+- **Instance-Unique Provenance HMAC Key**: Replaced the hardcoded HMAC key in `gatekeeper/app/signer.py` with `PROVENANCE_HMAC_KEY` or an auto-generated `0o600` key in `<OSS_DATA_ROOT>/keys/provenance.hmac.key`.
+- **DoS, Zip-Bomb, & Encrypted Archive Protections**: Streamed uploads/downloads with `MAX_ARTIFACT_BYTES` (250 MB, HTTP `413`), enforced archive member/uncompressed-size caps, rejected encrypted ZIP entries, enabled `ArchiveBlockEncrypted yes` in `clamd.conf`, and added pagination to `/audit/provenance`.
+- **Container & Gateway Hardening**: Configured the NAS appliance `gatekeeper` service to run as non-root user `gatekeeper` (`10001`), added Nginx `limit_req_zone` rate limiting on `/ingest/` and `/catalog/`, fixed undefined `logger` in `main.py`, and escaped `sha256` attributes in PEP 503 HTML responses.
+- **Documentation**: Added [ADR 0002](docs/adr/0002-gatekeeper-security-hardening-and-fail-closed-controls.md) and updated `README.md` and `.env.example`.
+
 ## [0.2.0] - 2026-11-11
 
 ### Added

@@ -26,7 +26,11 @@ mkdir -p \
   /var/run/clamav \
   /var/log/clamav
 
-# 2. Enforce strict permissions on private key directories
+# 2. Enforce strict permissions on private key directories and gatekeeper ownership
+chown -R gatekeeper:gatekeeper \
+  "${OSS_DATA_ROOT}/packages" \
+  "${OSS_DATA_ROOT}/keys" \
+  "${OSS_DATA_ROOT}/audit" 2>/dev/null || true
 chmod 0700 \
   "${OSS_DATA_ROOT}/keys/gnupg" \
   "${OSS_DATA_ROOT}/keys/mldsa" \

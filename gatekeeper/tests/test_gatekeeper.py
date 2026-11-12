@@ -277,6 +277,7 @@ def test_settings(tmp_path: Path, mock_clamd_server: tuple[str, int]) -> Setting
         AUTO_PROMOTE_CLEAN_ARTIFACTS=False,
         GNUPGHOME=data_root / "keys" / "gnupg",
         GATEKEEPER_ADMIN_TOKEN="test-secret-token",
+        ALLOW_SIMULATED_CVSS=True,
     )
 
 
@@ -874,4 +875,68 @@ def test_mldsa65_dual_signing_and_http_endpoints(
     r_sha384 = client.get("/maven/trusted/com/example/pqc-demo/1.0.0/pqc-demo-1.0.0.jar.sha384")
     assert r_sha384.status_code == 200
     assert len(r_sha384.text.strip()) == 96
+
+
+def test_insecure_default_admin_token_rejected(
+    tmp_path: Path, mock_clamd_server: tuple[str, int]
+) -> None:
+    """Verify admin endpoints fail closed (HTTP 503) when GATEKEEPER_ADMIN_TOKEN is unset or default."""
+    clamd_host, clamd_port = mock_clamd_server
+    data_root = tmp_path / "insecure-default"
+    bad_settings = Settings(
+        OSS_DATA_ROOT=data_root,
+        CLAMAV_HOST=clamd_host,
+        CLAMAV_PORT=clamd_port,
+        GATEKEEPER_ADMIN_TOKEN="",
+    )
+    app.state.settings = bad_settings
+    initialize_storage_and_keys(bad_settings)
+    with TestClient(app) as c:
+        resp = c.post("/catalog/warm", headers={"X-Gatekeeper-Token": ""})
+        assert resp.status_code == 503
+
+
+def test_simulated_cvss_header_ignored_when_disabled(
+    tmp_path: Path, mock_clamd_server: tuple[str, int]
+) -> None:
+    """Verify X-Simulated-Cvss header is ignored in production mode (ALLOW_SIMULATED_CVSS=False)."""
+    clamd_host, clamd_port = mock_clamd_server
+    data_root = tmp_path / "prod-mode"
+    prod_settings = Settings(
+        OSS_DATA_ROOT=data_root,
+        CLAMAV_HOST=clamd_host,
+        CLAMAV_PORT=clamd_port,
+        GATEKEEPER_ADMIN_TOKEN="prod-token",
+        ALLOW_SIMULATED_CVSS=False,
+    )
+    app.state.settings = prod_settings
+    initialize_storage_and_keys(prod_settings)
+    jar_data = build_sample_jar({"com/example/App.class": b"\xca\xfe\xba\xbe\x00\x00"})
+    with TestClient(app) as c:
+        resp = c.post(
+            "/ingest/maven/com/example/app/1.0.0/app-1.0.0.jar",
+            headers={
+                "X-Gatekeeper-Token": "prod-token",
+                "X-Simulated-Cvss": "9.8",
+            },
+            files={"file": ("app-1.0.0.jar", jar_data, "application/java-archive")},
+        )
+        assert resp.status_code == 201
+
+
+def test_encrypted_zip_rejected_cleanly(tmp_path: Path) -> None:
+    """Verify encrypted ZIP entries are rejected cleanly instead of raising RuntimeError."""
+    raw = bytearray(build_sample_jar({"secret.txt": b"classified"}))
+    # Set general purpose bit 0 (encrypted) in local file header and central directory
+    lfh_idx = raw.index(b"PK\x03\x04")
+    raw[lfh_idx + 6] |= 0x01
+    cdh_idx = raw.index(b"PK\x01\x02")
+    raw[cdh_idx + 8] |= 0x01
+
+    enc_zip = tmp_path / "encrypted.zip"
+    enc_zip.write_bytes(bytes(raw))
+    ok, msg = inspect_archive_safety(enc_zip)
+    assert not ok
+    assert "Encrypted entry prohibited" in msg
+
 

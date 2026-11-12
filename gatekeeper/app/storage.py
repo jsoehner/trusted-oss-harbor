@@ -133,8 +133,8 @@ def render_pep503_simple_index(package_name: str, pkg_dir: Path) -> str:
                 continue
             mldsa_path = entry.with_name(f"{entry.name}.mldsa65")
             pqc_attr = ' data-pqc-sig="true"' if mldsa_path.exists() else ""
-            sha256_val = sha256_path.read_text(encoding="utf-8").strip()
-            safe_fname = html.escape(entry.name)
+            sha256_val = html.escape(sha256_path.read_text(encoding="utf-8").strip(), quote=True)
+            safe_fname = html.escape(entry.name, quote=True)
             href = f"/pypi/trusted/packages/{safe_pkg}/{safe_fname}#sha256={sha256_val}"
             links.append(
                 f'    <a href="{href}" data-gpg-sig="true"{pqc_attr}>{safe_fname}</a><br/>'

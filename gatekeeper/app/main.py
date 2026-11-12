@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 import json
+import logging
 from pathlib import Path
 import secrets
 from typing import Annotated, Any
@@ -17,6 +18,7 @@ from app.signer import (
     append_provenance_record,
     ensure_gpg_signing_key,
     ensure_mldsa_signing_key,
+    ensure_provenance_hmac_key,
     sign_artifact_detached_gpg,
     sign_artifact_mldsa65,
     verify_artifact_signature,
@@ -29,6 +31,9 @@ from app.storage import (
     render_pep503_simple_index,
     resolve_safe_relative_path,
 )
+
+logger = logging.getLogger(__name__)
+INSECURE_DEFAULT_TOKENS = {"", "ChangeMe_GatekeeperToken_2026!"}
 
 
 OCI_ACCEPT_HEADER = (
@@ -67,10 +72,48 @@ def initialize_storage_and_keys(settings: Settings) -> Path:
             public_keys_dir=settings.public_keys_dir,
         )
 
+    ensure_provenance_hmac_key(
+        key_path=settings.provenance_hmac_key_path,
+        configured_key=settings.provenance_hmac_key,
+    )
+
     return ensure_gpg_signing_key(
         gnupghome=settings.gnupghome,
         public_keys_dir=settings.public_keys_dir,
     )
+
+
+def require_admin_token(x_gatekeeper_token: str | None, settings: Settings) -> None:
+    """Enforce non-default, constant-time admin token authentication."""
+    configured = settings.gatekeeper_admin_token
+    if configured in INSECURE_DEFAULT_TOKENS:
+        raise HTTPException(
+            status_code=503,
+            detail="Gatekeeper admin token is unset or uses an insecure default",
+        )
+    if not x_gatekeeper_token or not secrets.compare_digest(x_gatekeeper_token, configured):
+        raise HTTPException(status_code=403, detail="Invalid gatekeeper admin token")
+
+
+async def stream_http_to_file(
+    client: httpx.AsyncClient, url: str, dest_path: Path, max_bytes: int
+) -> bool:
+    """Stream an upstream HTTP GET response to disk, enforcing a maximum byte limit."""
+    async with client.stream("GET", url) as resp:
+        if resp.status_code != 200:
+            return False
+        total = 0
+        with dest_path.open("wb") as f:
+            async for chunk in resp.aiter_bytes(chunk_size=65536):
+                total += len(chunk)
+                if total > max_bytes:
+                    dest_path.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Upstream artifact exceeds maximum allowed size ({max_bytes} bytes)",
+                    )
+                f.write(chunk)
+    return True
 
 
 @asynccontextmanager
@@ -110,6 +153,7 @@ async def quarantine_scan_sign_and_promote(
         clamav_required=settings.clamav_required,
         cvss_threshold=settings.cvss_fail_threshold,
         simulated_cvss=simulated_cvss,
+        trivy_required=settings.trivy_required,
     )
     if not verdict.passed:
         staged_file.unlink(missing_ok=True)
@@ -150,6 +194,10 @@ async def quarantine_scan_sign_and_promote(
     if pqc_sig_file:
         pqc_sig_file.unlink(missing_ok=True)
 
+    hmac_key = ensure_provenance_hmac_key(
+        key_path=settings.provenance_hmac_key_path,
+        configured_key=settings.provenance_hmac_key,
+    )
     return append_provenance_record(
         provenance_log_path=settings.provenance_log_path,
         ecosystem=ecosystem,
@@ -161,6 +209,7 @@ async def quarantine_scan_sign_and_promote(
         cve_status=verdict.cve_status,
         signature_file=f"{artifact_rel_path}.asc",
         signature_file_mldsa=f"{artifact_rel_path}.mldsa65" if settings.pqc_signing_enabled else "",
+        hmac_key=hmac_key,
     )
 
 
@@ -215,14 +264,14 @@ async def ensure_maven_artifact_cached(
         for base_url in upstream_urls:
             candidate_url = f"{base_url.rstrip('/')}/{base_rel_path}"
             try:
-                resp = await client.get(candidate_url)
-                if resp.status_code == 200:
-                    staged_file.write_bytes(resp.content)
+                if await stream_http_to_file(client, candidate_url, staged_file, settings.max_artifact_bytes):
                     downloaded = True
                     break
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.warning(
-                    f"Failed to fetch maven artifact from {candidate_url}: {e}"
+                    "Failed to fetch maven artifact from %s: %s", candidate_url, e
                 )
 
     if not downloaded:
@@ -363,10 +412,7 @@ async def warm_seed_catalog(
     x_gatekeeper_token: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
     """Warm the Harbor Chainguard (JRE & Python) and shared Spring Boot component caches."""
-    if not x_gatekeeper_token or not secrets.compare_digest(
-        x_gatekeeper_token, settings.gatekeeper_admin_token
-    ):
-        raise HTTPException(status_code=403, detail="Invalid gatekeeper admin token")
+    require_admin_token(x_gatekeeper_token, settings)
 
     if not settings.seed_catalog_path.exists():
         raise HTTPException(
@@ -487,7 +533,9 @@ async def get_public_gpg_key(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> str:
     """Return the ASCII-armored Trusted OSS GPG Public Key for client signature verification."""
-    pubkey = initialize_storage_and_keys(settings)
+    pubkey = settings.public_keys_dir / "trusted-oss-pubkey.asc"
+    if not pubkey.exists():
+        pubkey = initialize_storage_and_keys(settings)
     return pubkey.read_text(encoding="utf-8")
 
 
@@ -496,7 +544,8 @@ async def get_public_mldsa65_key(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> str:
     """Return the ASCII-armored Trusted OSS NIST FIPS 204 ML-DSA-65 Public Key."""
-    initialize_storage_and_keys(settings)
+    if not settings.mldsa_public_key_path.exists():
+        initialize_storage_and_keys(settings)
     if not settings.mldsa_public_key_path.exists():
         raise HTTPException(status_code=404, detail="ML-DSA-65 public key not initialized")
     return settings.mldsa_public_key_path.read_text(encoding="utf-8")
@@ -507,8 +556,9 @@ async def get_mldsa65_fingerprint(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> str:
     """Return SHA-256 and SHA-384 fingerprints for the ML-DSA-65 Public Key."""
-    initialize_storage_and_keys(settings)
     fp_file = settings.public_keys_dir / "trusted-oss-mldsa65.fingerprint"
+    if not fp_file.exists():
+        initialize_storage_and_keys(settings)
     if not fp_file.exists():
         raise HTTPException(status_code=404, detail="ML-DSA-65 fingerprint not initialized")
     return fp_file.read_text(encoding="utf-8")
@@ -517,14 +567,24 @@ async def get_mldsa65_fingerprint(
 @app.get("/audit/provenance")
 async def get_provenance_log(
     settings: Annotated[Settings, Depends(get_settings)],
+    limit: int = 200,
+    offset: int = 0,
 ) -> dict[str, Any]:
-    """Return all recorded cryptographic provenance attestations."""
+    """Return recorded cryptographic provenance attestations with pagination."""
+    safe_limit = max(1, min(limit, 1000))
+    safe_offset = max(0, offset)
     records: list[dict[str, Any]] = []
+    total = 0
     if settings.provenance_log_path.exists():
-        for line in settings.provenance_log_path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                records.append(json.loads(line))
-    return {"count": len(records), "records": records}
+        with settings.provenance_log_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if safe_offset <= total < safe_offset + safe_limit:
+                    records.append(json.loads(stripped))
+                total += 1
+    return {"count": total, "limit": safe_limit, "offset": safe_offset, "records": records}
 
 
 @app.post("/ingest/{ecosystem}/{artifact_path:path}")
@@ -537,10 +597,7 @@ async def ingest_artifact(
     x_simulated_cvss: Annotated[float, Header()] = 0.0,
 ) -> JSONResponse:
     """Ingest, ClamAV-scan, CVE-verify, GPG-sign, and promote a Maven or PyPI artifact."""
-    if not x_gatekeeper_token or not secrets.compare_digest(
-        x_gatekeeper_token, settings.gatekeeper_admin_token
-    ):
-        raise HTTPException(status_code=403, detail="Invalid gatekeeper admin token")
+    require_admin_token(x_gatekeeper_token, settings)
 
     if ecosystem == "maven":
         target_root = settings.trusted_maven_dir
@@ -558,16 +615,27 @@ async def ingest_artifact(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     staged_file.parent.mkdir(parents=True, exist_ok=True)
-    content = await file.read()
-    staged_file.write_bytes(content)
+    total_written = 0
+    with staged_file.open("wb") as out_f:
+        while chunk := await file.read(65536):
+            total_written += len(chunk)
+            if total_written > settings.max_artifact_bytes:
+                out_f.close()
+                staged_file.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Uploaded artifact exceeds maximum allowed size ({settings.max_artifact_bytes} bytes)",
+                )
+            out_f.write(chunk)
 
+    effective_sim_cvss = x_simulated_cvss if settings.allow_simulated_cvss else 0.0
     record = await quarantine_scan_sign_and_promote(
         staged_file=staged_file,
         dest_file=dest_file,
         ecosystem=ecosystem,
         artifact_rel_path=artifact_path,
         settings=settings,
-        simulated_cvss=x_simulated_cvss,
+        simulated_cvss=effective_sim_cvss,
     )
     return JSONResponse(status_code=201, content=record)
 
@@ -666,14 +734,14 @@ async def get_pypi_trusted_package_file(
             for base_url in upstream_urls:
                 candidate_url = f"{base_url.rstrip('/')}/{base_rel_path}"
                 try:
-                    resp = await client.get(candidate_url)
-                    if resp.status_code == 200:
-                        staged_file.write_bytes(resp.content)
+                    if await stream_http_to_file(client, candidate_url, staged_file, settings.max_artifact_bytes):
                         downloaded = True
                         break
+                except HTTPException:
+                    raise
                 except Exception as e:
                     logger.warning(
-                        f"Failed to fetch PyPI artifact from {candidate_url}: {e}"
+                        "Failed to fetch PyPI artifact from %s: %s", candidate_url, e
                     )
 
         if not downloaded:

@@ -63,6 +63,7 @@ docker pull ghcr.io/jsoehner/trusted-oss-gatekeeper:latest
 
 ### 2. Run via Docker CLI on your NAS
 ```bash
+# Generate a strong admin token first: openssl rand -hex 32
 docker run -d \
   --name trusted-oss-gatekeeper \
   --restart unless-stopped \
@@ -70,7 +71,7 @@ docker run -d \
   -v /mnt/tank/trusted-oss-data:/data \
   -e CVSS_FAIL_THRESHOLD=7.0 \
   -e AUTO_PROMOTE_CLEAN_ARTIFACTS=true \
-  -e GATEKEEPER_ADMIN_TOKEN="ChangeMe_GatekeeperToken_2026!" \
+  -e GATEKEEPER_ADMIN_TOKEN="<your-generated-token>" \
   ghcr.io/jsoehner/trusted-oss-gatekeeper:latest
 ```
 
@@ -89,14 +90,23 @@ services:
       OSS_DATA_ROOT: /data
       CVSS_FAIL_THRESHOLD: 7.0
       AUTO_PROMOTE_CLEAN_ARTIFACTS: "true"
-      GATEKEEPER_ADMIN_TOKEN: "ChangeMe_GatekeeperToken_2026!"
+      GATEKEEPER_ADMIN_TOKEN: "${GATEKEEPER_ADMIN_TOKEN:?set a strong token}"
 ```
 
 The appliance automatically:
-- Initializes the `/data` directory hierarchy on your NAS ZFS pool.
-- Auto-generates RSA-3072 GPG and NIST FIPS 204 ML-DSA-65 PQC signing authorities on first boot.
+- Initializes the `/data` directory hierarchy on your NAS ZFS pool and runs the `gatekeeper` API as a non-root user (`10001`).
+- Auto-generates RSA-3072 GPG, NIST FIPS 204 ML-DSA-65 PQC signing authorities, and an instance-unique provenance HMAC key on first boot.
 - Auto-downloads and updates ClamAV virus signatures with persistent caching in `/data/scanners/clamav`.
-- Serves the unified gateway on port `8080`.
+- Serves the unified rate-limited gateway on port `8080`.
+
+---
+
+## Security Controls & Configuration
+
+- **Fail-Closed Admin Token**: `GATEKEEPER_ADMIN_TOKEN` is required for `/ingest/*` and `/catalog/warm`. Unset or placeholder values (`ChangeMe_GatekeeperToken_2026!`) are rejected with HTTP `503`.
+- **Vulnerability Scanning**: `scan_with_trivy()` runs `trivy fs` when `trivy` is installed; set `TRIVY_REQUIRED=true` to fail closed if the CLI is absent. `ALLOW_SIMULATED_CVSS` defaults to `false` so `X-Simulated-Cvss` headers are ignored in production.
+- **Resource & Archive Guards**: Uploads and upstream pull-through downloads stream to disk with a `MAX_ARTIFACT_BYTES` cap (default `262144000` / 250 MB). Archives exceeding 10,000 members, 512 MB uncompressed, or containing encrypted entries are rejected.
+- **Provenance Integrity**: `PROVENANCE_HMAC_KEY` signs `audit/provenance.jsonl` entries (auto-generated at `<OSS_DATA_ROOT>/keys/provenance.hmac.key` if unset). `/audit/provenance` supports `limit` and `offset` pagination.
 
 
 ---

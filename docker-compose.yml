@@ -55,7 +55,7 @@ services:
       COSIGN_PRIVATE_KEY_PATH: /data/trusted-oss/keys/cosign/cosign.key
       COSIGN_PUBLIC_KEY_PATH: /data/trusted-oss/keys/cosign/cosign.pub
       COSIGN_PASSWORD: ${COSIGN_PASSWORD:-}
-      GATEKEEPER_ADMIN_TOKEN: ${GATEKEEPER_ADMIN_TOKEN:-ChangeMe_GatekeeperToken_2026!}
+      GATEKEEPER_ADMIN_TOKEN: ${GATEKEEPER_ADMIN_TOKEN:?GATEKEEPER_ADMIN_TOKEN must be set}
     volumes:
       - ${OSS_DATA_ROOT:-/home/jsoehner/trusted-oss-data}:/data/trusted-oss
     expose:

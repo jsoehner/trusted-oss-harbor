@@ -49,7 +49,19 @@ class Settings(BaseSettings):
         alias="COSIGN_PUBLIC_KEY_PATH",
     )
     gatekeeper_admin_token: str = Field(
-        default="ChangeMe_GatekeeperToken_2026!", alias="GATEKEEPER_ADMIN_TOKEN"
+        default="", alias="GATEKEEPER_ADMIN_TOKEN"
+    )
+    provenance_hmac_key: str = Field(
+        default="", alias="PROVENANCE_HMAC_KEY"
+    )
+    allow_simulated_cvss: bool = Field(
+        default=False, alias="ALLOW_SIMULATED_CVSS"
+    )
+    trivy_required: bool = Field(
+        default=False, alias="TRIVY_REQUIRED"
+    )
+    max_artifact_bytes: int = Field(
+        default=250 * 1024 * 1024, alias="MAX_ARTIFACT_BYTES"
     )
     pqc_signing_enabled: bool = Field(default=True, alias="PQC_SIGNING_ENABLED")
 
@@ -112,3 +124,7 @@ class Settings(BaseSettings):
     @property
     def provenance_log_path(self) -> Path:
         return self.oss_data_root / "audit" / "provenance.jsonl"
+
+    @property
+    def provenance_hmac_key_path(self) -> Path:
+        return self.oss_data_root / "keys" / "provenance.hmac.key"

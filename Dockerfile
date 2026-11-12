@@ -45,9 +45,12 @@ COPY config/nginx/appliance-gateway.conf /etc/nginx/conf.d/default.conf
 COPY config/clamav/clamd.conf /etc/clamav/clamd.conf
 COPY config/clamav/freshclam.conf /etc/clamav/freshclam.conf
 
-# Ensure runtime directories exist
-RUN mkdir -p /var/run/clamav /var/log/clamav /var/lib/clamav /var/log/supervisor /data && \
-    chown -R clamav:clamav /var/run/clamav /var/log/clamav /var/lib/clamav
+# Ensure non-root gatekeeper user and runtime directories exist
+RUN groupadd -g 10001 gatekeeper && \
+    useradd -u 10001 -g gatekeeper -m -s /usr/sbin/nologin gatekeeper && \
+    mkdir -p /var/run/clamav /var/log/clamav /var/lib/clamav /var/log/supervisor /data && \
+    chown -R clamav:clamav /var/run/clamav /var/log/clamav /var/lib/clamav && \
+    chown -R gatekeeper:gatekeeper /data
 
 # 4. Install Python Gatekeeper Dependencies
 WORKDIR /app
