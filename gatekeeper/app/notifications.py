@@ -8,12 +8,21 @@ and carrier Email-to-SMS gateways.
 from __future__ import annotations
 
 import datetime
+import json
+import os
 import smtplib
 import ssl
+import time
 from email.message import EmailMessage
+from pathlib import Path
 from typing import Any
 
 import httpx
+
+GRAPH_DEFAULT_SCOPES = "offline_access https://graph.microsoft.com/Mail.Send"
+DEFAULT_TOKEN_CACHE_PATH = (
+    Path.home() / ".config" / "trusted-oss-harbor" / "msgraph_token.json"
+)
 
 
 def build_daily_digest(
@@ -172,3 +181,152 @@ def send_twilio_sms(
         timeout=timeout,
     )
     resp.raise_for_status()
+
+
+def load_msgraph_token_cache(path: Path) -> dict[str, Any]:
+    """Load cached Microsoft Graph OAuth2 token payload from disk."""
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_msgraph_token_cache(path: Path, data: dict[str, Any]) -> None:
+    """Persist Microsoft Graph OAuth2 token payload with 0600 permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.chmod(path, 0o600)
+
+
+def request_msgraph_device_code(
+    *,
+    client_id: str,
+    tenant_id: str = "common",
+    scopes: str = GRAPH_DEFAULT_SCOPES,
+    timeout: float = 20.0,
+) -> dict[str, Any]:
+    """Initiate OAuth2 Device Code flow for MFA-compatible delegated Mail.Send."""
+    url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/devicecode"
+    resp = httpx.post(
+        url,
+        data={"client_id": client_id, "scope": scopes},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def poll_msgraph_device_token(
+    *,
+    client_id: str,
+    device_code: str,
+    tenant_id: str = "common",
+    interval: int = 5,
+    expires_in: int = 900,
+    timeout: float = 20.0,
+) -> dict[str, Any]:
+    """Poll Microsoft identity platform until device code login completes."""
+    url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    deadline = time.monotonic() + max(30, expires_in)
+    wait_seconds = max(1, interval)
+    while time.monotonic() < deadline:
+        resp = httpx.post(
+            url,
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "client_id": client_id,
+                "device_code": device_code,
+            },
+            timeout=timeout,
+        )
+        payload = resp.json()
+        if resp.status_code == 200 and "access_token" in payload:
+            payload["obtained_at"] = int(time.time())
+            return payload
+        err = payload.get("error", "")
+        if err == "authorization_pending":
+            time.sleep(wait_seconds)
+            continue
+        if err == "slow_down":
+            wait_seconds += 5
+            time.sleep(wait_seconds)
+            continue
+        raise RuntimeError(
+            f"Microsoft Graph device login failed ({err}): "
+            f"{payload.get('error_description', resp.text)}"
+        )
+    raise TimeoutError("Timed out waiting for Microsoft Graph device login.")
+
+
+def refresh_msgraph_access_token(
+    *,
+    client_id: str,
+    refresh_token: str,
+    tenant_id: str = "common",
+    scopes: str = GRAPH_DEFAULT_SCOPES,
+    timeout: float = 20.0,
+) -> dict[str, Any]:
+    """Exchange a long-lived refresh token for a fresh Microsoft Graph access token."""
+    url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    resp = httpx.post(
+        url,
+        data={
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": scopes,
+        },
+        timeout=timeout,
+    )
+    payload = resp.json()
+    if resp.status_code != 200 or "access_token" not in payload:
+        raise RuntimeError(
+            f"Microsoft Graph token refresh failed ({payload.get('error', resp.status_code)}): "
+            f"{payload.get('error_description', resp.text)}"
+        )
+    payload["obtained_at"] = int(time.time())
+    return payload
+
+
+def resolve_msgraph_access_token(
+    *,
+    access_token: str = "",
+    refresh_token: str = "",
+    client_id: str = "",
+    tenant_id: str = "common",
+    token_file: Path = DEFAULT_TOKEN_CACHE_PATH,
+    timeout: float = 20.0,
+) -> str:
+    """Resolve a usable Microsoft Graph access token, refreshing and rotating cache if needed."""
+    if access_token:
+        return access_token
+
+    cached = load_msgraph_token_cache(token_file)
+    eff_client_id = client_id or str(cached.get("client_id", ""))
+    eff_tenant_id = (
+        tenant_id if tenant_id != "common" else str(cached.get("tenant_id", "common"))
+    )
+    eff_refresh = refresh_token or str(cached.get("refresh_token", ""))
+
+    if not eff_refresh:
+        return ""
+    if not eff_client_id:
+        raise ValueError(
+            "Microsoft Graph refresh token requires --graph-client-id (or GRAPH_CLIENT_ID)."
+        )
+
+    refreshed = refresh_msgraph_access_token(
+        client_id=eff_client_id,
+        refresh_token=eff_refresh,
+        tenant_id=eff_tenant_id,
+        timeout=timeout,
+    )
+    merged = {
+        **cached,
+        **refreshed,
+        "client_id": eff_client_id,
+        "tenant_id": eff_tenant_id,
+    }
+    if "refresh_token" not in merged:
+        merged["refresh_token"] = eff_refresh
+    save_msgraph_token_cache(token_file, merged)
+    return str(merged["access_token"])

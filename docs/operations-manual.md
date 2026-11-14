@@ -224,8 +224,34 @@ GATEKEEPER_ADMIN_TOKEN="<token>" \
     --sms-to "5551234567@vtext.com"
 ```
 
-Alternative HTTPS port `443` transports (when even port `587` is restricted):
-- **Microsoft Graph**: pass `--graph-token "$GRAPH_ACCESS_TOKEN"` and `--to "ops@example.com"` (requires `Mail.Send` OAuth scope).
+Alternative HTTPS port `443` transports (recommended when **MFA is enabled** or SMTP AUTH / port `587` is blocked):
+- **Microsoft Graph OAuth2 Device Code + Long-Lived Refresh Token** (supports MFA, works over HTTPS `443`, and auto-rotates the refresh token on every daily run):
+  1. Register a free Entra ID / Azure AD App Registration (Public client / native, **Allow public client flows = Yes**) with delegated Microsoft Graph permissions `Mail.Send` and `offline_access`.
+  2. Run the one-time interactive MFA login to store the refresh token in `~/.config/trusted-oss-harbor/msgraph_token.json` (`chmod 600`):
+     ```bash
+     python3 scripts/daily_digest.py \
+       --graph-auth \
+       --graph-client-id "<your-app-client-id>" \
+       --graph-tenant-id "common"
+     ```
+  3. Send daily email + carrier Email-to-SMS over HTTPS `443` using the cached refresh token:
+     ```bash
+     GATEKEEPER_ADMIN_TOKEN="<token>" \
+       python3 scripts/daily_digest.py \
+         --url http://oss.jsigroup.local:8080 \
+         --to "ops@example.com" \
+         --sms-to "5551234567@vtext.com"
+     ```
+  4. Or run it automatically inside the `oss-engine` Docker container by setting these in `.env` and restarting `docker compose up -d --build oss-engine`:
+     ```dotenv
+     DIGEST_ENABLED=true
+     DIGEST_TO=ops@example.com
+     DIGEST_SMS_TO=5551234567@vtext.com
+     GRAPH_CLIENT_ID=<your-app-client-id>
+     GRAPH_TENANT_ID=common
+     GRAPH_REFRESH_TOKEN=<refresh_token_from_msgraph_token.json>
+     ```
+- **Microsoft Graph (direct token)**: pass `--graph-token "$GRAPH_ACCESS_TOKEN"` and `--to "ops@example.com"`.
 - **Twilio SMS**: pass `--twilio-sid`, `--twilio-token`, `--twilio-from`, and `--twilio-to "+15551234567"`.
 
 Schedule a daily cron job (e.g., 07:30 every day) in `crontab -e`:

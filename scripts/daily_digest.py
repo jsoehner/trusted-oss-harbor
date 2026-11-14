@@ -3,9 +3,10 @@
 
 Fetches gateway health, vulnerability counts, and recent scheduled/engine
 activity events, then prints (--dry-run) or sends a daily digest over:
-  1. Outlook / M365 SMTP STARTTLS on port 587 (bypasses blocked port 25),
-     optionally also delivering to carrier Email-to-SMS gateways (--sms-to).
-  2. Microsoft Graph API over HTTPS port 443 (--graph-token).
+  1. Microsoft Graph API over HTTPS port 443 with MFA-compatible OAuth2 Device
+     Code + long-lived Refresh Token (--graph-auth / --token-file).
+     Supports both regular email (--to) and carrier Email-to-SMS (--sms-to).
+  2. Outlook / M365 SMTP STARTTLS on port 587 (for non-MFA / SMTP AUTH accounts).
   3. Twilio SMS REST API over HTTPS port 443 (--twilio-*).
 """
 
@@ -26,7 +27,12 @@ if str(GATEKEEPER_DIR) not in sys.path:
     sys.path.insert(0, str(GATEKEEPER_DIR))
 
 from app.notifications import (  # noqa: E402
+    DEFAULT_TOKEN_CACHE_PATH,
     build_daily_digest,
+    poll_msgraph_device_token,
+    request_msgraph_device_code,
+    resolve_msgraph_access_token,
+    save_msgraph_token_cache,
     send_graph_mail,
     send_smtp_starttls,
     send_twilio_sms,
@@ -78,6 +84,38 @@ def parse_args() -> argparse.Namespace:
         help="Print the email subject, body, and SMS summary without sending",
     )
 
+    # Microsoft Graph OAuth2 (MFA + long-lived refresh token over HTTPS 443)
+    parser.add_argument(
+        "--graph-auth",
+        action="store_true",
+        help="Run interactive OAuth2 Device Code login (MFA) and save a long-lived refresh token",
+    )
+    parser.add_argument(
+        "--graph-client-id",
+        default=os.environ.get("GRAPH_CLIENT_ID", ""),
+        help="Microsoft Entra ID App Registration (Client) ID for Graph Mail.Send",
+    )
+    parser.add_argument(
+        "--graph-tenant-id",
+        default=os.environ.get("GRAPH_TENANT_ID", "common"),
+        help="Microsoft Entra ID Tenant ID or 'common' (default: common)",
+    )
+    parser.add_argument(
+        "--graph-token",
+        default=os.environ.get("GRAPH_ACCESS_TOKEN", ""),
+        help="Microsoft Graph OAuth2 access token with Mail.Send scope",
+    )
+    parser.add_argument(
+        "--graph-refresh-token",
+        default=os.environ.get("GRAPH_REFRESH_TOKEN", ""),
+        help="Microsoft Graph OAuth2 long-lived refresh token",
+    )
+    parser.add_argument(
+        "--token-file",
+        default=os.environ.get("GRAPH_TOKEN_FILE", str(DEFAULT_TOKEN_CACHE_PATH)),
+        help=f"Path to cached Graph OAuth2 token JSON (default: {DEFAULT_TOKEN_CACHE_PATH})",
+    )
+
     # Outlook / M365 SMTP STARTTLS (port 587)
     parser.add_argument(
         "--smtp-host",
@@ -117,13 +155,6 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated carrier Email-to-SMS addresses (e.g. 5551234567@vtext.com)",
     )
 
-    # Microsoft Graph API (HTTPS 443)
-    parser.add_argument(
-        "--graph-token",
-        default=os.environ.get("GRAPH_ACCESS_TOKEN", ""),
-        help="Microsoft Graph OAuth2 access token with Mail.Send scope",
-    )
-
     # Twilio SMS API (HTTPS 443)
     parser.add_argument(
         "--twilio-sid",
@@ -148,8 +179,41 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _run_graph_device_auth(args: argparse.Namespace) -> int:
+    if not args.graph_client_id:
+        print(
+            "ERROR: --graph-auth requires --graph-client-id (or GRAPH_CLIENT_ID).",
+            file=sys.stderr,
+        )
+        return 2
+
+    dc = request_msgraph_device_code(
+        client_id=args.graph_client_id,
+        tenant_id=args.graph_tenant_id,
+    )
+    print(dc.get("message") or f"Open {dc.get('verification_uri')} and enter code: {dc.get('user_code')}")
+    sys.stdout.flush()
+
+    token_payload = poll_msgraph_device_token(
+        client_id=args.graph_client_id,
+        device_code=str(dc["device_code"]),
+        tenant_id=args.graph_tenant_id,
+        interval=int(dc.get("interval", 5)),
+        expires_in=int(dc.get("expires_in", 900)),
+    )
+    token_payload["client_id"] = args.graph_client_id
+    token_payload["tenant_id"] = args.graph_tenant_id
+    token_path = Path(args.token_file).expanduser()
+    save_msgraph_token_cache(token_path, token_payload)
+    print(f"Saved Microsoft Graph refresh token to {token_path} (chmod 600).")
+    return 0
+
+
 def main() -> int:
     args = parse_args()
+    if args.graph_auth:
+        return _run_graph_device_auth(args)
+
     base = args.url.rstrip("/")
 
     try:
@@ -185,55 +249,80 @@ def main() -> int:
     sms_gateway_recipients = _split_recipients(args.sms_to)
     twilio_recipients = _split_recipients(args.twilio_to)
 
+    token_path = Path(args.token_file).expanduser()
+    graph_access_token = resolve_msgraph_access_token(
+        access_token=args.graph_token,
+        refresh_token=args.graph_refresh_token,
+        client_id=args.graph_client_id,
+        tenant_id=args.graph_tenant_id,
+        token_file=token_path,
+    )
+
     sent_any = False
 
-    if args.graph_token and email_recipients:
-        send_graph_mail(
-            access_token=args.graph_token,
-            recipients=email_recipients,
-            subject=subject,
-            body=body_text,
-        )
-        print(f"Sent Graph email to {', '.join(email_recipients)}")
-        sent_any = True
-    elif args.smtp_user and args.smtp_password and email_recipients:
-        sender = args.sender or args.smtp_user
-        send_smtp_starttls(
-            smtp_host=args.smtp_host,
-            smtp_port=args.smtp_port,
-            username=args.smtp_user,
-            password=args.smtp_password,
-            sender=sender,
-            recipients=email_recipients,
-            subject=subject,
-            body=body_text,
-        )
-        print(
-            f"Sent SMTP STARTTLS email via {args.smtp_host}:{args.smtp_port} "
-            f"to {', '.join(email_recipients)}"
-        )
-        sent_any = True
-
-    if sms_gateway_recipients:
-        if not (args.smtp_user and args.smtp_password):
-            print(
-                "ERROR: --sms-to requires --smtp-user and --smtp-password",
-                file=sys.stderr,
+    if graph_access_token and (email_recipients or sms_gateway_recipients):
+        if email_recipients:
+            send_graph_mail(
+                access_token=graph_access_token,
+                recipients=email_recipients,
+                subject=subject,
+                body=body_text,
             )
-            return 2
+            print(f"Sent Microsoft Graph email (HTTPS 443) to {', '.join(email_recipients)}")
+            sent_any = True
+        if sms_gateway_recipients:
+            send_graph_mail(
+                access_token=graph_access_token,
+                recipients=sms_gateway_recipients,
+                subject="OSS Harbor Digest",
+                body=sms_text,
+            )
+            print(
+                f"Sent Microsoft Graph Email-to-SMS (HTTPS 443) to "
+                f"{', '.join(sms_gateway_recipients)}"
+            )
+            sent_any = True
+    elif args.smtp_user and args.smtp_password:
         sender = args.sender or args.smtp_user
-        send_smtp_starttls(
-            smtp_host=args.smtp_host,
-            smtp_port=args.smtp_port,
-            username=args.smtp_user,
-            password=args.smtp_password,
-            sender=sender,
-            recipients=sms_gateway_recipients,
-            subject="OSS Harbor Digest",
-            body=sms_text,
+        if email_recipients:
+            send_smtp_starttls(
+                smtp_host=args.smtp_host,
+                smtp_port=args.smtp_port,
+                username=args.smtp_user,
+                password=args.smtp_password,
+                sender=sender,
+                recipients=email_recipients,
+                subject=subject,
+                body=body_text,
+            )
+            print(
+                f"Sent SMTP STARTTLS email via {args.smtp_host}:{args.smtp_port} "
+                f"to {', '.join(email_recipients)}"
+            )
+            sent_any = True
+        if sms_gateway_recipients:
+            send_smtp_starttls(
+                smtp_host=args.smtp_host,
+                smtp_port=args.smtp_port,
+                username=args.smtp_user,
+                password=args.smtp_password,
+                sender=sender,
+                recipients=sms_gateway_recipients,
+                subject="OSS Harbor Digest",
+                body=sms_text,
+            )
+            print(
+                f"Sent Email-to-SMS via {args.smtp_host}:{args.smtp_port} "
+                f"to {', '.join(sms_gateway_recipients)}"
+            )
+            sent_any = True
+    elif sms_gateway_recipients:
+        print(
+            "ERROR: --sms-to requires Microsoft Graph auth (--graph-auth / --token-file) "
+            "or SMTP (--smtp-user, --smtp-password).",
+            file=sys.stderr,
         )
-        print(f"Sent Email-to-SMS via {args.smtp_host}:{args.smtp_port} to {', '.join(sms_gateway_recipients)}")
-        sent_any = True
+        return 2
 
     if args.twilio_sid and args.twilio_token and args.twilio_from and twilio_recipients:
         for dest in twilio_recipients:
@@ -249,9 +338,9 @@ def main() -> int:
 
     if not sent_any:
         print(
-            "ERROR: No transport configured. Pass --dry-run, or provide "
-            "(--smtp-user, --smtp-password, --to), (--graph-token, --to), "
-            "or (--twilio-sid, --twilio-token, --twilio-from, --twilio-to).",
+            "ERROR: No transport configured. Run --graph-auth (recommended for MFA), "
+            "--dry-run, or provide (--smtp-user, --smtp-password, --to) / "
+            "(--twilio-sid, --twilio-token, --twilio-from, --twilio-to).",
             file=sys.stderr,
         )
         return 2

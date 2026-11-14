@@ -610,3 +610,51 @@ def test_daily_digest_formatting_and_smtp_starttls():
     mock_smtp_instance.starttls.assert_called_once()
     mock_smtp_instance.login.assert_called_once_with("harbor@outlook.com", "app-password")
     mock_smtp_instance.send_message.assert_called_once()
+
+
+def test_msgraph_refresh_token_rotation_and_mail_send(tmp_path):
+    """Verify MFA-compatible Microsoft Graph refresh token rotation and HTTPS mail send."""
+    import json
+    from unittest.mock import MagicMock, patch
+
+    from app.notifications import (
+        resolve_msgraph_access_token,
+        save_msgraph_token_cache,
+        send_graph_mail,
+    )
+
+    cache_path = tmp_path / "msgraph_token.json"
+    save_msgraph_token_cache(
+        cache_path,
+        {
+            "client_id": "client-123",
+            "tenant_id": "common",
+            "refresh_token": "refresh-old",
+        },
+    )
+    assert (cache_path.stat().st_mode & 0o777) == 0o600
+
+    refresh_resp = MagicMock()
+    refresh_resp.status_code = 200
+    refresh_resp.json.return_value = {
+        "access_token": "access-new",
+        "refresh_token": "refresh-rotated",
+        "expires_in": 3600,
+    }
+    mail_resp = MagicMock()
+    mail_resp.raise_for_status.return_value = None
+
+    with patch("app.notifications.httpx.post", side_effect=[refresh_resp, mail_resp]) as mock_post:
+        access_token = resolve_msgraph_access_token(token_file=cache_path)
+        assert access_token == "access-new"
+        send_graph_mail(
+            access_token=access_token,
+            recipients=["ops@example.com"],
+            subject="Digest",
+            body="All clean",
+        )
+
+    assert mock_post.call_count == 2
+    saved = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert saved["refresh_token"] == "refresh-rotated"
+    assert saved["access_token"] == "access-new"
