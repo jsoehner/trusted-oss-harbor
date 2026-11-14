@@ -89,33 +89,41 @@ GATEKEEPER_ADMIN_TOKEN="<token>" \
 
 ### 2.4 Hourly CVE Rescan, Unscanned Sweeps, Auto-Quarantine & `N-2` Garbage Collection
 
-- **`oss-engine`** runs an initial sweep shortly after startup (`only_unscanned=true`) to scan any `UNSCANNED` cached components and persist their `CLEAN` / `QUARANTINED` verdicts, followed by an hourly rescan + garbage collection loop (`CVE_RESCAN_INTERVAL_SECONDS=3600`).
-- **Auto-Quarantine & `'latest'` Tagging**: When a previously clean cached version is affected by a newly published CVE with `CVSS >= CVSS_FAIL_THRESHOLD`:
-  1. The vulnerable version and its sidecars are moved to `packages/quarantine/` with CVE metadata (`max_cvss`, `cve_ids`, `superseded_by`).
-  2. The newest clean upstream version is fetched, scanned, dual-signed, and tagged as **`latest`** (`maven-metadata.xml` for Maven; `latest` resolution metadata for PyPI).
-  3. `GET /catalog/vulnerabilities` and `catalog_frontend.py` display the active `'latest'` version, the `[Quarantined (Vulnerable)]` table, and the `[Component Caching History & Active 'latest' Resolution]` table.
-- **Scheduled Task Activity Log (`--activity` / `GET /audit/activity`)**:
-  `oss-engine` and the scheduler write structured events (`INITIAL_UNSCANNED_SCAN`, `HOURLY_CVE_RESCAN`, `HOURLY_GC`, `GC_REMOVED`, `QUARANTINED`, `LATEST_TAG_UPDATED`) to `audit/activity.jsonl`. Query them from the CLI without dumping the full component table:
-  ```bash
-  # View the 50 most recent scheduled task and engine events
-  GATEKEEPER_ADMIN_TOKEN="<token>" \
-    python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --activity
+`oss-engine` runs an initial `only_unscanned=true` sweep shortly after startup and an hourly rescan + garbage collection loop (`CVE_RESCAN_INTERVAL_SECONDS=3600`). Follow these four steps to inspect scheduled activity, scan `UNSCANNED` components, remediate newly vulnerable versions, and prune `N-2+` artifacts:
 
-  # Filter activity by event type and limit
-  GATEKEEPER_ADMIN_TOKEN="<token>" \
-    python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 \
-    --activity --activity-limit 20 --activity-event HOURLY_CVE_RESCAN,GC_REMOVED,QUARANTINED
+1. **Step 1 — Inspect the Scheduled Task & Engine Activity Log (`--activity`)**:
+   Query `GET /audit/activity` to verify that `INITIAL_UNSCANNED_SCAN`, `HOURLY_CVE_RESCAN`, and `HOURLY_GC` ran and see what each run did:
+   ```bash
+   GATEKEEPER_ADMIN_TOKEN="<token>" \
+     python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --activity
+   ```
+   ![Section 2.4 Step 1 — Activity Log](images/05-sec24-step1-activity-log.png)
 
-  # Force scanning of only UNSCANNED components, wait, and print activity
-  GATEKEEPER_ADMIN_TOKEN="<token>" \
-    python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --scan-unscanned --wait --activity
+2. **Step 2 — Force Scanning of `UNSCANNED` Components (`--scan-unscanned --wait --activity`)**:
+   Trigger an immediate sweep of every cached component whose provenance status classifies as `UNSCANNED` (including legacy `OSV_SKIPPED` or `NO_VULN_HEADER` records), persist `CLEAN` verdicts, and print the updated `MANUAL_UNSCANNED_SCAN` event:
+   ```bash
+   GATEKEEPER_ADMIN_TOKEN="<token>" \
+     python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --scan-unscanned --wait --activity
+   ```
+   ![Section 2.4 Step 2 — Force Scan Unscanned](images/06-sec24-step2-scan-unscanned.png)
 
-  # Preview or force N-2+ version garbage collection (override retention with --gc-keep)
-  GATEKEEPER_ADMIN_TOKEN="<token>" \
-    python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --gc --gc-dry-run --wait
-  GATEKEEPER_ADMIN_TOKEN="<token>" \
-    python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --gc --gc-keep 2 --wait
-  ```
+3. **Step 3 — Auto-Quarantine Vulnerable Versions & Tag Clean `'latest'` (`--remediate --wait`)**:
+   When a CVE exceeds `CVSS_FAIL_THRESHOLD` (`7.0`), `oss-engine` moves the vulnerable version to `packages/quarantine/`, fetches the newest clean upstream version, tags it `'latest'`, and displays `[Quarantined (Vulnerable)]` plus `[Component Caching History & Active 'latest' Resolution]`:
+   ```bash
+   GATEKEEPER_ADMIN_TOKEN="<token>" \
+     python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 \
+     --ecosystem pypi --components requests --remediate --wait
+   ```
+   ![Section 2.4 Step 3 — Auto-Quarantine and Latest Tagging](images/07-sec24-step3-remediate-quarantine.png)
+
+4. **Step 4 — `N-2` Garbage Collection (`--gc --wait --activity`)**:
+   Prune cached versions that are 2+ versions older than `latest` (`GC_RETENTION_VERSIONS=2` keeps `N` and `N-1`; pass `--gc-dry-run` to preview or `--gc-keep <n>` to override):
+   ```bash
+   GATEKEEPER_ADMIN_TOKEN="<token>" \
+     python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 \
+     --ecosystem pypi --gc --wait --activity
+   ```
+   ![Section 2.4 Step 4 — N-2 Garbage Collection](images/08-sec24-step4-gc-pruning.png)
 
 ### 2.5 Asynchronous Engine Jobs (`POST /catalog/remediate`, `GET /jobs`)
 

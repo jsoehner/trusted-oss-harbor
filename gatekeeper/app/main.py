@@ -229,14 +229,26 @@ async def handle_engine_job(
     job_type = str(job.get("job_type", ""))
     payload = job.get("payload") or {}
     if job_type == "remediate":
-        return await remediate_vulnerable_components(
+        only_unscanned = bool(payload.get("only_unscanned", False))
+        res = await remediate_vulnerable_components(
             settings=settings,
             app_instance=app_instance,
             ecosystems=_parse_ecosystem_filter(payload.get("ecosystem")),
             comp_filters=_parse_component_filter(payload.get("components")),
             concurrency=payload.get("concurrency"),
-            only_unscanned=bool(payload.get("only_unscanned", False)),
+            only_unscanned=only_unscanned,
         )
+        append_activity_event(
+            settings.activity_log_path,
+            source="engine",
+            event="MANUAL_UNSCANNED_SCAN" if only_unscanned else "MANUAL_REMEDIATE",
+            ecosystem=str(payload.get("ecosystem") or "all"),
+            details=(
+                f"scanned={res['scanned']} clean={res['clean_count']} "
+                f"quarantined={res['quarantined_count']} upgraded={res['upgraded_count']}"
+            ),
+        )
+        return res
     if job_type == "warm":
         params = WarmRequest(**payload)
         if params.discover:
@@ -1725,7 +1737,13 @@ async def remediate_vulnerable_components(
         prov_key = f"chainguard-cache/{rel}" if eco == "oci" else rel
         prov_rec = prov_index.get(prov_key) or prov_index.get(rel) or {}
         existing_cve_status = str(prov_rec.get("cve_status", "")).strip()
-        is_unscanned = not existing_cve_status or existing_cve_status.upper() == "UNSCANNED"
+        existing_max_cvss = float(prov_rec.get("max_cvss", 0.0) or 0.0)
+        is_unscanned = (
+            _classify_vulnerability_status(
+                existing_cve_status, existing_max_cvss, settings.cvss_fail_threshold
+            )
+            == "UNSCANNED"
+        )
         if only_unscanned and not is_unscanned:
             return
         async with sem:
@@ -1883,7 +1901,7 @@ async def remediate_catalog_endpoint(
 
     ecosystems = _parse_ecosystem_filter(ecosystem)
     comp_filters = _parse_component_filter(components)
-    return await remediate_vulnerable_components(
+    res = await remediate_vulnerable_components(
         settings=settings,
         app_instance=request.app,
         ecosystems=ecosystems,
@@ -1891,6 +1909,17 @@ async def remediate_catalog_endpoint(
         concurrency=concurrency,
         only_unscanned=only_unscanned,
     )
+    append_activity_event(
+        settings.activity_log_path,
+        source="api",
+        event="MANUAL_UNSCANNED_SCAN" if only_unscanned else "MANUAL_REMEDIATE",
+        ecosystem=ecosystem or "all",
+        details=(
+            f"scanned={res['scanned']} clean={res['clean_count']} "
+            f"quarantined={res['quarantined_count']} upgraded={res['upgraded_count']}"
+        ),
+    )
+    return res
 
 
 @app.post("/catalog/gc")
@@ -1920,13 +1949,24 @@ async def gc_catalog_endpoint(
         )
         return JSONResponse(status_code=202, content=job)
 
-    return gc_old_component_versions(
+    gc_res = gc_old_component_versions(
         settings=settings,
         keep_versions=keep_versions,
         ecosystems=_parse_ecosystem_filter(ecosystem),
         comp_filters=_parse_component_filter(components),
         dry_run=dry_run,
     )
+    append_activity_event(
+        settings.activity_log_path,
+        source="api",
+        event="MANUAL_GC",
+        ecosystem=ecosystem or "all",
+        details=(
+            f"removed_versions={gc_res['removed_count']} files_removed={gc_res['files_removed_total']} "
+            f"keep={gc_res['keep_versions']} dry_run={dry_run}"
+        ),
+    )
+    return gc_res
 
 
 @app.get("/jobs")

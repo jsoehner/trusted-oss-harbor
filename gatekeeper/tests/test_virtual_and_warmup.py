@@ -472,6 +472,23 @@ def test_unscanned_component_scan_and_n_minus_2_garbage_collection(tmp_path, mon
         whl.write_bytes(b"PK\x03\x04dummy-wheel-" + ver.encode())
         whl.with_name(f"{whl.name}.asc").write_text("-----BEGIN PGP SIGNATURE-----\n", encoding="utf-8")
 
+    # Also seed a provenance record with legacy non-CLEAN status ("OSV_SKIPPED") for 1.3.0
+    from app.signer import append_provenance_record
+    from app.storage import compute_digests
+
+    whl_130 = pkg_dir / "demo_gc_pkg-1.3.0-py3-none-any.whl"
+    append_provenance_record(
+        provenance_log_path=settings.provenance_log_path,
+        ecosystem="pypi",
+        artifact_rel_path="demo-gc-pkg/demo_gc_pkg-1.3.0-py3-none-any.whl",
+        sha256=compute_digests(whl_130).sha256,
+        sha384=compute_digests(whl_130).sha384,
+        sha512=compute_digests(whl_130).sha512,
+        clamav_status="LOCAL_ARCHIVE_OK",
+        cve_status="OSV_SKIPPED",
+        signature_file="demo-gc-pkg/demo_gc_pkg-1.3.0-py3-none-any.whl.asc",
+    )
+
     async def fake_osv_clean(eco: str, pkg: str, ver: str):
         return False, 0.0, [], "OSV_OK"
 
