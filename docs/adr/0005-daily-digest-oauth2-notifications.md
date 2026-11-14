@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-11-14
-- **Version:** 1.0.0
+- **Version:** 1.1.0
 
 ## Context and Problem Statement
 

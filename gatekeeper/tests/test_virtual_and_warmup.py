@@ -422,7 +422,7 @@ def test_job_bus_async_remediation_and_frontend_role(tmp_path, monkeypatch):
         hz = client.get("/healthz")
         assert hz.status_code == 200
         hz_body = hz.json()
-        assert hz_body["version"] == "1.0.0"
+        assert hz_body["version"] == "1.1.0"
         assert hz_body["role"] == "frontend"
         assert hz_body["bus_backend"] == "memory"
 
@@ -658,3 +658,38 @@ def test_msgraph_refresh_token_rotation_and_mail_send(tmp_path):
     saved = json.loads(cache_path.read_text(encoding="utf-8"))
     assert saved["refresh_token"] == "refresh-rotated"
     assert saved["access_token"] == "access-new"
+
+
+def test_component_history_deduplicates_multi_file_maven_versions(tmp_path):
+    """Multiple Maven artifacts (.jar, .pom, .module) for one version emit a single history row."""
+    from app.main import _build_component_history
+
+    components = [
+        {
+            "ecosystem": "maven",
+            "component": "org.apache.velocity.tools:velocity-tools-generic",
+            "version": "3.1",
+            "tags": [],
+            "vulnerability_status": "CLEAN",
+            "max_cvss": 0.0,
+            "cve_ids": [],
+            "last_scanned_at": "2026-11-14T16:16:18+00:00",
+            "artifact": f"org/apache/velocity/tools/velocity-tools-generic/3.1/{fname}",
+        }
+        for fname in (
+            "velocity-tools-generic-3.1.jar",
+            "velocity-tools-generic-3.1.pom",
+            "velocity-tools-generic-3.1-sources.jar",
+            "velocity-tools-generic-3.1.module",
+        )
+    ]
+
+    history = _build_component_history(
+        components=components,
+        quarantined=[],
+        provenance_log_path=tmp_path / "missing.jsonl",
+        latest_tags={},
+    )
+    assert len(history) == 1
+    assert len(history[0]["versions"]) == 1
+    assert history[0]["versions"][0]["version"] == "3.1"

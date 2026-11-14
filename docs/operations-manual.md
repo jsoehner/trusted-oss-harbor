@@ -1,6 +1,6 @@
-# Trusted OSS Supply Chain Platform — Operations Manual (`v1.0.0`)
+# Trusted OSS Supply Chain Platform — Operations Manual (`v1.1.0`)
 
-This manual documents every operational capability of `trusted-oss-harbor` (`v1.0.0`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack, and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, and GitHub Actions projects.
+This manual documents every operational capability of `trusted-oss-harbor` (`v1.1.0`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack, and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, and GitHub Actions projects.
 
 ---
 

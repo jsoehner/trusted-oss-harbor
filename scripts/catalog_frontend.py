@@ -456,26 +456,40 @@ def _print_report(report: dict[str, Any]) -> None:
 
     print("\n[Active Cached Components]")
     if report["components"]:
-        active_rows = []
+        active_by_key: dict[tuple[str, str, str], list[str]] = {}
         for item in report["components"]:
+            eco = str(item.get("ecosystem", ""))
+            comp = str(item.get("component", ""))
+            ver = str(item.get("version", ""))
             sig = "GPG-VALID" if item.get("signature_valid") else "UNSIGNED"
             if item.get("pqc_signed"):
                 sig += "+PQC"
             tags = ",".join(item.get("tags") or []) or "-"
             cves = ",".join(item.get("cve_ids") or []) or "none"
-            active_rows.append(
-                [
-                    str(item.get("ecosystem", "")),
-                    str(item.get("component", "")),
-                    str(item.get("version", "")),
-                    tags,
-                    sig,
-                    str(item.get("vulnerability_status", "UNSCANNED")),
-                    f"{float(item.get('max_cvss', 0.0) or 0.0):.1f}",
-                    cves,
-                    str(item.get("clamav_status", "UNKNOWN")),
-                ]
-            )
+            key = (eco, comp, ver)
+            if key in active_by_key:
+                prev = active_by_key[key]
+                if tags != "-" and prev[3] == "-":
+                    prev[3] = tags
+                if float(item.get("max_cvss", 0.0) or 0.0) > float(prev[6]):
+                    prev[6] = f"{float(item.get('max_cvss', 0.0) or 0.0):.1f}"
+                if item.get("vulnerability_status") == "VULNERABLE":
+                    prev[5] = "VULNERABLE"
+                elif item.get("vulnerability_status") == "UNSCANNED" and prev[5] == "CLEAN":
+                    prev[5] = "UNSCANNED"
+                continue
+            active_by_key[key] = [
+                eco,
+                comp,
+                ver,
+                tags,
+                sig,
+                str(item.get("vulnerability_status", "UNSCANNED")),
+                f"{float(item.get('max_cvss', 0.0) or 0.0):.1f}",
+                cves,
+                str(item.get("clamav_status", "UNKNOWN")),
+            ]
+        active_rows = list(active_by_key.values())
         print(
             _render_table(
                 ["ECOSYSTEM", "COMPONENT", "VERSION", "TAGS", "SIGNATURE", "VULN_STATUS", "CVSS", "CVES", "CLAMAV"],
@@ -488,14 +502,23 @@ def _print_report(report: dict[str, Any]) -> None:
     quarantined = report.get("quarantined") or []
     print(f"\n[Quarantined (Vulnerable)] (count={len(quarantined)})")
     if quarantined:
+        seen_q: set[tuple[str, str, str]] = set()
         q_rows = []
         for q in quarantined:
+            q_key = (
+                str(q.get("ecosystem", "")),
+                str(q.get("component", "")),
+                str(q.get("version", "")),
+            )
+            if q_key in seen_q:
+                continue
+            seen_q.add(q_key)
             cves = ",".join(q.get("cve_ids") or []) or "none"
             q_rows.append(
                 [
-                    str(q.get("ecosystem", "")),
-                    str(q.get("component", "")),
-                    str(q.get("version", "")),
+                    q_key[0],
+                    q_key[1],
+                    q_key[2],
                     str(q.get("status", "QUARANTINED")),
                     f"{float(q.get('max_cvss', 0.0) or 0.0):.1f}",
                     cves,

@@ -329,7 +329,7 @@ app = FastAPI(
         "Harbor Chainguard OCI proxy cache, ClamAV antivirus inspection, Trivy/NVD vulnerability gating, "
         "GPG/Cosign signing, and NIST FIPS 204 ML-DSA-65 Post-Quantum Cryptography dual-signing."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -1343,7 +1343,9 @@ def _build_component_history(
             }
         return grouped[key]
 
-    seen_keys: set[tuple[str, str, str, str]] = set()
+    seen_entries: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    _vuln_rank = {"VULNERABLE": 3, "UNSCANNED": 2, "CLEAN": 1}
+
     for item in components:
         eco = str(item.get("ecosystem", ""))
         comp = str(item.get("component", ""))
@@ -1355,19 +1357,35 @@ def _build_component_history(
         bucket = _bucket(eco, comp)
         if state == "SERVING_LATEST" and not bucket["serving_latest_version"]:
             bucket["serving_latest_version"] = ver
-        bucket["versions"].append(
-            {
-                "version": ver,
-                "state": state,
-                "tags": tags,
-                "vulnerability_status": item.get("vulnerability_status", "UNSCANNED"),
-                "max_cvss": item.get("max_cvss", 0.0),
-                "cve_ids": item.get("cve_ids", []),
-                "timestamp": item.get("last_scanned_at", ""),
-                "artifact": item.get("artifact", ""),
-            }
-        )
-        seen_keys.add((eco, comp, ver, state))
+
+        entry_key = (eco, comp, ver, state)
+        v_status = str(item.get("vulnerability_status", "UNSCANNED"))
+        v_cvss = float(item.get("max_cvss", 0.0) or 0.0)
+        v_cves = list(item.get("cve_ids") or [])
+        v_ts = str(item.get("last_scanned_at", ""))
+
+        if entry_key in seen_entries:
+            existing = seen_entries[entry_key]
+            existing["max_cvss"] = max(float(existing.get("max_cvss", 0.0) or 0.0), v_cvss)
+            existing["cve_ids"] = sorted(set(existing.get("cve_ids") or []) | set(v_cves))
+            if _vuln_rank.get(v_status, 0) > _vuln_rank.get(str(existing.get("vulnerability_status", "")), 0):
+                existing["vulnerability_status"] = v_status
+            if v_ts and v_ts > str(existing.get("timestamp", "")):
+                existing["timestamp"] = v_ts
+            continue
+
+        entry = {
+            "version": ver,
+            "state": state,
+            "tags": tags,
+            "vulnerability_status": v_status,
+            "max_cvss": v_cvss,
+            "cve_ids": v_cves,
+            "timestamp": v_ts,
+            "artifact": item.get("artifact", ""),
+        }
+        bucket["versions"].append(entry)
+        seen_entries[entry_key] = entry
 
     for q in quarantined:
         eco = str(q.get("ecosystem", ""))
@@ -1375,21 +1393,35 @@ def _build_component_history(
         if (eco_filters and eco not in eco_filters) or not _matches_component_filter(comp, c_filters):
             continue
         ver = str(q.get("version", ""))
+        entry_key = (eco, comp, ver, "QUARANTINED")
+        q_cvss = float(q.get("max_cvss", 0.0) or 0.0)
+        q_cves = list(q.get("cve_ids") or [])
+        q_ts = str(q.get("quarantined_at", ""))
+
+        if entry_key in seen_entries:
+            existing = seen_entries[entry_key]
+            existing["max_cvss"] = max(float(existing.get("max_cvss", 0.0) or 0.0), q_cvss)
+            existing["cve_ids"] = sorted(set(existing.get("cve_ids") or []) | set(q_cves))
+            if q_ts and q_ts > str(existing.get("timestamp", "")):
+                existing["timestamp"] = q_ts
+            continue
+
         bucket = _bucket(eco, comp)
-        bucket["versions"].append(
-            {
-                "version": ver,
-                "state": "QUARANTINED",
-                "tags": [],
-                "vulnerability_status": "VULNERABLE",
-                "max_cvss": q.get("max_cvss", 0.0),
-                "cve_ids": q.get("cve_ids", []),
-                "superseded_by": q.get("superseded_by", ""),
-                "timestamp": q.get("quarantined_at", ""),
-                "artifact": q.get("artifact", ""),
-            }
-        )
-        seen_keys.add((eco, comp, ver, "QUARANTINED"))
+        entry = {
+            "version": ver,
+            "state": "QUARANTINED",
+            "tags": [],
+            "vulnerability_status": "VULNERABLE",
+            "max_cvss": q_cvss,
+            "cve_ids": q_cves,
+            "superseded_by": q.get("superseded_by", ""),
+            "timestamp": q_ts,
+            "artifact": q.get("artifact", ""),
+        }
+        bucket["versions"].append(entry)
+        seen_entries[entry_key] = entry
+
+    seen_keys = set(seen_entries.keys())
 
     if provenance_log_path.is_file():
         for line in provenance_log_path.read_text(encoding="utf-8").splitlines():

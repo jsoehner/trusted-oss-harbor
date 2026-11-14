@@ -76,16 +76,27 @@ def build_daily_digest(
         lines.append("Event Breakdown   : " + ", ".join(f"{k}={v}" for k, v in sorted(event_counts.items())))
 
     if quarantined:
+        seen_q: set[tuple[str, str, str]] = set()
+        unique_q: list[dict[str, Any]] = []
+        for q in quarantined:
+            q_key = (
+                str(q.get("ecosystem", "")),
+                str(q.get("component", "")),
+                str(q.get("version", "")),
+            )
+            if q_key not in seen_q:
+                seen_q.add(q_key)
+                unique_q.append(q)
         lines.append("")
         lines.append("Quarantined (Vulnerable) Components:")
-        for q in quarantined[:15]:
+        for q in unique_q[:15]:
             cves = ",".join(q.get("cve_ids") or []) or "none"
             lines.append(
                 f"  - {q.get('ecosystem')}:{q.get('component')}@{q.get('version')} "
                 f"(CVSS={q.get('max_cvss', 0.0):.1f}, CVEs={cves}, latest={q.get('superseded_by') or '-'})"
             )
-        if len(quarantined) > 15:
-            lines.append(f"  ... and {len(quarantined) - 15} more")
+        if len(unique_q) > 15:
+            lines.append(f"  ... and {len(unique_q) - 15} more")
 
     if recent_events:
         lines.append("")
