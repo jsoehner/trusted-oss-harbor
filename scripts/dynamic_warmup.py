@@ -110,21 +110,22 @@ def main() -> int:
         print(f"[SAVED] Wrote discovered catalog: {args.output}")
 
     if args.warm:
-        endpoint = f"{args.gatekeeper_url.rstrip('/')}/catalog/warm"
+        endpoint = f"{args.gatekeeper_url.rstrip('/')}/catalog/discover"
         resp = httpx.post(
             endpoint,
             headers={"X-Gatekeeper-Token": args.token},
             json={
-                "discover": True,
                 "scan_roots": args.roots,
                 "include_github": args.github,
                 "github_username": args.github_user,
                 "max_projects": args.max_projects,
+                "save_to_catalog": True,
+                "warm": True,
             },
             timeout=300.0,
         )
         resp.raise_for_status()
-        summary = resp.json()
+        summary = resp.json().get("warmup") or {}
         print(
             f"[WARM] OCI={summary.get('chainguard_containers_cached', 0)} "
             f"Maven={summary.get('spring_boot_artifacts_cached', 0)} "
