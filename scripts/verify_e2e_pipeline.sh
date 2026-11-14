@@ -118,6 +118,7 @@ PORT="$("${VENV_DIR}/bin/python3" -c 'import socket; s=socket.socket(); s.bind((
 OSS_DATA_ROOT="${HARNESS_TMP}/data" \
 GNUPGHOME="${HARNESS_TMP}/data/keys/gnupg" \
 CLAMAV_REQUIRED="false" \
+CVE_SCANNER_MODE="none" \
 AUTO_PROMOTE_CLEAN_ARTIFACTS="true" \
 GATEKEEPER_ADMIN_TOKEN="live-e2e-token" \
 PYTHONPATH="${PROJECT_ROOT}/gatekeeper" \
