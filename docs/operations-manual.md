@@ -242,7 +242,7 @@ Alternative HTTPS port `443` transports (recommended when **MFA is enabled** or 
          --to "ops@example.com" \
          --sms-to "5551234567@vtext.com"
      ```
-  4. Or run it automatically inside the `oss-engine` Docker container by setting these in `.env` and restarting `docker compose up -d --build oss-engine`:
+  4. Or run it automatically inside the `oss-engine` Docker container by setting these in `.env` and restarting `docker compose up -d --build oss-engine` (rotated tokens persist in `/data/trusted-oss/audit/msgraph_token.json` and send timestamps in `last_digest_sent.txt`, controlled by `DIGEST_INTERVAL_SECONDS=86400`):
      ```dotenv
      DIGEST_ENABLED=true
      DIGEST_TO=ops@example.com
@@ -254,10 +254,10 @@ Alternative HTTPS port `443` transports (recommended when **MFA is enabled** or 
 - **Microsoft Graph (direct token)**: pass `--graph-token "$GRAPH_ACCESS_TOKEN"` and `--to "ops@example.com"`.
 - **Twilio SMS**: pass `--twilio-sid`, `--twilio-token`, `--twilio-from`, and `--twilio-to "+15551234567"`.
 
-Schedule a daily cron job (e.g., 07:30 every day) in `crontab -e`:
+Schedule a daily cron job on the host (e.g., 07:30 every day, using the cached Graph refresh token) in `crontab -e`:
 
 ```cron
-30 7 * * * cd /home/jsoehner/trusted-oss-harbor && GATEKEEPER_ADMIN_TOKEN="<token>" SMTP_USER="you@outlook.com" SMTP_PASSWORD="<app-password>" /usr/bin/python3 scripts/daily_digest.py --url http://oss.jsigroup.local:8080 --to "ops@example.com" >> /var/log/oss-harbor-digest.log 2>&1
+30 7 * * * cd /home/jsoehner/trusted-oss-harbor && GATEKEEPER_ADMIN_TOKEN="<token>" /usr/bin/python3 scripts/daily_digest.py --url http://oss.jsigroup.local:8080 --to "ops@example.com" --sms-to "5551234567@vtext.com" >> /var/log/oss-harbor-digest.log 2>&1
 ```
 
 ---
