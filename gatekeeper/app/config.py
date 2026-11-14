@@ -62,6 +62,9 @@ class Settings(BaseSettings):
     cve_rescan_interval_seconds: int = Field(
         default=3600, alias="CVE_RESCAN_INTERVAL_SECONDS"
     )
+    gc_retention_versions: int = Field(
+        default=2, alias="GC_RETENTION_VERSIONS"
+    )
     gatekeeper_role: str = Field(default="all", alias="GATEKEEPER_ROLE")
     bus_url: str = Field(default="", alias="BUS_URL")
     engine_max_concurrency: int = Field(default=2, alias="ENGINE_MAX_CONCURRENCY")

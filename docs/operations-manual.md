@@ -87,13 +87,18 @@ GATEKEEPER_ADMIN_TOKEN="<token>" \
 
 ![Maven Catalog and Vulnerability Table](images/03-catalog-frontend-maven.png)
 
-### 2.4 Hourly CVE Rescan, Auto-Quarantine & `'latest'` Tagging
+### 2.4 Hourly CVE Rescan, Unscanned Sweeps, Auto-Quarantine & `N-2` Garbage Collection
 
-- **`oss-engine`** runs an hourly CVE rescan (`CVE_RESCAN_INTERVAL_SECONDS=3600`).
-- When a previously clean cached version is affected by a newly published CVE with `CVSS >= CVSS_FAIL_THRESHOLD`:
+- **`oss-engine`** runs an initial sweep shortly after startup (`only_unscanned=true`) to scan any `UNSCANNED` cached components and persist their `CLEAN` / `QUARANTINED` verdicts, followed by an hourly rescan + garbage collection loop (`CVE_RESCAN_INTERVAL_SECONDS=3600`).
+- **Auto-Quarantine & `'latest'` Tagging**: When a previously clean cached version is affected by a newly published CVE with `CVSS >= CVSS_FAIL_THRESHOLD`:
   1. The vulnerable version and its sidecars are moved to `packages/quarantine/` with CVE metadata (`max_cvss`, `cve_ids`, `superseded_by`).
   2. The newest clean upstream version is fetched, scanned, dual-signed, and tagged as **`latest`** (`maven-metadata.xml` for Maven; `latest` resolution metadata for PyPI).
   3. `GET /catalog/vulnerabilities` and `catalog_frontend.py` display the active `'latest'` version, the `[Quarantined (Vulnerable)]` table, and the `[Component Caching History & Active 'latest' Resolution]` table.
+- **`N-2` Garbage Collection (`POST /catalog/gc`)**: Automatically prunes cached versions that are 2+ versions older than `latest` (retaining `GC_RETENTION_VERSIONS=2`, i.e., `N` and `N-1`), removing `N-2` and older artifacts and their sidecars (`.asc`, `.mldsa65`, `.sha256`, `.sha384`, `.sha512`). You can also trigger GC manually:
+  ```bash
+  curl -X POST -H "X-Gatekeeper-Token: <token>" \
+    "http://oss.jsigroup.local:8080/catalog/gc?ecosystem=pypi,maven"
+  ```
 
 ### 2.5 Asynchronous Engine Jobs (`POST /catalog/remediate`, `GET /jobs`)
 

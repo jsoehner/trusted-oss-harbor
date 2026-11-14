@@ -446,3 +446,63 @@ def test_job_bus_async_remediation_and_frontend_role(tmp_path, monkeypatch):
         assert jobs_list.status_code == 200
         assert jobs_list.json()["count"] >= 1
         assert jobs_list.json()["bus_backend"] == "memory"
+
+
+def test_unscanned_component_scan_and_n_minus_2_garbage_collection(tmp_path, monkeypatch):
+    """Verify unscanned components are scanned/recorded as CLEAN and N-2+ old versions are garbage-collected."""
+    from app.main import remediate_vulnerable_components
+    import asyncio
+
+    settings = Settings(
+        oss_data_root=tmp_path,
+        gatekeeper_admin_token="test-admin-token",
+        clamav_required=False,
+        pqc_signing_enabled=False,
+        cve_scanner_mode="osv",
+        cve_rescan_interval_seconds=0,
+        gc_retention_versions=2,
+    )
+    app.state.settings = settings
+
+    # Seed 4 cached versions of a PyPI package directly on disk without provenance (UNSCANNED)
+    pkg_dir = settings.trusted_pypi_dir / "demo-gc-pkg"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    for ver in ("1.0.0", "1.1.0", "1.2.0", "1.3.0"):
+        whl = pkg_dir / f"demo_gc_pkg-{ver}-py3-none-any.whl"
+        whl.write_bytes(b"PK\x03\x04dummy-wheel-" + ver.encode())
+        whl.with_name(f"{whl.name}.asc").write_text("-----BEGIN PGP SIGNATURE-----\n", encoding="utf-8")
+
+    async def fake_osv_clean(eco: str, pkg: str, ver: str):
+        return False, 0.0, [], "OSV_OK"
+
+    monkeypatch.setattr("app.scanner.query_osv_vulnerabilities", fake_osv_clean)
+
+    with TestClient(app) as client:
+        # Before scheduled scan, all 4 versions are UNSCANNED
+        before = client.get("/catalog/vulnerabilities?ecosystem=pypi&components=demo_gc_pkg").json()
+        assert before["summary"]["unscanned"] == 4
+
+        # Run only_unscanned sweep -> transitions all 4 to CLEAN
+        summary = asyncio.run(
+            remediate_vulnerable_components(settings=settings, app_instance=app, only_unscanned=True)
+        )
+        assert summary["scanned"] == 4
+        assert summary["clean_count"] == 4
+
+        after_scan = client.get("/catalog/vulnerabilities?ecosystem=pypi&components=demo_gc_pkg").json()
+        assert after_scan["summary"]["unscanned"] == 0
+        assert after_scan["summary"]["clean"] == 4
+
+        # Run N-2 garbage collection -> keeps 1.3.0 (N) and 1.2.0 (N-1), removes 1.1.0 and 1.0.0 (N-2+)
+        gc_resp = client.post("/catalog/gc?ecosystem=pypi", headers={"X-Gatekeeper-Token": "test-admin-token"})
+        assert gc_resp.status_code == 200
+        gc_body = gc_resp.json()
+        assert gc_body["removed_count"] == 2
+        removed_vers = {item["version"] for item in gc_body["removed"]}
+        assert removed_vers == {"1.0.0", "1.1.0"}
+
+        assert not (pkg_dir / "demo_gc_pkg-1.0.0-py3-none-any.whl").exists()
+        assert not (pkg_dir / "demo_gc_pkg-1.0.0-py3-none-any.whl.asc").exists()
+        assert not (pkg_dir / "demo_gc_pkg-1.1.0-py3-none-any.whl").exists()
+        assert (pkg_dir / "demo_gc_pkg-1.2.0-py3-none-any.whl").exists()
+        assert (pkg_dir / "demo_gc_pkg-1.3.0-py3-none-any.whl").exists()

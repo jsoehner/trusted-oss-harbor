@@ -49,6 +49,7 @@ from app.virtual_repo import (
 )
 from app.remediation import (
     fetch_upstream_maven_versions,
+    gc_old_component_versions,
     load_latest_tags,
     load_quarantined_components,
     quarantine_artifact_with_sidecars,
@@ -110,9 +111,29 @@ def initialize_storage_and_keys(settings: Settings) -> Path:
 
 
 async def _hourly_cve_rescan_loop(app: FastAPI) -> None:
-    """Periodically rescan cached components for newly published CVEs and auto-remediate."""
+    """Periodically scan unscanned/cached components for CVEs, auto-remediate, and GC N-2+ versions."""
     settings = get_settings_from_app(app)
     interval = max(60, settings.cve_rescan_interval_seconds)
+
+    # Initial sweep for any UNSCANNED components shortly after startup
+    await asyncio.sleep(min(10, interval))
+    try:
+        init_summary = await remediate_vulnerable_components(
+            settings=settings, app_instance=app, only_unscanned=True
+        )
+        if init_summary["scanned"]:
+            logger.info(
+                "[CACHE] INITIAL_UNSCANNED_SCAN scanned=%d clean=%d quarantined=%d upgraded=%d",
+                init_summary["scanned"],
+                init_summary["clean_count"],
+                init_summary["quarantined_count"],
+                init_summary["upgraded_count"],
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("[CACHE] INITIAL_UNSCANNED_SCAN failed: %s", exc)
+
     while True:
         await asyncio.sleep(interval)
         try:
@@ -123,6 +144,14 @@ async def _hourly_cve_rescan_loop(app: FastAPI) -> None:
                 summary["quarantined_count"],
                 summary["upgraded_count"],
             )
+            gc_summary = gc_old_component_versions(settings=settings)
+            if gc_summary["removed_count"]:
+                logger.info(
+                    "[CACHE] HOURLY_GC removed_versions=%d files_removed=%d keep=%d",
+                    gc_summary["removed_count"],
+                    gc_summary["files_removed_total"],
+                    gc_summary["keep_versions"],
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -188,6 +217,14 @@ async def handle_engine_job(
             app_instance=app_instance,
             ecosystems=ecosystems,
             concurrency=params.concurrency or settings.warmup_concurrency,
+        )
+    if job_type == "gc":
+        return gc_old_component_versions(
+            settings=settings,
+            keep_versions=payload.get("keep_versions"),
+            ecosystems=_parse_ecosystem_filter(payload.get("ecosystem")),
+            comp_filters=_parse_component_filter(payload.get("components")),
+            dry_run=bool(payload.get("dry_run", False)),
         )
     raise ValueError(f"Unsupported engine job_type: {job_type}")
 
@@ -1590,12 +1627,14 @@ async def remediate_vulnerable_components(
     ecosystems: set[str] | None = None,
     comp_filters: list[str] | None = None,
     concurrency: int | None = None,
+    only_unscanned: bool = False,
 ) -> dict[str, Any]:
     """Rescan cached artifacts concurrently for newly published CVEs, quarantine vulnerable versions, and fetch clean 'latest'."""
     import app.scanner as scanner_mod
 
     active_ecosystems = ecosystems or {"oci", "maven", "pypi"}
     c_filters = comp_filters or []
+    prov_index = _load_latest_provenance_map(settings.provenance_log_path)
     sem = asyncio.Semaphore(max(1, concurrency or settings.warmup_concurrency))
     scanned = 0
     clean_count = 0
@@ -1637,6 +1676,12 @@ async def remediate_vulnerable_components(
         eco, root_dir, path, rel, component, version = target
         if not path.exists() or not _matches_component_filter(component, c_filters):
             return
+        prov_key = f"chainguard-cache/{rel}" if eco == "oci" else rel
+        prov_rec = prov_index.get(prov_key) or prov_index.get(rel) or {}
+        existing_cve_status = str(prov_rec.get("cve_status", "")).strip()
+        is_unscanned = not existing_cve_status or existing_cve_status.upper() == "UNSCANNED"
+        if only_unscanned and not is_unscanned:
+            return
         async with sem:
             scanned += 1
             mode = (settings.cve_scanner_mode or "auto").lower()
@@ -1656,6 +1701,22 @@ async def remediate_vulnerable_components(
 
             if max_cvss < settings.cvss_fail_threshold:
                 clean_count += 1
+                if is_unscanned:
+                    digests = compute_digests(path)
+                    append_provenance_record(
+                        provenance_log_path=settings.provenance_log_path,
+                        ecosystem=eco,
+                        artifact_rel_path=prov_key,
+                        sha256=digests.sha256,
+                        sha384=digests.sha384,
+                        sha512=digests.sha512,
+                        clamav_status=str(prov_rec.get("clamav_status") or "RESCAN_CLEAN"),
+                        cve_status=f"CLEAN (max CVSS {max_cvss:.1f} < {settings.cvss_fail_threshold:.1f}) [{cve_status}]",
+                        signature_file=f"{prov_key}.asc",
+                        signature_file_mldsa=f"{prov_key}.mldsa65" if path.with_name(f"{path.name}.mldsa65").exists() else "",
+                        max_cvss=max_cvss,
+                        cve_ids=cve_ids,
+                    )
                 return
 
             upgrade = await _try_upgrade_component(
@@ -1762,6 +1823,42 @@ async def remediate_catalog_endpoint(
         ecosystems=ecosystems,
         comp_filters=comp_filters,
         concurrency=concurrency,
+    )
+
+
+@app.post("/catalog/gc")
+async def gc_catalog_endpoint(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    ecosystem: str | None = None,
+    components: str | None = None,
+    keep_versions: int | None = None,
+    dry_run: bool = False,
+    wait: bool | None = None,
+    x_gatekeeper_token: Annotated[str | None, Header()] = None,
+) -> Any:
+    """Garbage-collect cached versions that are N-2 or older (2+ versions older than latest)."""
+    require_admin_token(x_gatekeeper_token, settings)
+    should_enqueue = wait is False or (wait is None and settings.gatekeeper_role == "frontend")
+    if should_enqueue:
+        bus = get_job_bus(request.app, settings)
+        job = await bus.enqueue(
+            "gc",
+            {
+                "ecosystem": ecosystem,
+                "components": components,
+                "keep_versions": keep_versions,
+                "dry_run": dry_run,
+            },
+        )
+        return JSONResponse(status_code=202, content=job)
+
+    return gc_old_component_versions(
+        settings=settings,
+        keep_versions=keep_versions,
+        ecosystems=_parse_ecosystem_filter(ecosystem),
+        comp_filters=_parse_component_filter(components),
+        dry_run=dry_run,
     )
 
 
