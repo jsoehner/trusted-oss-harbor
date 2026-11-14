@@ -132,3 +132,7 @@ class Settings(BaseSettings):
     @property
     def provenance_log_path(self) -> Path:
         return self.oss_data_root / "audit" / "provenance.jsonl"
+
+    @property
+    def activity_log_path(self) -> Path:
+        return self.oss_data_root / "audit" / "activity.jsonl"

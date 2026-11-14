@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 
+from app.activity import append_activity_event
 from app.config import Settings
 from app.virtual_repo import extract_package_coordinates
 
@@ -277,6 +278,16 @@ def gc_old_component_versions(
                     len(removed_paths),
                     dry_run,
                 )
+                if not dry_run:
+                    append_activity_event(
+                        settings.activity_log_path,
+                        source="gc",
+                        event="GC_REMOVED",
+                        ecosystem=eco,
+                        component=component,
+                        version=ver,
+                        details=f"kept={','.join(kept)} files={len(removed_paths)}",
+                    )
 
     return {
         "status": "gc_completed",

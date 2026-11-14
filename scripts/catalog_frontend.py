@@ -166,6 +166,33 @@ def _fallback_vulnerabilities_from_status(
     }
 
 
+def _post_and_maybe_wait(
+    url: str,
+    *,
+    base: str,
+    ssl_ctx: ssl.SSLContext | None,
+    token: str,
+    wait: bool,
+) -> dict[str, Any] | None:
+    """POST to an engine-backed endpoint and optionally poll /jobs/{job_id} on 202 Accepted."""
+    try:
+        res = _post_json(url, ssl_ctx=ssl_ctx, token=token)
+        if wait and res.get("job_id") and res.get("status") in ("queued", "running"):
+            job_id = str(res["job_id"])
+            for _ in range(150):
+                time.sleep(2.0)
+                job_state = _get_json(f"{base}/jobs/{job_id}", ssl_ctx=ssl_ctx, token=token)
+                if job_state.get("status") == "completed" and isinstance(job_state.get("result"), dict):
+                    return job_state["result"]
+                if job_state.get("status") == "failed":
+                    return job_state
+        return res
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 403, 503):
+            return None
+        raise
+
+
 def catalog_frontend(
     base_url: str,
     ca_bundle: str = "",
@@ -174,9 +201,16 @@ def catalog_frontend(
     ecosystem: str = "all",
     components_filter: str = "",
     remediate: bool = False,
+    scan_unscanned: bool = False,
+    gc: bool = False,
+    gc_dry_run: bool = False,
+    gc_keep: int | None = None,
+    activity: bool = False,
+    activity_limit: int = 50,
+    activity_event: str = "",
     wait: bool = False,
 ) -> dict[str, Any]:
-    """Optionally remediate newly vulnerable cached versions, then return per-version inventory & history."""
+    """Optionally force unscanned scans, remediation, or N-2 GC, then return inventory & activity."""
     base = base_url.rstrip("/")
     ssl_ctx = _build_ssl_context(ca_bundle=ca_bundle, insecure=insecure)
 
@@ -186,32 +220,40 @@ def catalog_frontend(
     comp_param = ",".join(comp_tokens)
 
     remediation_result: dict[str, Any] | None = None
-    if remediate and token:
+    if (remediate or scan_unscanned) and token:
         rem_params: dict[str, str] = {}
         if eco_param:
             rem_params["ecosystem"] = eco_param
         if comp_param:
             rem_params["components"] = comp_param
+        if scan_unscanned and not remediate:
+            rem_params["only_unscanned"] = "true"
         if wait:
             rem_params["wait"] = "true"
         rem_qs = urllib.parse.urlencode(rem_params)
         rem_url = f"{base}/catalog/remediate" + (f"?{rem_qs}" if rem_qs else "")
-        try:
-            remediation_result = _post_json(rem_url, ssl_ctx=ssl_ctx, token=token)
-            if wait and remediation_result.get("job_id") and remediation_result.get("status") in ("queued", "running"):
-                job_id = str(remediation_result["job_id"])
-                for _ in range(150):
-                    time.sleep(2.0)
-                    job_state = _get_json(f"{base}/jobs/{job_id}", ssl_ctx=ssl_ctx, token=token)
-                    if job_state.get("status") == "completed" and isinstance(job_state.get("result"), dict):
-                        remediation_result = job_state["result"]
-                        break
-                    if job_state.get("status") == "failed":
-                        remediation_result = job_state
-                        break
-        except urllib.error.HTTPError as exc:
-            if exc.code not in (404, 403, 503):
-                raise
+        remediation_result = _post_and_maybe_wait(
+            rem_url, base=base, ssl_ctx=ssl_ctx, token=token, wait=wait
+        )
+
+    gc_result: dict[str, Any] | None = None
+    if gc and token:
+        gc_params: dict[str, str] = {}
+        if eco_param:
+            gc_params["ecosystem"] = eco_param
+        if comp_param:
+            gc_params["components"] = comp_param
+        if gc_keep is not None:
+            gc_params["keep_versions"] = str(gc_keep)
+        if gc_dry_run:
+            gc_params["dry_run"] = "true"
+        if wait:
+            gc_params["wait"] = "true"
+        gc_qs = urllib.parse.urlencode(gc_params)
+        gc_url = f"{base}/catalog/gc" + (f"?{gc_qs}" if gc_qs else "")
+        gc_result = _post_and_maybe_wait(
+            gc_url, base=base, ssl_ctx=ssl_ctx, token=token, wait=wait
+        )
 
     health = _get_json(f"{base}/healthz", ssl_ctx=ssl_ctx, token=token)
     provenance = _get_json(f"{base}/audit/provenance", ssl_ctx=ssl_ctx, token=token)
@@ -260,10 +302,27 @@ def catalog_frontend(
             h for h in history if any(t in str(h.get("component", "")).lower() for t in comp_tokens)
         ]
 
+    activity_data: dict[str, Any] | None = None
+    if activity:
+        act_params: dict[str, str] = {"limit": str(max(1, activity_limit))}
+        if activity_event.strip():
+            act_params["event"] = activity_event.strip()
+        act_qs = urllib.parse.urlencode(act_params)
+        try:
+            activity_data = _get_json(f"{base}/audit/activity?{act_qs}", ssl_ctx=ssl_ctx, token=token)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                activity_data = {"count": 0, "events": [], "note": "/audit/activity not available on this server"}
+            else:
+                raise
+
     return {
         "frontend_url": base,
         "health": health,
         "remediation": remediation_result,
+        "gc": gc_result,
+        "activity": activity_data,
+        "activity_only": bool(activity and not comp_param and not eco_param),
         "filters": {
             "ecosystem": eco_param or "all",
             "components": comp_param or "all",
@@ -344,11 +403,56 @@ def _print_report(report: dict[str, Any]) -> None:
                 f"Auto-Remediation     : job_id={rem.get('job_id')} status={rem.get('status')} "
                 "(engine processing asynchronously via message bus)"
             )
-        elif rem.get("quarantined_count") or rem.get("upgraded_count"):
+        else:
             print(
-                f"Auto-Remediation     : quarantined={rem.get('quarantined_count', 0)}, "
-                f"upgraded_to_latest={rem.get('upgraded_count', 0)}"
+                f"Auto-Remediation     : scanned={rem.get('scanned', 0)}, clean={rem.get('clean_count', 0)}, "
+                f"quarantined={rem.get('quarantined_count', 0)}, upgraded_to_latest={rem.get('upgraded_count', 0)}"
             )
+
+    gc = report.get("gc")
+    if gc:
+        if gc.get("job_id") and gc.get("status") in ("queued", "running", "failed"):
+            print(
+                f"Garbage Collection   : job_id={gc.get('job_id')} status={gc.get('status')} "
+                "(engine processing asynchronously via message bus)"
+            )
+        else:
+            print(
+                f"Garbage Collection   : removed_versions={gc.get('removed_count', 0)}, "
+                f"files_removed={gc.get('files_removed_total', 0)}, keep_versions={gc.get('keep_versions', 2)}, "
+                f"dry_run={gc.get('dry_run', False)}"
+            )
+
+    act = report.get("activity")
+    if act is not None:
+        events = act.get("events") or []
+        print(f"\n[Scheduled Task & Engine Activity Log] (events={len(events)})")
+        if act.get("note"):
+            print(f"  {act['note']}")
+        elif events:
+            a_rows = [
+                [
+                    str(ev.get("timestamp", ""))[:19],
+                    str(ev.get("source", "")),
+                    str(ev.get("event", "")),
+                    str(ev.get("ecosystem", "") or "-"),
+                    str(ev.get("component", "") or "-"),
+                    str(ev.get("version", "") or "-"),
+                    str(ev.get("details", "") or "-"),
+                ]
+                for ev in events
+            ]
+            print(
+                _render_table(
+                    ["TIMESTAMP", "SOURCE", "EVENT", "ECOSYSTEM", "COMPONENT", "VERSION", "DETAILS"],
+                    a_rows,
+                )
+            )
+        else:
+            print("  (no activity events recorded yet)")
+
+    if report.get("activity_only"):
+        return
 
     print("\n[Active Cached Components]")
     if report["components"]:
@@ -466,12 +570,49 @@ def main() -> int:
     parser.add_argument(
         "--remediate",
         action="store_true",
-        help="Trigger POST /catalog/remediate CVE rescan/auto-upgrade before listing (opt-in; hourly background rescan already runs on the server)",
+        help="Force POST /catalog/remediate CVE rescan/auto-upgrade before listing",
+    )
+    parser.add_argument(
+        "--scan-unscanned",
+        action="store_true",
+        help="Force scanning of only UNSCANNED cached components (POST /catalog/remediate?only_unscanned=true)",
+    )
+    parser.add_argument(
+        "--gc",
+        action="store_true",
+        help="Force N-2+ version garbage collection (POST /catalog/gc)",
+    )
+    parser.add_argument(
+        "--gc-dry-run",
+        action="store_true",
+        help="Preview N-2+ garbage collection without deleting files",
+    )
+    parser.add_argument(
+        "--gc-keep",
+        type=int,
+        default=None,
+        help="Override number of newest versions to keep during --gc (default: server GC_RETENTION_VERSIONS=2)",
+    )
+    parser.add_argument(
+        "--activity",
+        action="store_true",
+        help="Show scheduled task, rescan, quarantine, and GC activity log events (GET /audit/activity)",
+    )
+    parser.add_argument(
+        "--activity-limit",
+        type=int,
+        default=50,
+        help="Maximum number of recent activity events to display (default: 50)",
+    )
+    parser.add_argument(
+        "--activity-event",
+        default="",
+        help="Comma-separated activity event filter (e.g. HOURLY_CVE_RESCAN,GC_REMOVED,QUARANTINED)",
     )
     parser.add_argument(
         "--wait",
         action="store_true",
-        help="Wait for async engine remediation job to finish when --remediate is used",
+        help="Wait for async engine job to finish when --remediate, --scan-unscanned, or --gc is used",
     )
     parser.add_argument("--ca-bundle", default="", help="Path to custom CA certificate bundle")
     parser.add_argument("--insecure", action="store_true", help="Skip TLS certificate verification")
@@ -487,6 +628,13 @@ def main() -> int:
             ecosystem=args.ecosystem,
             components_filter=args.components,
             remediate=args.remediate,
+            scan_unscanned=args.scan_unscanned,
+            gc=args.gc,
+            gc_dry_run=args.gc_dry_run,
+            gc_keep=args.gc_keep,
+            activity=args.activity,
+            activity_limit=args.activity_limit,
+            activity_event=args.activity_event,
             wait=args.wait,
         )
     except Exception as exc:

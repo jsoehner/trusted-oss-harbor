@@ -482,10 +482,13 @@ def test_unscanned_component_scan_and_n_minus_2_garbage_collection(tmp_path, mon
         before = client.get("/catalog/vulnerabilities?ecosystem=pypi&components=demo_gc_pkg").json()
         assert before["summary"]["unscanned"] == 4
 
-        # Run only_unscanned sweep -> transitions all 4 to CLEAN
-        summary = asyncio.run(
-            remediate_vulnerable_components(settings=settings, app_instance=app, only_unscanned=True)
+        # Force only_unscanned sweep via HTTP -> transitions all 4 to CLEAN
+        rem_resp = client.post(
+            "/catalog/remediate?ecosystem=pypi&components=demo_gc_pkg&only_unscanned=true",
+            headers={"X-Gatekeeper-Token": "test-admin-token"},
         )
+        assert rem_resp.status_code == 200
+        summary = rem_resp.json()
         assert summary["scanned"] == 4
         assert summary["clean_count"] == 4
 
@@ -506,3 +509,10 @@ def test_unscanned_component_scan_and_n_minus_2_garbage_collection(tmp_path, mon
         assert not (pkg_dir / "demo_gc_pkg-1.1.0-py3-none-any.whl").exists()
         assert (pkg_dir / "demo_gc_pkg-1.2.0-py3-none-any.whl").exists()
         assert (pkg_dir / "demo_gc_pkg-1.3.0-py3-none-any.whl").exists()
+
+        # Verify GET /audit/activity recorded GC_REMOVED events
+        act_resp = client.get("/audit/activity?event=GC_REMOVED&limit=10")
+        assert act_resp.status_code == 200
+        act_body = act_resp.json()
+        assert act_body["count"] == 2
+        assert {ev["version"] for ev in act_body["events"]} == {"1.0.0", "1.1.0"}

@@ -94,10 +94,19 @@ GATEKEEPER_ADMIN_TOKEN="<token>" \
   1. The vulnerable version and its sidecars are moved to `packages/quarantine/` with CVE metadata (`max_cvss`, `cve_ids`, `superseded_by`).
   2. The newest clean upstream version is fetched, scanned, dual-signed, and tagged as **`latest`** (`maven-metadata.xml` for Maven; `latest` resolution metadata for PyPI).
   3. `GET /catalog/vulnerabilities` and `catalog_frontend.py` display the active `'latest'` version, the `[Quarantined (Vulnerable)]` table, and the `[Component Caching History & Active 'latest' Resolution]` table.
-- **`N-2` Garbage Collection (`POST /catalog/gc`)**: Automatically prunes cached versions that are 2+ versions older than `latest` (retaining `GC_RETENTION_VERSIONS=2`, i.e., `N` and `N-1`), removing `N-2` and older artifacts and their sidecars (`.asc`, `.mldsa65`, `.sha256`, `.sha384`, `.sha512`). You can also trigger GC manually:
+- **`N-2` Garbage Collection (`POST /catalog/gc`)**: Automatically prunes cached versions that are 2+ versions older than `latest` (retaining `GC_RETENTION_VERSIONS=2`, i.e., `N` and `N-1`), removing `N-2` and older artifacts and their sidecars (`.asc`, `.mldsa65`, `.sha256`, `.sha384`, `.sha512`). You can also view scheduled activity or trigger scans/GC directly from `scripts/catalog_frontend.py`:
   ```bash
-  curl -X POST -H "X-Gatekeeper-Token: <token>" \
-    "http://oss.jsigroup.local:8080/catalog/gc?ecosystem=pypi,maven"
+  # View scheduled task, rescan, quarantine, and GC activity log
+  GATEKEEPER_ADMIN_TOKEN="<token>" \
+    python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --activity
+
+  # Force scanning of only UNSCANNED components
+  GATEKEEPER_ADMIN_TOKEN="<token>" \
+    python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --scan-unscanned --wait --activity
+
+  # Preview or force N-2+ version garbage collection
+  GATEKEEPER_ADMIN_TOKEN="<token>" \
+    python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --gc --gc-dry-run --wait
   ```
 
 ### 2.5 Asynchronous Engine Jobs (`POST /catalog/remediate`, `GET /jobs`)

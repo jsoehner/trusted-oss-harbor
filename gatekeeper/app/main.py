@@ -15,6 +15,7 @@ from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, Uplo
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
+from app.activity import append_activity_event, read_activity_events
 from app.bus import BaseJobBus, create_job_bus
 from app.config import Settings
 from app.discovery import (
@@ -121,6 +122,16 @@ async def _hourly_cve_rescan_loop(app: FastAPI) -> None:
         init_summary = await remediate_vulnerable_components(
             settings=settings, app_instance=app, only_unscanned=True
         )
+        append_activity_event(
+            settings.activity_log_path,
+            source="scheduler",
+            event="INITIAL_UNSCANNED_SCAN",
+            ecosystem="all",
+            details=(
+                f"scanned={init_summary['scanned']} clean={init_summary['clean_count']} "
+                f"quarantined={init_summary['quarantined_count']} upgraded={init_summary['upgraded_count']}"
+            ),
+        )
         if init_summary["scanned"]:
             logger.info(
                 "[CACHE] INITIAL_UNSCANNED_SCAN scanned=%d clean=%d quarantined=%d upgraded=%d",
@@ -133,6 +144,13 @@ async def _hourly_cve_rescan_loop(app: FastAPI) -> None:
         raise
     except Exception as exc:
         logger.warning("[CACHE] INITIAL_UNSCANNED_SCAN failed: %s", exc)
+        append_activity_event(
+            settings.activity_log_path,
+            source="scheduler",
+            event="SCHEDULER_ERROR",
+            ecosystem="all",
+            details=f"initial_unscanned_scan: {exc}",
+        )
 
     while True:
         await asyncio.sleep(interval)
@@ -144,7 +162,27 @@ async def _hourly_cve_rescan_loop(app: FastAPI) -> None:
                 summary["quarantined_count"],
                 summary["upgraded_count"],
             )
+            append_activity_event(
+                settings.activity_log_path,
+                source="scheduler",
+                event="HOURLY_CVE_RESCAN",
+                ecosystem="all",
+                details=(
+                    f"scanned={summary['scanned']} clean={summary['clean_count']} "
+                    f"quarantined={summary['quarantined_count']} upgraded={summary['upgraded_count']}"
+                ),
+            )
             gc_summary = gc_old_component_versions(settings=settings)
+            append_activity_event(
+                settings.activity_log_path,
+                source="scheduler",
+                event="HOURLY_GC",
+                ecosystem="all",
+                details=(
+                    f"removed_versions={gc_summary['removed_count']} "
+                    f"files_removed={gc_summary['files_removed_total']} keep={gc_summary['keep_versions']}"
+                ),
+            )
             if gc_summary["removed_count"]:
                 logger.info(
                     "[CACHE] HOURLY_GC removed_versions=%d files_removed=%d keep=%d",
@@ -156,6 +194,13 @@ async def _hourly_cve_rescan_loop(app: FastAPI) -> None:
             raise
         except Exception as exc:
             logger.warning("[CACHE] HOURLY_CVE_RESCAN failed: %s", exc)
+            append_activity_event(
+                settings.activity_log_path,
+                source="scheduler",
+                event="SCHEDULER_ERROR",
+                ecosystem="all",
+                details=f"hourly_cve_rescan: {exc}",
+            )
 
 
 def get_settings_from_app(app: FastAPI) -> Settings:
@@ -190,6 +235,7 @@ async def handle_engine_job(
             ecosystems=_parse_ecosystem_filter(payload.get("ecosystem")),
             comp_filters=_parse_component_filter(payload.get("components")),
             concurrency=payload.get("concurrency"),
+            only_unscanned=bool(payload.get("only_unscanned", False)),
         )
     if job_type == "warm":
         params = WarmRequest(**payload)
@@ -1738,6 +1784,15 @@ async def remediate_vulnerable_components(
                         "artifact": upgrade["artifact"],
                     }
                 )
+                append_activity_event(
+                    settings.activity_log_path,
+                    source="remediation",
+                    event="LATEST_TAG_UPDATED",
+                    ecosystem=eco,
+                    component=component,
+                    version=upgrade["version"],
+                    details=f"superseded={version}",
+                )
             else:
                 failed_upgrades.append({"ecosystem": eco, "component": component, "version": version})
 
@@ -1761,6 +1816,15 @@ async def remediate_vulnerable_components(
                 max_cvss,
                 ",".join(cve_ids) if cve_ids else "none",
                 superseded_by or "none",
+            )
+            append_activity_event(
+                settings.activity_log_path,
+                source="remediation",
+                event="QUARANTINED",
+                ecosystem=eco,
+                component=component,
+                version=version,
+                details=f"max_cvss={max_cvss:.1f} cves={','.join(cve_ids) if cve_ids else 'none'} superseded_by={superseded_by or 'none'}",
             )
             quarantined_items.append(
                 {
@@ -1797,6 +1861,7 @@ async def remediate_catalog_endpoint(
     ecosystem: str | None = None,
     components: str | None = None,
     concurrency: int | None = None,
+    only_unscanned: bool = False,
     wait: bool | None = None,
     x_gatekeeper_token: Annotated[str | None, Header()] = None,
 ) -> Any:
@@ -1811,6 +1876,7 @@ async def remediate_catalog_endpoint(
                 "ecosystem": ecosystem,
                 "components": components,
                 "concurrency": concurrency,
+                "only_unscanned": only_unscanned,
             },
         )
         return JSONResponse(status_code=202, content=job)
@@ -1823,6 +1889,7 @@ async def remediate_catalog_endpoint(
         ecosystems=ecosystems,
         comp_filters=comp_filters,
         concurrency=concurrency,
+        only_unscanned=only_unscanned,
     )
 
 
@@ -1935,6 +2002,25 @@ async def get_provenance_log(
             if line.strip():
                 records.append(json.loads(line))
     return {"count": len(records), "records": records}
+
+
+@app.get("/audit/activity")
+async def get_activity_log(
+    settings: Annotated[Settings, Depends(get_settings)],
+    limit: int = 50,
+    event: str | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """Return recent scheduled task, rescan, quarantine, and GC activity events (newest first)."""
+    events_filter = {e.strip().upper() for e in (event or "").split(",") if e.strip()} or None
+    sources_filter = {s.strip().lower() for s in (source or "").split(",") if s.strip()} or None
+    events = read_activity_events(
+        settings.activity_log_path,
+        limit=max(1, min(limit, 500)),
+        events_filter=events_filter,
+        sources_filter=sources_filter,
+    )
+    return {"count": len(events), "events": events}
 
 
 @app.post("/ingest/{ecosystem}/{artifact_path:path}")
