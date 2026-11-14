@@ -46,6 +46,14 @@ from app.virtual_repo import (
     render_virtual_pep503_index,
     select_preferred_distribution,
 )
+from app.remediation import (
+    fetch_upstream_maven_versions,
+    load_latest_tags,
+    load_quarantined_components,
+    quarantine_artifact_with_sidecars,
+    update_latest_tag,
+    version_sort_key,
+)
 
 logger = logging.getLogger("gatekeeper")
 if not logger.handlers:
@@ -100,13 +108,51 @@ def initialize_storage_and_keys(settings: Settings) -> Path:
     )
 
 
+async def _hourly_cve_rescan_loop(app: FastAPI) -> None:
+    """Periodically rescan cached components for newly published CVEs and auto-remediate."""
+    settings = get_settings_from_app(app)
+    interval = max(60, settings.cve_rescan_interval_seconds)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            summary = await remediate_vulnerable_components(settings=settings, app_instance=app)
+            logger.info(
+                "[CACHE] HOURLY_CVE_RESCAN scanned=%d quarantined=%d upgraded=%d",
+                summary["scanned"],
+                summary["quarantined_count"],
+                summary["upgraded_count"],
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[CACHE] HOURLY_CVE_RESCAN failed: %s", exc)
+
+
+def get_settings_from_app(app: FastAPI) -> Settings:
+    settings = getattr(app.state, "settings", None)
+    if settings is None:
+        settings = Settings()
+        app.state.settings = settings
+    return settings
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize storage directories and GPG/PQC signing authorities on startup."""
-    settings = getattr(app.state, "settings", None) or Settings()
-    app.state.settings = settings
+    settings = get_settings_from_app(app)
     initialize_storage_and_keys(settings)
-    yield
+    rescan_task: asyncio.Task[Any] | None = None
+    if settings.cve_rescan_interval_seconds > 0:
+        rescan_task = asyncio.create_task(_hourly_cve_rescan_loop(app))
+    try:
+        yield
+    finally:
+        if rescan_task is not None:
+            rescan_task.cancel()
+            try:
+                await rescan_task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(
@@ -1031,7 +1077,7 @@ async def get_catalog_cache_status(
     }
 
 
-_SIDECAR_SUFFIXES = (".asc", ".mldsa65", ".sha256", ".sha384", ".sha512", ".html")
+_SIDECAR_SUFFIXES = (".asc", ".mldsa65", ".sha256", ".sha384", ".sha512", ".html", ".json", ".xml")
 
 
 def _classify_vulnerability_status(
@@ -1070,6 +1116,8 @@ async def get_catalog_vulnerabilities(
 ) -> dict[str, Any]:
     """Return all cached components on disk with per-version signature and vulnerability status."""
     provenance_map = _load_latest_provenance_map(settings.provenance_log_path)
+    latest_tags = load_latest_tags(settings)
+    quarantined = load_quarantined_components(settings.quarantine_dir)
     components: list[dict[str, Any]] = []
 
     # 1. OCI / Harbor proxy cache (all namespaces under harbor/registry)
@@ -1093,6 +1141,8 @@ async def get_catalog_vulnerabilities(
                 cve_status = str(prov.get("cve_status", "UNKNOWN"))
                 max_cvss = float(prov.get("max_cvss", 0.0) or 0.0)
                 cve_ids = list(prov.get("cve_ids") or [])
+                tag_entry = latest_tags.get(f"oci:{repo_part}", {})
+                comp_tags = ["latest"] if (tag_part == "latest" or tag_entry.get("latest_version") == (tag_part or "latest")) else []
                 components.append(
                     {
                         "ecosystem": "oci",
@@ -1100,6 +1150,7 @@ async def get_catalog_vulnerabilities(
                         "component": repo_part,
                         "version": tag_part or "latest",
                         "artifact": rel,
+                        "tags": comp_tags,
                         "signature_valid": verify_artifact_signature(
                             path, path.with_name(f"{path.name}.asc"), settings.gnupghome
                         ),
@@ -1132,12 +1183,15 @@ async def get_catalog_vulnerabilities(
             cve_status = str(prov.get("cve_status", "UNKNOWN"))
             max_cvss = float(prov.get("max_cvss", 0.0) or 0.0)
             cve_ids = list(prov.get("cve_ids") or [])
+            tag_entry = latest_tags.get(f"{eco}:{pkg_name or rel}", {})
+            comp_tags = ["latest"] if tag_entry.get("latest_version") == (pkg_version or "unknown") else []
             components.append(
                 {
                     "ecosystem": eco,
                     "component": pkg_name or rel,
                     "version": pkg_version or "unknown",
                     "artifact": rel,
+                    "tags": comp_tags,
                     "signature_valid": verify_artifact_signature(
                         path, path.with_name(f"{path.name}.asc"), settings.gnupghome
                     ),
@@ -1158,12 +1212,233 @@ async def get_catalog_vulnerabilities(
         "clean": sum(1 for c in components if c["vulnerability_status"] == "CLEAN"),
         "vulnerable": sum(1 for c in components if c["vulnerability_status"] == "VULNERABLE"),
         "unscanned": sum(1 for c in components if c["vulnerability_status"] == "UNSCANNED"),
+        "quarantined": len(quarantined),
     }
     return {
         "cvss_fail_threshold": settings.cvss_fail_threshold,
         "summary": summary,
         "components": components,
+        "quarantined": quarantined,
+        "latest_tags": latest_tags,
     }
+
+
+async def _try_upgrade_component(
+    ecosystem: str,
+    component: str,
+    vulnerable_version: str,
+    rel_path: str,
+    settings: Settings,
+    app_instance: FastAPI,
+) -> dict[str, str] | None:
+    """Fetch the newest clean upstream version and tag it 'latest'."""
+    if ecosystem == "pypi":
+        upstream_urls = [u.strip() for u in settings.upstream_pypi_simple_url.split(",") if u.strip()]
+        dists = await fetch_upstream_pypi_distributions(upstream_urls, component)
+        enriched: list[tuple[str, dict[str, str]]] = []
+        for d in dists:
+            fname = d.get("filename", "")
+            ver = d.get("version") or extract_package_coordinates("pypi", f"{component}/{fname}")[1]
+            if ver and ver != vulnerable_version:
+                enriched.append((ver, d))
+        enriched.sort(key=lambda pair: version_sort_key(pair[0]), reverse=True)
+        seen_versions: set[str] = set()
+        for ver, dist in enriched:
+            if ver in seen_versions:
+                continue
+            seen_versions.add(ver)
+            _get_pypi_upstream_map(app_instance).setdefault(component, {})[dist["filename"]] = dist["url"]
+            try:
+                await ensure_pypi_artifact_cached(component, dist["filename"], settings, app_instance=app_instance)
+                update_latest_tag(settings, "pypi", component, ver, f"{component}/{dist['filename']}")
+                logger.info(
+                    "[CACHE] LATEST_TAG_UPDATED ecosystem=pypi component=%s version=%s superseded=%s",
+                    component,
+                    ver,
+                    vulnerable_version,
+                )
+                return {"version": ver, "artifact": f"{component}/{dist['filename']}"}
+            except HTTPException:
+                continue
+        return None
+
+    if ecosystem == "maven" and ":" in component:
+        group_id, artifact_id = component.split(":", 1)
+        upstream_urls = [u.strip() for u in settings.upstream_maven_url.split(",") if u.strip()]
+        versions = await fetch_upstream_maven_versions(upstream_urls, group_id, artifact_id)
+        ext = ".pom" if rel_path.endswith(".pom") else ".jar"
+        group_path = group_id.replace(".", "/")
+        for ver in versions:
+            if ver == vulnerable_version:
+                continue
+            candidate_rel = f"{group_path}/{artifact_id}/{ver}/{artifact_id}-{ver}{ext}"
+            try:
+                await ensure_maven_artifact_cached(candidate_rel, settings, app_instance=app_instance)
+                update_latest_tag(settings, "maven", component, ver, candidate_rel)
+                logger.info(
+                    "[CACHE] LATEST_TAG_UPDATED ecosystem=maven component=%s version=%s superseded=%s",
+                    component,
+                    ver,
+                    vulnerable_version,
+                )
+                return {"version": ver, "artifact": candidate_rel}
+            except HTTPException:
+                continue
+        return None
+
+    if ecosystem == "oci":
+        try:
+            await ensure_oci_manifest_cached(
+                repo_path=component,
+                base_ref="latest",
+                settings=settings,
+                app_instance=app_instance,
+            )
+            update_latest_tag(settings, "oci", component, "latest", f"chainguard-cache/{component}/manifests/latest")
+            return {"version": "latest", "artifact": f"{component}/manifests/latest"}
+        except HTTPException:
+            return None
+
+    return None
+
+
+async def remediate_vulnerable_components(
+    settings: Settings,
+    app_instance: FastAPI,
+    ecosystems: set[str] | None = None,
+) -> dict[str, Any]:
+    """Rescan cached artifacts for newly published CVEs, quarantine vulnerable versions, and fetch clean 'latest'."""
+    active_ecosystems = ecosystems or {"oci", "maven", "pypi"}
+    scanned = 0
+    clean_count = 0
+    quarantined_items: list[dict[str, Any]] = []
+    upgraded_items: list[dict[str, Any]] = []
+    failed_upgrades: list[dict[str, Any]] = []
+
+    targets: list[tuple[str, Path, Path, str, str, str]] = []
+    if "oci" in active_ecosystems:
+        registry_root = settings.oss_data_root / "harbor" / "registry"
+        if registry_root.is_dir():
+            for ns_dir in sorted(registry_root.iterdir()):
+                if not ns_dir.is_dir() or ns_dir.is_symlink():
+                    continue
+                for path in sorted(ns_dir.rglob("*")):
+                    if (
+                        not path.is_file()
+                        or path.is_symlink()
+                        or path.name.endswith(_SIDECAR_SUFFIXES)
+                        or "/manifests/" not in path.as_posix()
+                    ):
+                        continue
+                    rel = path.relative_to(ns_dir).as_posix()
+                    repo_part, _, tag_part = rel.partition("/manifests/")
+                    targets.append(("oci", ns_dir, path, rel, repo_part, tag_part or "latest"))
+
+    for eco, root_dir in (("maven", settings.trusted_maven_dir), ("pypi", settings.trusted_pypi_dir)):
+        if eco not in active_ecosystems or not root_dir.is_dir():
+            continue
+        for path in sorted(root_dir.rglob("*")):
+            if not path.is_file() or path.is_symlink() or path.name.endswith(_SIDECAR_SUFFIXES):
+                continue
+            rel = path.relative_to(root_dir).as_posix()
+            pkg_name, pkg_version = extract_package_coordinates(eco, rel)
+            targets.append((eco, root_dir, path, rel, pkg_name or rel, pkg_version or "unknown"))
+
+    for eco, root_dir, path, rel, component, version in targets:
+        if not path.exists():
+            continue
+        scanned += 1
+        verdict = await evaluate_artifact_security(
+            file_path=path,
+            clamav_host=settings.clamav_host,
+            clamav_port=settings.clamav_port,
+            clamav_required=False,
+            cvss_threshold=settings.cvss_fail_threshold,
+            cve_scanner_mode=settings.cve_scanner_mode,
+            package_ecosystem=eco,
+            package_name=component,
+            package_version=version,
+        )
+        if verdict.passed and verdict.max_cvss < settings.cvss_fail_threshold:
+            clean_count += 1
+            continue
+
+        upgrade = await _try_upgrade_component(
+            ecosystem=eco,
+            component=component,
+            vulnerable_version=version,
+            rel_path=rel,
+            settings=settings,
+            app_instance=app_instance,
+        )
+        superseded_by = upgrade["version"] if upgrade else ""
+        if upgrade:
+            upgraded_items.append(
+                {
+                    "ecosystem": eco,
+                    "component": component,
+                    "previous_version": version,
+                    "latest_version": upgrade["version"],
+                    "artifact": upgrade["artifact"],
+                }
+            )
+        else:
+            failed_upgrades.append({"ecosystem": eco, "component": component, "version": version})
+
+        quarantine_artifact_with_sidecars(
+            artifact_path=path,
+            root_dir=root_dir,
+            quarantine_root=settings.quarantine_dir,
+            ecosystem=eco,
+            component=component,
+            version=version,
+            max_cvss=verdict.max_cvss,
+            cve_ids=verdict.cve_ids,
+            cve_status=verdict.cve_status,
+            superseded_by=superseded_by,
+        )
+        logger.warning(
+            "[CACHE] QUARANTINED ecosystem=%s component=%s version=%s max_cvss=%.1f cves=%s superseded_by=%s",
+            eco,
+            component,
+            version,
+            verdict.max_cvss,
+            ",".join(verdict.cve_ids) if verdict.cve_ids else "none",
+            superseded_by or "none",
+        )
+        quarantined_items.append(
+            {
+                "ecosystem": eco,
+                "component": component,
+                "version": version,
+                "max_cvss": verdict.max_cvss,
+                "cve_ids": verdict.cve_ids,
+                "superseded_by": superseded_by,
+            }
+        )
+
+    return {
+        "status": "remediated",
+        "scanned": scanned,
+        "clean_count": clean_count,
+        "quarantined_count": len(quarantined_items),
+        "upgraded_count": len(upgraded_items),
+        "quarantined": quarantined_items,
+        "upgraded": upgraded_items,
+        "failed_upgrades": failed_upgrades,
+        "latest_tags": load_latest_tags(settings),
+    }
+
+
+@app.post("/catalog/remediate")
+async def remediate_catalog_endpoint(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    x_gatekeeper_token: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """Rescan cached components for newly published CVEs, quarantine vulnerable versions, and fetch clean 'latest'."""
+    require_admin_token(x_gatekeeper_token, settings)
+    return await remediate_vulnerable_components(settings=settings, app_instance=request.app)
 
 
 @app.api_route("/keys/trusted-oss-pubkey.asc", methods=["GET", "HEAD"], response_class=PlainTextResponse)

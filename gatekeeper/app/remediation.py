@@ -1,0 +1,178 @@
+"""Automated CVE remediation, vulnerable artifact quarantine, and 'latest' tag management."""
+
+from __future__ import annotations
+
+import datetime
+import json
+import re
+import shutil
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from app.config import Settings
+
+_ARTIFACT_SIDECARS = ("", ".asc", ".mldsa65", ".sha256", ".sha384", ".sha512")
+
+
+def version_sort_key(version: str) -> tuple[tuple[int, int, str], ...]:
+    """Convert a version string into a sortable tuple (newest-first when reversed)."""
+    parts = re.split(r"[.\-_+]", version.strip())
+    key: list[tuple[int, int, str]] = []
+    for part in parts:
+        if not part:
+            continue
+        if part.isdigit():
+            key.append((1, int(part), ""))
+        else:
+            m = re.match(r"^(\d+)(.*)$", part)
+            if m:
+                key.append((1, int(m.group(1)), m.group(2).lower()))
+            else:
+                key.append((0, 0, part.lower()))
+    return tuple(key)
+
+
+async def fetch_upstream_maven_versions(
+    upstream_urls: list[str],
+    group_id: str,
+    artifact_id: str,
+) -> list[str]:
+    """Fetch candidate versions from upstream Maven metadata, ordered newest-first."""
+    group_path = group_id.replace(".", "/")
+    versions: list[str] = []
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20.0) as client:
+        for base_url in upstream_urls:
+            meta_url = f"{base_url.rstrip('/')}/{group_path}/{artifact_id}/maven-metadata.xml"
+            try:
+                resp = await client.get(meta_url)
+                if resp.status_code != 200:
+                    continue
+                root = ET.fromstring(resp.text)
+                for node in root.findall("./versioning/versions/version"):
+                    if node.text and node.text.strip():
+                        versions.append(node.text.strip())
+                if versions:
+                    break
+            except Exception:
+                continue
+
+    deduped = sorted(set(versions), key=version_sort_key, reverse=True)
+    return deduped
+
+
+def quarantine_artifact_with_sidecars(
+    artifact_path: Path,
+    root_dir: Path,
+    quarantine_root: Path,
+    ecosystem: str,
+    component: str,
+    version: str,
+    max_cvss: float,
+    cve_ids: list[str],
+    cve_status: str,
+    superseded_by: str = "",
+) -> Path:
+    """Move a newly vulnerable artifact and its sidecars out of trusted storage into quarantine."""
+    rel = artifact_path.relative_to(root_dir).as_posix()
+    dest_base = quarantine_root / "cve-quarantined" / ecosystem / rel
+    dest_base.parent.mkdir(parents=True, exist_ok=True)
+
+    for suffix in _ARTIFACT_SIDECARS:
+        src = artifact_path if not suffix else artifact_path.with_name(f"{artifact_path.name}{suffix}")
+        dst = dest_base if not suffix else dest_base.with_name(f"{dest_base.name}{suffix}")
+        if src.exists() and not src.is_symlink():
+            shutil.move(str(src), str(dst))
+
+    meta_file = dest_base.with_name(f"{dest_base.name}.quarantine.json")
+    meta = {
+        "ecosystem": ecosystem,
+        "component": component,
+        "version": version,
+        "artifact": rel,
+        "status": "QUARANTINED",
+        "max_cvss": max_cvss,
+        "cve_ids": list(cve_ids),
+        "cve_status": cve_status,
+        "quarantined_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "superseded_by": superseded_by,
+    }
+    meta_file.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    return dest_base
+
+
+def load_quarantined_components(quarantine_root: Path) -> list[dict[str, Any]]:
+    """Load metadata for all CVE-quarantined artifacts."""
+    q_dir = quarantine_root / "cve-quarantined"
+    if not q_dir.is_dir():
+        return []
+    records: list[dict[str, Any]] = []
+    for meta_file in sorted(q_dir.rglob("*.quarantine.json")):
+        if meta_file.is_symlink():
+            continue
+        try:
+            records.append(json.loads(meta_file.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return records
+
+
+def _latest_tags_path(settings: Settings) -> Path:
+    return settings.oss_data_root / "audit" / "latest-tags.json"
+
+
+def load_latest_tags(settings: Settings) -> dict[str, dict[str, Any]]:
+    """Return mapping of '<ecosystem>:<component>' -> latest tag metadata."""
+    path = _latest_tags_path(settings)
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def update_latest_tag(
+    settings: Settings,
+    ecosystem: str,
+    component: str,
+    version: str,
+    rel_artifact_path: str,
+) -> None:
+    """Persist 'latest' tag pointer in audit/latest-tags.json and ecosystem metadata."""
+    tags = load_latest_tags(settings)
+    tags[f"{ecosystem}:{component}"] = {
+        "ecosystem": ecosystem,
+        "component": component,
+        "latest_version": version,
+        "artifact": rel_artifact_path,
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    path = _latest_tags_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(tags, indent=2) + "\n", encoding="utf-8")
+
+    if ecosystem == "pypi":
+        pkg_dir = settings.trusted_pypi_dir / component
+        pkg_dir.mkdir(parents=True, exist_ok=True)
+        (pkg_dir / "latest.json").write_text(
+            json.dumps({"tag": "latest", "version": version, "artifact": rel_artifact_path}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    elif ecosystem == "maven" and ":" in component:
+        group_id, artifact_id = component.split(":", 1)
+        art_dir = settings.trusted_maven_dir / group_id.replace(".", "/") / artifact_id
+        art_dir.mkdir(parents=True, exist_ok=True)
+        xml = (
+            "<metadata>\n"
+            f"  <groupId>{group_id}</groupId>\n"
+            f"  <artifactId>{artifact_id}</artifactId>\n"
+            "  <versioning>\n"
+            f"    <latest>{version}</latest>\n"
+            f"    <release>{version}</release>\n"
+            "  </versioning>\n"
+            "</metadata>\n"
+        )
+        (art_dir / "maven-metadata.xml").write_text(xml, encoding="utf-8")

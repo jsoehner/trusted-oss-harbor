@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     github_username: str = Field(default="jsoehner", alias="GITHUB_USERNAME")
     github_token: str = Field(default="", alias="GITHUB_TOKEN")
     warmup_concurrency: int = Field(default=4, alias="WARMUP_CONCURRENCY")
+    cve_rescan_interval_seconds: int = Field(
+        default=3600, alias="CVE_RESCAN_INTERVAL_SECONDS"
+    )
     trusted_sources: list[str] = Field(
         default=["cgr.dev", "docker.io", "ghcr.io", "quay.io"],
         alias="TRUSTED_SOURCES",

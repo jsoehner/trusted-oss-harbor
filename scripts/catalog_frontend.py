@@ -35,6 +35,18 @@ def _get_json(
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _post_json(
+    url: str,
+    timeout: float = 120.0,
+    ssl_ctx: ssl.SSLContext | None = None,
+    token: str = "",
+) -> dict[str, Any]:
+    headers = {"X-Gatekeeper-Token": token} if token else {}
+    req = urllib.request.Request(url, method="POST", data=b"", headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
 def _head_or_get_ok(
     url: str,
     timeout: float = 5.0,
@@ -158,10 +170,22 @@ def catalog_frontend(
     insecure: bool = False,
     token: str = "",
     ecosystem: str = "all",
+    remediate: bool = True,
 ) -> dict[str, Any]:
-    """Query frontend HTTP endpoints and return cached components + per-version CVE status."""
+    """Optionally remediate newly vulnerable cached versions, then return per-version inventory."""
     base = base_url.rstrip("/")
     ssl_ctx = _build_ssl_context(ca_bundle=ca_bundle, insecure=insecure)
+
+    remediation_result: dict[str, Any] | None = None
+    if remediate and token:
+        try:
+            remediation_result = _post_json(
+                f"{base}/catalog/remediate", ssl_ctx=ssl_ctx, token=token
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (404, 403, 503):
+                raise
+
     health = _get_json(f"{base}/healthz", ssl_ctx=ssl_ctx, token=token)
     status = _get_json(f"{base}/catalog/status", ssl_ctx=ssl_ctx, token=token)
     provenance = _get_json(f"{base}/audit/provenance", ssl_ctx=ssl_ctx, token=token)
@@ -183,12 +207,15 @@ def catalog_frontend(
     )
 
     components = vuln_data.get("components", [])
+    quarantined = vuln_data.get("quarantined", [])
     if ecosystem != "all":
         components = [c for c in components if c.get("ecosystem") == ecosystem]
+        quarantined = [q for q in quarantined if q.get("ecosystem") == ecosystem]
 
     return {
         "frontend_url": base,
         "health": health,
+        "remediation": remediation_result,
         "keys": {
             "gpg_public_key": gpg_ok,
             "mldsa65_public_key": mldsa_ok,
@@ -199,6 +226,7 @@ def catalog_frontend(
             "oci_cached": sum(1 for c in components if c.get("ecosystem") == "oci"),
             "maven_cached": sum(1 for c in components if c.get("ecosystem") == "maven"),
             "pypi_cached": sum(1 for c in components if c.get("ecosystem") == "pypi"),
+            "quarantined": len(quarantined),
             "provenance_records": provenance.get("count", 0),
         },
         "vulnerability_summary": {
@@ -206,8 +234,10 @@ def catalog_frontend(
             "clean": sum(1 for c in components if c.get("vulnerability_status") == "CLEAN"),
             "vulnerable": sum(1 for c in components if c.get("vulnerability_status") == "VULNERABLE"),
             "unscanned": sum(1 for c in components if c.get("vulnerability_status") == "UNSCANNED"),
+            "quarantined": len(quarantined),
         },
         "components": components,
+        "quarantined": quarantined,
     }
 
 
@@ -226,12 +256,20 @@ def _print_report(report: dict[str, Any]) -> None:
     print(f"Policy Threshold     : CVSS >= {health.get('cvss_fail_threshold', 'N/A')}")
     print(
         f"Cached Components    : Total={c['cached_total']} (OCI={c['oci_cached']}, "
-        f"Maven={c['maven_cached']}, PyPI={c['pypi_cached']}) | Provenance={c['provenance_records']}"
+        f"Maven={c['maven_cached']}, PyPI={c['pypi_cached']}) | "
+        f"Quarantined={c.get('quarantined', 0)} | Provenance={c['provenance_records']}"
     )
     print(
         f"Vulnerability Status : CLEAN={vs['clean']} | VULNERABLE={vs['vulnerable']} | "
-        f"UNSCANNED={vs['unscanned']}"
+        f"UNSCANNED={vs['unscanned']} | QUARANTINED={vs.get('quarantined', 0)}"
     )
+
+    rem = report.get("remediation")
+    if rem and (rem.get("quarantined_count") or rem.get("upgraded_count")):
+        print(
+            f"Auto-Remediation     : quarantined={rem.get('quarantined_count', 0)}, "
+            f"upgraded_to_latest={rem.get('upgraded_count', 0)}"
+        )
 
     for eco, label in (("oci", "OCI / Harbor Cache"), ("maven", "Trusted Maven"), ("pypi", "Trusted PyPI")):
         rows = [item for item in report["components"] if item.get("ecosystem") == eco]
@@ -242,15 +280,30 @@ def _print_report(report: dict[str, Any]) -> None:
         for item in rows:
             sig = "GPG-VALID" if item.get("signature_valid") else "UNSIGNED"
             pqc = "+PQC" if item.get("pqc_signed") else ""
+            tags = item.get("tags") or []
+            tag_str = f" [tag:{','.join(tags)}]" if tags else ""
             vstat = item.get("vulnerability_status", "UNSCANNED")
             cve_status = item.get("cve_status", "UNKNOWN")
             cvss = float(item.get("max_cvss", 0.0) or 0.0)
             cves = ",".join(item.get("cve_ids") or []) or "none"
             print(
-                f"  - {item.get('component')}@{item.get('version')} "
+                f"  - {item.get('component')}@{item.get('version')}{tag_str} "
                 f"[{sig}{pqc}] vuln={vstat} (scanner={cve_status}, max_cvss={cvss:.1f}, cves={cves}) "
                 f"clamav={item.get('clamav_status', 'UNKNOWN')}"
             )
+
+    quarantined = report.get("quarantined") or []
+    print(f"\n[Quarantined (Vulnerable)] (count={len(quarantined)})")
+    if not quarantined:
+        print("  (none)")
+    for q in quarantined:
+        cves = ",".join(q.get("cve_ids") or []) or "none"
+        cvss = float(q.get("max_cvss", 0.0) or 0.0)
+        sup = f" -> superseded_by={q['superseded_by']} (tag:latest)" if q.get("superseded_by") else ""
+        print(
+            f"  - [{q.get('ecosystem')}] {q.get('component')}@{q.get('version')} "
+            f"[QUARANTINED] max_cvss={cvss:.1f} failing_cves={cves}{sup}"
+        )
 
 
 def main() -> int:
@@ -273,6 +326,11 @@ def main() -> int:
         default="all",
         help="Filter output to a specific ecosystem (default: all)",
     )
+    parser.add_argument(
+        "--no-remediate",
+        action="store_true",
+        help="Skip POST /catalog/remediate CVE rescan/auto-upgrade before listing",
+    )
     parser.add_argument("--ca-bundle", default="", help="Path to custom CA certificate bundle")
     parser.add_argument("--insecure", action="store_true", help="Skip TLS certificate verification")
     parser.add_argument("--json", action="store_true", help="Output JSON inventory")
@@ -285,6 +343,7 @@ def main() -> int:
             insecure=args.insecure,
             token=args.token,
             ecosystem=args.ecosystem,
+            remediate=not args.no_remediate,
         )
     except Exception as exc:
         print(f"[ERROR] Could not reach frontend at {args.url}: {exc}")

@@ -1,6 +1,6 @@
 """Tests for dynamic project discovery, catalog warmup, and virtual repo pull-through."""
 
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 import io
 import json
 import socketserver
@@ -296,3 +296,103 @@ async def test_cve_gate_rejects_high_and_critical_defects(tmp_path: Path, monkey
     assert verdict.passed is False
     assert verdict.max_cvss == 9.8
     assert "CVE-2026-99999" in verdict.cve_ids
+
+
+def test_remediation_quarantines_vulnerable_version_and_tags_latest(tmp_path: Path, monkeypatch) -> None:
+    """When a cached version fails a new CVE >= 7.0, fetch clean newer version, tag 'latest', and quarantine old."""
+    old_whl = _build_zip({"requests/__init__.py": b"__version__ = '2.32.3'\n"})
+    new_whl = _build_zip({"requests/__init__.py": b"__version__ = '2.32.4'\n"})
+
+    class _RemediationHTTPHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args) -> None:
+            return
+
+        def do_GET(self) -> None:
+            if self.path == "/simple/requests/":
+                html = (
+                    "<html><body>"
+                    "<a href='/files/requests-2.32.3-py3-none-any.whl'>requests-2.32.3-py3-none-any.whl</a>"
+                    "<a href='/files/requests-2.32.4-py3-none-any.whl'>requests-2.32.4-py3-none-any.whl</a>"
+                    "</body></html>"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(html)
+                return
+            if self.path == "/files/requests-2.32.3-py3-none-any.whl":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(old_whl)
+                return
+            if self.path == "/files/requests-2.32.4-py3-none-any.whl":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(new_whl)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _RemediationHTTPHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_port}"
+
+    data_root = tmp_path / "oss-data"
+    settings = Settings(
+        OSS_DATA_ROOT=data_root,
+        CLAMAV_REQUIRED=False,
+        CVSS_FAIL_THRESHOLD=7.0,
+        AUTO_PROMOTE_CLEAN_ARTIFACTS=True,
+        PQC_SIGNING_ENABLED=True,
+        CVE_SCANNER_MODE="osv",
+        CVE_RESCAN_INTERVAL_SECONDS=0,
+        UPSTREAM_PYPI_SIMPLE_URL=f"{base}/simple/",
+        GATEKEEPER_ADMIN_TOKEN="test-admin-token",
+    )
+    app.state.settings = settings
+    app.state.pypi_upstream_map = {}
+
+    async def fake_osv_initial(eco: str, pkg: str, ver: str):
+        return False, 0.0, [], "OSV_OK"
+
+    monkeypatch.setattr("app.scanner.query_osv_vulnerabilities", fake_osv_initial)
+
+    try:
+        with TestClient(app) as client:
+            # 1. Cache 2.32.3 while it is clean
+            r1 = client.get("/pypi/virtual/packages/requests/requests-2.32.3-py3-none-any.whl")
+            assert r1.status_code == 200
+
+            # 2. Simulate new CVE published for 2.32.3 (CVSS 8.5 >= 7.0), while 2.32.4 is clean
+            async def fake_osv_after_cve(eco: str, pkg: str, ver: str):
+                if "2.32.3" in ver:
+                    return True, 8.5, ["CVE-2026-88888"], "OSV_OK"
+                return False, 0.0, [], "OSV_OK"
+
+            monkeypatch.setattr("app.scanner.query_osv_vulnerabilities", fake_osv_after_cve)
+
+            # 3. Trigger remediation
+            rem = client.post("/catalog/remediate", headers={"X-Gatekeeper-Token": "test-admin-token"})
+            assert rem.status_code == 200
+            rem_body = rem.json()
+            assert rem_body["quarantined_count"] == 1
+            assert rem_body["upgraded_count"] == 1
+            assert rem_body["upgraded"][0]["latest_version"] == "2.32.4"
+
+            # 4. Verify /catalog/vulnerabilities shows 2.32.4 as 'latest' and 2.32.3 as quarantined with CVEs
+            vulns = client.get("/catalog/vulnerabilities").json()
+            assert vulns["summary"]["quarantined"] == 1
+            assert len(vulns["components"]) == 1
+            assert vulns["components"][0]["version"] == "2.32.4"
+            assert "latest" in vulns["components"][0]["tags"]
+            assert vulns["components"][0]["vulnerability_status"] == "CLEAN"
+
+            q_item = vulns["quarantined"][0]
+            assert q_item["status"] == "QUARANTINED"
+            assert q_item["version"] == "2.32.3"
+            assert q_item["max_cvss"] == 8.5
+            assert "CVE-2026-88888" in q_item["cve_ids"]
+            assert q_item["superseded_by"] == "2.32.4"
+    finally:
+        srv.shutdown()
+        srv.server_close()
