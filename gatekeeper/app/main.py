@@ -6,6 +6,7 @@ import json
 import logging
 from pathlib import Path
 import secrets
+import sys
 from typing import Annotated, Any
 import uuid
 
@@ -47,6 +48,14 @@ from app.virtual_repo import (
 )
 
 logger = logging.getLogger("gatekeeper")
+if not logger.handlers:
+    _stdout_handler = logging.StreamHandler(sys.stdout)
+    _stdout_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] [gatekeeper] %(message)s")
+    )
+    logger.addHandler(_stdout_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 
 OCI_ACCEPT_HEADER = (
@@ -107,7 +116,7 @@ app = FastAPI(
         "ClamAV antivirus inspection, Trivy/NVD vulnerability gating, GPG/Cosign signing, "
         "and NIST FIPS 204 ML-DSA-65 Post-Quantum Cryptography dual-signing."
     ),
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -222,6 +231,17 @@ async def quarantine_scan_sign_and_promote(
     )
     if not verdict.passed:
         staged_file.unlink(missing_ok=True)
+        logger.warning(
+            "[CACHE] BLOCKED ecosystem=%s artifact=%s version=%s clamav=%s cve_status=%s max_cvss=%.1f cves=%s reason=%s",
+            ecosystem,
+            artifact_rel_path,
+            pkg_version or "unknown",
+            verdict.clamav_status,
+            verdict.cve_status,
+            verdict.max_cvss,
+            ",".join(verdict.cve_ids) if verdict.cve_ids else "none",
+            verdict.reason,
+        )
         raise HTTPException(status_code=451, detail=verdict.reason)
 
     try:
@@ -259,7 +279,7 @@ async def quarantine_scan_sign_and_promote(
     if pqc_sig_file:
         pqc_sig_file.unlink(missing_ok=True)
 
-    return append_provenance_record(
+    record = append_provenance_record(
         provenance_log_path=settings.provenance_log_path,
         ecosystem=ecosystem,
         artifact_rel_path=artifact_rel_path,
@@ -270,7 +290,22 @@ async def quarantine_scan_sign_and_promote(
         cve_status=verdict.cve_status,
         signature_file=f"{artifact_rel_path}.asc",
         signature_file_mldsa=f"{artifact_rel_path}.mldsa65" if settings.pqc_signing_enabled else "",
+        max_cvss=verdict.max_cvss,
+        cve_ids=verdict.cve_ids,
     )
+    logger.info(
+        "[CACHE] PROMOTED ecosystem=%s artifact=%s version=%s clamav=%s cve_status=%s max_cvss=%.1f cves=%s sha256=%s pqc=%s",
+        ecosystem,
+        artifact_rel_path,
+        pkg_version or "unknown",
+        verdict.clamav_status,
+        verdict.cve_status,
+        verdict.max_cvss,
+        ",".join(verdict.cve_ids) if verdict.cve_ids else "none",
+        digests.sha256[:12],
+        "enabled" if settings.pqc_signing_enabled else "disabled",
+    )
+    return record
 
 
 async def fetch_upstream_oci_manifest(
@@ -307,6 +342,7 @@ async def ensure_maven_artifact_cached(
     """Ensure a Maven artifact is cached and GPG-signed, pulling from upstream on cache miss."""
     base_file = resolve_safe_relative_path(settings.trusted_maven_dir, base_rel_path)
     if base_file.exists():
+        logger.info("[CACHE] HIT ecosystem=maven artifact=%s", base_rel_path)
         return base_file, "HIT"
 
     if not settings.auto_promote_clean_artifacts:
@@ -365,6 +401,7 @@ async def ensure_pypi_artifact_cached(
     base_rel_path = f"{norm_pkg}/{base_filename}"
     base_file = resolve_safe_relative_path(settings.trusted_pypi_dir, base_rel_path)
     if base_file.exists():
+        logger.info("[CACHE] HIT ecosystem=pypi artifact=%s", base_rel_path)
         return base_file, "HIT"
 
     if not settings.auto_promote_clean_artifacts:
@@ -448,6 +485,7 @@ async def ensure_oci_manifest_cached(
     )
     base_file = resolve_safe_relative_path(cache_root, rel_manifest_path)
     if base_file.exists():
+        logger.info("[CACHE] HIT ecosystem=oci namespace=%s artifact=%s", cache_namespace, rel_manifest_path)
         return base_file, "HIT"
 
     if not settings.auto_promote_clean_artifacts:
@@ -799,6 +837,14 @@ async def _execute_catalog_warmup(
     if tasks:
         await asyncio.gather(*tasks)
 
+    logger.info(
+        "[CACHE] WARMUP_SUMMARY oci=%d maven=%d pypi=%d failures=%d",
+        len(chainguard_results),
+        len(spring_boot_results),
+        len(pypi_results),
+        len(failures),
+    )
+
     return {
         "status": "warmed",
         "source_projects": catalog.get("source_projects", []),
@@ -982,6 +1028,141 @@ async def get_catalog_cache_status(
         "chainguard_containers": cg_status,
         "spring_boot_components": sb_status,
         "pypi_components": pypi_status,
+    }
+
+
+_SIDECAR_SUFFIXES = (".asc", ".mldsa65", ".sha256", ".sha384", ".sha512", ".html")
+
+
+def _classify_vulnerability_status(
+    cve_status: str, max_cvss: float, threshold: float
+) -> str:
+    """Classify per-version vulnerability posture from provenance scan metadata."""
+    upper = (cve_status or "").upper()
+    if max_cvss >= threshold or "FAIL" in upper or "BLOCKED" in upper or "VULN" in upper:
+        return "VULNERABLE"
+    if any(tok in upper for tok in ("OK", "CLEAN", "PASS")):
+        return "CLEAN"
+    return "UNSCANNED"
+
+
+def _load_latest_provenance_map(provenance_log_path: Path) -> dict[str, dict[str, Any]]:
+    """Return latest provenance record keyed by relative artifact path."""
+    latest: dict[str, dict[str, Any]] = {}
+    if not provenance_log_path.is_file():
+        return latest
+    for line in provenance_log_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        art = str(rec.get("artifact", ""))
+        if art:
+            latest[art] = rec
+    return latest
+
+
+@app.get("/catalog/vulnerabilities")
+async def get_catalog_vulnerabilities(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    """Return all cached components on disk with per-version signature and vulnerability status."""
+    provenance_map = _load_latest_provenance_map(settings.provenance_log_path)
+    components: list[dict[str, Any]] = []
+
+    # 1. OCI / Harbor proxy cache (all namespaces under harbor/registry)
+    registry_root = settings.oss_data_root / "harbor" / "registry"
+    if registry_root.is_dir():
+        for ns_dir in sorted(registry_root.iterdir()):
+            if not ns_dir.is_dir() or ns_dir.is_symlink():
+                continue
+            ns = ns_dir.name
+            for path in sorted(ns_dir.rglob("*")):
+                if (
+                    not path.is_file()
+                    or path.is_symlink()
+                    or path.name.endswith(_SIDECAR_SUFFIXES)
+                    or "/manifests/" not in path.as_posix()
+                ):
+                    continue
+                rel = path.relative_to(ns_dir).as_posix()
+                repo_part, _, tag_part = rel.partition("/manifests/")
+                prov = provenance_map.get(f"{ns}/{rel}") or provenance_map.get(rel) or {}
+                cve_status = str(prov.get("cve_status", "UNKNOWN"))
+                max_cvss = float(prov.get("max_cvss", 0.0) or 0.0)
+                cve_ids = list(prov.get("cve_ids") or [])
+                components.append(
+                    {
+                        "ecosystem": "oci",
+                        "namespace": ns,
+                        "component": repo_part,
+                        "version": tag_part or "latest",
+                        "artifact": rel,
+                        "signature_valid": verify_artifact_signature(
+                            path, path.with_name(f"{path.name}.asc"), settings.gnupghome
+                        ),
+                        "pqc_signed": path.with_name(f"{path.name}.mldsa65").is_file(),
+                        "clamav_status": str(prov.get("clamav_status", "UNKNOWN")),
+                        "cve_status": cve_status,
+                        "max_cvss": max_cvss,
+                        "cve_ids": cve_ids,
+                        "vulnerability_status": _classify_vulnerability_status(
+                            cve_status, max_cvss, settings.cvss_fail_threshold
+                        ),
+                        "last_scanned_at": str(prov.get("timestamp", "")),
+                    }
+                )
+
+    # 2. Trusted Maven & PyPI caches
+    for eco, root_dir in (("maven", settings.trusted_maven_dir), ("pypi", settings.trusted_pypi_dir)):
+        if not root_dir.is_dir():
+            continue
+        for path in sorted(root_dir.rglob("*")):
+            if (
+                not path.is_file()
+                or path.is_symlink()
+                or path.name.endswith(_SIDECAR_SUFFIXES)
+            ):
+                continue
+            rel = path.relative_to(root_dir).as_posix()
+            pkg_name, pkg_version = extract_package_coordinates(eco, rel)
+            prov = provenance_map.get(rel) or {}
+            cve_status = str(prov.get("cve_status", "UNKNOWN"))
+            max_cvss = float(prov.get("max_cvss", 0.0) or 0.0)
+            cve_ids = list(prov.get("cve_ids") or [])
+            components.append(
+                {
+                    "ecosystem": eco,
+                    "component": pkg_name or rel,
+                    "version": pkg_version or "unknown",
+                    "artifact": rel,
+                    "signature_valid": verify_artifact_signature(
+                        path, path.with_name(f"{path.name}.asc"), settings.gnupghome
+                    ),
+                    "pqc_signed": path.with_name(f"{path.name}.mldsa65").is_file(),
+                    "clamav_status": str(prov.get("clamav_status", "UNKNOWN")),
+                    "cve_status": cve_status,
+                    "max_cvss": max_cvss,
+                    "cve_ids": cve_ids,
+                    "vulnerability_status": _classify_vulnerability_status(
+                        cve_status, max_cvss, settings.cvss_fail_threshold
+                    ),
+                    "last_scanned_at": str(prov.get("timestamp", "")),
+                }
+            )
+
+    summary = {
+        "total": len(components),
+        "clean": sum(1 for c in components if c["vulnerability_status"] == "CLEAN"),
+        "vulnerable": sum(1 for c in components if c["vulnerability_status"] == "VULNERABLE"),
+        "unscanned": sum(1 for c in components if c["vulnerability_status"] == "UNSCANNED"),
+    }
+    return {
+        "cvss_fail_threshold": settings.cvss_fail_threshold,
+        "summary": summary,
+        "components": components,
     }
 
 

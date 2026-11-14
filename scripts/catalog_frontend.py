@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Frontend HTTP catalog inventory (queries Gatekeeper/Gateway HTTP endpoints only)."""
+"""Frontend HTTP catalog and per-version vulnerability inventory."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ def _build_ssl_context(ca_bundle: str = "", insecure: bool = False) -> ssl.SSLCo
 
 def _get_json(
     url: str,
-    timeout: float = 10.0,
+    timeout: float = 15.0,
     ssl_ctx: ssl.SSLContext | None = None,
     token: str = "",
 ) -> dict[str, Any]:
@@ -53,18 +53,128 @@ def _head_or_get_ok(
         return False, str(exc)
 
 
+def _fallback_vulnerabilities_from_status(
+    status: dict[str, Any],
+    provenance: dict[str, Any],
+    threshold: float,
+) -> dict[str, Any]:
+    """Synthesize per-version vulnerability rows when /catalog/vulnerabilities is unavailable."""
+    prov_map: dict[str, dict[str, Any]] = {}
+    for rec in provenance.get("records", []):
+        art = str(rec.get("artifact", ""))
+        if art:
+            prov_map[art] = rec
+
+    components: list[dict[str, Any]] = []
+    for item in status.get("chainguard_containers", []):
+        if not item.get("cached"):
+            continue
+        image = str(item.get("image", ""))
+        repo, _, tag = image.partition(":")
+        rel = f"{repo}/manifests/{tag or 'latest'}"
+        prov = prov_map.get(f"chainguard-cache/{rel}") or prov_map.get(rel) or {}
+        components.append(
+            {
+                "ecosystem": "oci",
+                "component": repo,
+                "version": tag or "latest",
+                "artifact": rel,
+                "signature_valid": bool(item.get("signature_valid")),
+                "pqc_signed": bool(prov.get("signature_file_mldsa")),
+                "clamav_status": str(prov.get("clamav_status", "UNKNOWN")),
+                "cve_status": str(prov.get("cve_status", "UNKNOWN")),
+                "max_cvss": float(prov.get("max_cvss", 0.0) or 0.0),
+                "cve_ids": list(prov.get("cve_ids") or []),
+                "vulnerability_status": "UNSCANNED" if prov.get("cve_status", "NONE") in ("NONE", "UNKNOWN", "") else "CLEAN",
+                "last_scanned_at": str(prov.get("timestamp", "")),
+            }
+        )
+
+    for item in status.get("spring_boot_components", []):
+        if not item.get("cached"):
+            continue
+        rel = str(item.get("artifact", ""))
+        coord = str(item.get("coordinate", ""))
+        parts = coord.split(":")
+        comp_name = f"{parts[0]}:{parts[1]}" if len(parts) >= 2 else rel
+        ver = parts[2] if len(parts) >= 3 else "unknown"
+        prov = prov_map.get(rel) or {}
+        components.append(
+            {
+                "ecosystem": "maven",
+                "component": comp_name,
+                "version": ver,
+                "artifact": rel,
+                "signature_valid": bool(item.get("signature_valid")),
+                "pqc_signed": bool(prov.get("signature_file_mldsa")),
+                "clamav_status": str(prov.get("clamav_status", "UNKNOWN")),
+                "cve_status": str(prov.get("cve_status", "UNKNOWN")),
+                "max_cvss": float(prov.get("max_cvss", 0.0) or 0.0),
+                "cve_ids": list(prov.get("cve_ids") or []),
+                "vulnerability_status": "UNSCANNED" if prov.get("cve_status", "NONE") in ("NONE", "UNKNOWN", "") else "CLEAN",
+                "last_scanned_at": str(prov.get("timestamp", "")),
+            }
+        )
+
+    for item in status.get("pypi_components", []):
+        if not item.get("cached"):
+            continue
+        pkg = str(item.get("package", ""))
+        for fname in item.get("files", []):
+            rel = f"{pkg}/{fname}"
+            prov = prov_map.get(rel) or {}
+            components.append(
+                {
+                    "ecosystem": "pypi",
+                    "component": pkg,
+                    "version": fname,
+                    "artifact": rel,
+                    "signature_valid": bool(item.get("signature_valid")),
+                    "pqc_signed": bool(prov.get("signature_file_mldsa")),
+                    "clamav_status": str(prov.get("clamav_status", "UNKNOWN")),
+                    "cve_status": str(prov.get("cve_status", "UNKNOWN")),
+                    "max_cvss": float(prov.get("max_cvss", 0.0) or 0.0),
+                    "cve_ids": list(prov.get("cve_ids") or []),
+                    "vulnerability_status": "UNSCANNED" if prov.get("cve_status", "NONE") in ("NONE", "UNKNOWN", "") else "CLEAN",
+                    "last_scanned_at": str(prov.get("timestamp", "")),
+                }
+            )
+
+    return {
+        "cvss_fail_threshold": threshold,
+        "summary": {
+            "total": len(components),
+            "clean": sum(1 for c in components if c["vulnerability_status"] == "CLEAN"),
+            "vulnerable": sum(1 for c in components if c["vulnerability_status"] == "VULNERABLE"),
+            "unscanned": sum(1 for c in components if c["vulnerability_status"] == "UNSCANNED"),
+        },
+        "components": components,
+    }
+
+
 def catalog_frontend(
     base_url: str,
     ca_bundle: str = "",
     insecure: bool = False,
     token: str = "",
+    ecosystem: str = "all",
 ) -> dict[str, Any]:
-    """Query frontend HTTP endpoints and return a structured catalog report."""
+    """Query frontend HTTP endpoints and return cached components + per-version CVE status."""
     base = base_url.rstrip("/")
     ssl_ctx = _build_ssl_context(ca_bundle=ca_bundle, insecure=insecure)
     health = _get_json(f"{base}/healthz", ssl_ctx=ssl_ctx, token=token)
     status = _get_json(f"{base}/catalog/status", ssl_ctx=ssl_ctx, token=token)
     provenance = _get_json(f"{base}/audit/provenance", ssl_ctx=ssl_ctx, token=token)
+
+    try:
+        vuln_data = _get_json(f"{base}/catalog/vulnerabilities", ssl_ctx=ssl_ctx, token=token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            vuln_data = _fallback_vulnerabilities_from_status(
+                status, provenance, float(health.get("cvss_fail_threshold", 7.0))
+            )
+        else:
+            raise
 
     gpg_ok, _ = _head_or_get_ok(f"{base}/keys/trusted-oss-pubkey.asc", ssl_ctx=ssl_ctx, token=token)
     mldsa_ok, _ = _head_or_get_ok(f"{base}/keys/trusted-oss-mldsa65.pub", ssl_ctx=ssl_ctx, token=token)
@@ -72,13 +182,9 @@ def catalog_frontend(
         f"{base}/keys/trusted-oss-mldsa65.fingerprint", ssl_ctx=ssl_ctx, token=token
     )
 
-    oci_items = status.get("chainguard_containers", [])
-    maven_items = status.get("spring_boot_components", [])
-    pypi_items = status.get("pypi_components", [])
-
-    cached_oci = [i for i in oci_items if i.get("cached")]
-    cached_maven = [i for i in maven_items if i.get("cached")]
-    cached_pypi = [i for i in pypi_items if i.get("cached")]
+    components = vuln_data.get("components", [])
+    if ecosystem != "all":
+        components = [c for c in components if c.get("ecosystem") == ecosystem]
 
     return {
         "frontend_url": base,
@@ -89,17 +195,19 @@ def catalog_frontend(
             "mldsa65_fingerprint": mldsa_fp_body.splitlines()[0] if mldsa_fp_ok and mldsa_fp_body else "",
         },
         "counts": {
-            "oci_cached": len(cached_oci),
-            "oci_catalog_total": len(oci_items),
-            "maven_cached": len(cached_maven),
-            "maven_catalog_total": len(maven_items),
-            "pypi_cached": len(cached_pypi),
-            "pypi_catalog_total": len(pypi_items),
+            "cached_total": len(components),
+            "oci_cached": sum(1 for c in components if c.get("ecosystem") == "oci"),
+            "maven_cached": sum(1 for c in components if c.get("ecosystem") == "maven"),
+            "pypi_cached": sum(1 for c in components if c.get("ecosystem") == "pypi"),
             "provenance_records": provenance.get("count", 0),
         },
-        "oci": oci_items,
-        "maven": maven_items,
-        "pypi": pypi_items,
+        "vulnerability_summary": {
+            "total": len(components),
+            "clean": sum(1 for c in components if c.get("vulnerability_status") == "CLEAN"),
+            "vulnerable": sum(1 for c in components if c.get("vulnerability_status") == "VULNERABLE"),
+            "unscanned": sum(1 for c in components if c.get("vulnerability_status") == "UNSCANNED"),
+        },
+        "components": components,
     }
 
 
@@ -107,6 +215,8 @@ def _print_report(report: dict[str, Any]) -> None:
     health = report["health"]
     keys = report["keys"]
     c = report["counts"]
+    vs = report["vulnerability_summary"]
+
     print(f"Frontend Gateway URL : {report['frontend_url']} (status={health.get('status', 'unknown')})")
     print(
         f"Signing Keys         : GPG={'ready' if keys['gpg_public_key'] else 'missing'}, "
@@ -115,30 +225,37 @@ def _print_report(report: dict[str, Any]) -> None:
     )
     print(f"Policy Threshold     : CVSS >= {health.get('cvss_fail_threshold', 'N/A')}")
     print(
-        f"Cached Components    : OCI={c['oci_cached']}/{c['oci_catalog_total']} | "
-        f"Maven={c['maven_cached']}/{c['maven_catalog_total']} | "
-        f"PyPI={c['pypi_cached']}/{c['pypi_catalog_total']} | "
-        f"Provenance={c['provenance_records']}"
+        f"Cached Components    : Total={c['cached_total']} (OCI={c['oci_cached']}, "
+        f"Maven={c['maven_cached']}, PyPI={c['pypi_cached']}) | Provenance={c['provenance_records']}"
+    )
+    print(
+        f"Vulnerability Status : CLEAN={vs['clean']} | VULNERABLE={vs['vulnerable']} | "
+        f"UNSCANNED={vs['unscanned']}"
     )
 
-    for section, label, key_field in (
-        ("oci", "OCI / Harbor Cache", "image"),
-        ("maven", "Trusted Maven", "artifact"),
-        ("pypi", "Trusted PyPI", "package"),
-    ):
-        items = report[section]
-        cached_only = [i for i in items if i.get("cached")]
-        print(f"\n[{label}] (cached={len(cached_only)} / catalog={len(items)})")
-        if not cached_only:
+    for eco, label in (("oci", "OCI / Harbor Cache"), ("maven", "Trusted Maven"), ("pypi", "Trusted PyPI")):
+        rows = [item for item in report["components"] if item.get("ecosystem") == eco]
+        print(f"\n[{label}] (cached={len(rows)})")
+        if not rows:
             print("  (empty)")
-        for item in cached_only:
-            sig = "GPG-VALID" if item.get("signature_valid") else "UNSIGNED/INVALID"
-            print(f"  - {item.get(key_field)} ({sig})")
+            continue
+        for item in rows:
+            sig = "GPG-VALID" if item.get("signature_valid") else "UNSIGNED"
+            pqc = "+PQC" if item.get("pqc_signed") else ""
+            vstat = item.get("vulnerability_status", "UNSCANNED")
+            cve_status = item.get("cve_status", "UNKNOWN")
+            cvss = float(item.get("max_cvss", 0.0) or 0.0)
+            cves = ",".join(item.get("cve_ids") or []) or "none"
+            print(
+                f"  - {item.get('component')}@{item.get('version')} "
+                f"[{sig}{pqc}] vuln={vstat} (scanner={cve_status}, max_cvss={cvss:.1f}, cves={cves}) "
+                f"clamav={item.get('clamav_status', 'UNKNOWN')}"
+            )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Catalog warmed-up components using only frontend Gatekeeper/Gateway HTTP endpoints."
+        description="Catalog all cached components and per-version vulnerability status via frontend HTTP endpoints."
     )
     parser.add_argument(
         "--url",
@@ -149,6 +266,12 @@ def main() -> int:
         "--token",
         default=os.getenv("GATEKEEPER_ADMIN_TOKEN", ""),
         help="Optional X-Gatekeeper-Token header",
+    )
+    parser.add_argument(
+        "--ecosystem",
+        choices=("all", "oci", "maven", "pypi"),
+        default="all",
+        help="Filter output to a specific ecosystem (default: all)",
     )
     parser.add_argument("--ca-bundle", default="", help="Path to custom CA certificate bundle")
     parser.add_argument("--insecure", action="store_true", help="Skip TLS certificate verification")
@@ -161,9 +284,10 @@ def main() -> int:
             ca_bundle=args.ca_bundle,
             insecure=args.insecure,
             token=args.token,
+            ecosystem=args.ecosystem,
         )
     except Exception as exc:
-        print(f"[ERROR] Could not reach frontend at {args.url}: {exc}", file=sys.stderr if hasattr(sys, "stderr") else None)
+        print(f"[ERROR] Could not reach frontend at {args.url}: {exc}")
         return 1
 
     if args.json:
@@ -174,6 +298,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    import sys
-
     raise SystemExit(main())

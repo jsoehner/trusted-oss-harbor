@@ -256,6 +256,15 @@ def test_virtual_repo_pypi_maven_and_dynamic_warmup_e2e(tmp_path: Path) -> None:
             assert len(st["pypi_components"]) == 1
             assert st["pypi_components"][0]["cached"] is True
             assert st["pypi_components"][0]["signature_valid"] is True
+
+            vuln_resp = client.get("/catalog/vulnerabilities")
+            assert vuln_resp.status_code == 200
+            vbody = vuln_resp.json()
+            assert vbody["summary"]["total"] >= 4
+            assert vbody["summary"]["vulnerable"] == 0
+            ecos = {item["ecosystem"] for item in vbody["components"]}
+            assert {"oci", "maven", "pypi"} <= ecos
+            assert all(item["signature_valid"] for item in vbody["components"])
     finally:
         http_srv.shutdown()
         http_srv.server_close()

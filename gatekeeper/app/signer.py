@@ -265,6 +265,8 @@ def append_provenance_record(
     sha384: str = "",
     signature_file_mldsa: str = "",
     hmac_key: bytes | None = None,
+    max_cvss: float = 0.0,
+    cve_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Append an immutable provenance record to provenance.jsonl."""
     provenance_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -278,6 +280,8 @@ def append_provenance_record(
         "sha512": sha512,
         "clamav_status": clamav_status,
         "cve_status": cve_status,
+        "max_cvss": max_cvss,
+        "cve_ids": list(cve_ids or []),
         "signature_file": signature_file,
         "signature_file_mldsa": signature_file_mldsa,
         "pqc_status": "POST-QUANTUM READY" if signature_file_mldsa else "CLASSICAL",

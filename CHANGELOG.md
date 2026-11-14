@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-14
+
+### Added
+- **Virtual Repository Pull-Through**: Added `/maven/virtual/{path}`, `/pypi/virtual/simple/{pkg}/`, `/pypi/virtual/packages/{pkg}/{file}`, and `/v2/virtual/{repo}/manifests/{ref}` with per-artifact `asyncio.Lock` single-flight deduplication and automatic Quarantine -> ClamAV -> OSV/Trivy CVE Gate -> Dual Sign -> Promote on cache miss.
+- **Dynamic Project Discovery & Warmup**: Added `gatekeeper/app/discovery.py`, `POST /catalog/discover`, `POST /catalog/warm` (`discover=true`), and `scripts/dynamic_warmup.py` to scan local workspaces and GitHub repositories for Maven, Gradle, Python, and Docker/OCI dependencies and persist `dynamic-catalog.json`.
+- **Per-Version Vulnerability & Cache Inventory**: Added `GET /catalog/vulnerabilities`, `scripts/catalog_frontend.py`, and `scripts/catalog_storage.py` to report all cached OCI, Maven, and PyPI components, GPG/ML-DSA-65 signature status, ClamAV status, and per-version CVE/CVSS findings (`CLEAN`, `VULNERABLE`, `UNSCANNED`).
+- **TrueNAS Container App Cache Telemetry**: Configured `gatekeeper` stdout logging (`[CACHE] HIT`, `PROMOTED`, `BLOCKED`, `WARMUP_SUMMARY`) so all caching and security gate activity appears in `docker logs` and TrueNAS SCALE's App Logs UI.
+- **Documentation & ADRs**: Added [ADR 0003](docs/adr/0003-chainguard-wolfi-virtual-repo-and-observability.md) and updated `README.md` with Mermaid architecture/pull-through diagrams.
+
+### Changed
+- **Chainguard Wolfi & Python 3.13 Multi-Stage Images**: Migrated `Dockerfile` and `gatekeeper/Dockerfile` to `cgr.dev/chainguard/wolfi-base:latest` with Python 3.13, `clamav-1.5`, `nginx-stable`, `gpg`, and `supervisor`, reducing the NAS appliance image from 467 MB to 317 MB (~32% smaller).
+- **Version Bump**: Upgraded `VERSION` and `gatekeeper` FastAPI application version to `0.3.0`.
+- **ClamAV & Entrypoint Fixes**: Replaced deprecated `ArchiveBlockEncrypted` with `AlertEncrypted yes` in `config/clamav/clamd.conf` and initialized `${OSS_DATA_ROOT}/catalog` permissions in `scripts/nas_entrypoint.sh`.
+
 ### Security
 - **Fail-Closed Admin Authentication**: Removed default `ChangeMe_GatekeeperToken_2026!` fallback from `Settings` and `docker-compose.yml`; admin endpoints now return HTTP `503` if `GATEKEEPER_ADMIN_TOKEN` is unset or a known placeholder, and `scripts/bootstrap_host.sh` requires `.env` before rendering `harbor.yml`.
 - **Trivy Vulnerability Gate & Simulation Guard**: Added `trivy fs` vulnerability scanning in `gatekeeper/app/scanner.py` (`TRIVY_REQUIRED` support) and gated `X-Simulated-Cvss` behind `ALLOW_SIMULATED_CVSS=false` by default.
