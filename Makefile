@@ -1,4 +1,4 @@
-.PHONY: help init-storage generate-keys sync-nvd bootstrap-harbor up down logs test verify-e2e iscsi-roadmap-dryrun build-appliance run-appliance push-appliance
+.PHONY: help init-storage generate-keys sync-nvd bootstrap-harbor up down logs test verify-e2e iscsi-roadmap-dryrun build-appliance run-appliance push-appliance discover-catalog warm-catalog catalog-storage catalog-frontend
 
 SHELL := /usr/bin/bash
 include .env.example
@@ -54,3 +54,15 @@ run-appliance: ## Run standalone all-in-one NAS appliance container locally on p
 push-appliance: ## Push standalone NAS appliance image to GitHub Container Registry
 	docker push ghcr.io/jsoehner/trusted-oss-gatekeeper:latest
 	docker push ghcr.io/jsoehner/trusted-oss-gatekeeper:$$(cat VERSION)
+
+discover-catalog: ## Discover Maven, PyPI, and OCI components from recent local projects
+	python3 scripts/dynamic_warmup.py --roots $${WORKSPACE_SCAN_ROOTS:-$$HOME} --update-seed
+
+warm-catalog: ## Dynamically discover recent project components and warm Gatekeeper caches
+	python3 scripts/dynamic_warmup.py --roots $${WORKSPACE_SCAN_ROOTS:-$$HOME} --warm
+
+catalog-storage: ## Catalog existing warmed-up components directly from backend OSS_DATA_ROOT storage
+	python3 scripts/catalog_storage.py --data-root $${OSS_DATA_ROOT:-/home/jsoehner/trusted-oss-data}
+
+catalog-frontend: ## Catalog warmed-up components via frontend HTTP endpoints only
+	python3 scripts/catalog_frontend.py --url $${GATEKEEPER_URL:-http://127.0.0.1:8080}

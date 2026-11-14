@@ -274,6 +274,7 @@ def test_settings(tmp_path: Path, mock_clamd_server: tuple[str, int]) -> Setting
         CLAMAV_PORT=clamd_port,
         CLAMAV_REQUIRED=True,
         CVSS_FAIL_THRESHOLD=7.0,
+        CVE_SCANNER_MODE="none",
         AUTO_PROMOTE_CLEAN_ARTIFACTS=False,
         GNUPGHOME=data_root / "keys" / "gnupg",
         GATEKEEPER_ADMIN_TOKEN="test-secret-token",
