@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-14
+
+### Added
+- **Decoupled Frontend, Engine Worker, and Message Bus (`oss-bus`)**:
+  - Added `gatekeeper/app/bus.py` (`ValkeyJobBus` via Redis/Valkey Streams + `InMemoryJobBus` fallback) and `gatekeeper/app/worker.py` (`python -m app.worker`) to separate HTTP serving (`oss-frontend`, `GATEKEEPER_ROLE=frontend`) from background scanning, warming, and remediation (`oss-engine`, `GATEKEEPER_ROLE=engine`).
+  - Added `oss-bus` (`valkey/valkey:8-alpine`), `oss-frontend`, and `oss-engine` services to `docker-compose.yml` with bounded worker concurrency (`ENGINE_MAX_CONCURRENCY=2`), and updated `config/nginx/oss-gateway.conf` and `config/nginx/appliance-gateway.conf` to route `/jobs`.
+  - Added `GET /jobs` and `GET /jobs/{job_id}` endpoints, plus `202 Accepted` async job enqueuing on `POST /catalog/remediate` and `POST /catalog/warm` when running in `frontend` role (or `wait=false`).
+- **Auto-Quarantine, `'latest'` Tagging & Caching History**:
+  - Added `gatekeeper/app/remediation.py`, `CVE_RESCAN_INTERVAL_SECONDS` (hourly background rescan), `maven-metadata.xml` resolution, quarantine tracking for newly vulnerable versions above `CVSS_FAIL_THRESHOLD`, and per-component caching history in `GET /catalog/vulnerabilities`.
+  - Updated `scripts/catalog_frontend.py` to support comma-separated `--ecosystem` and `--components` filters, ASCII table formatting, opt-in `--remediate`, and `--wait` job polling.
+- **Documentation & ADRs**:
+  - Bumped major semantic version to `1.0.0` (`VERSION`, FastAPI `app.version`, `README.md`, `CHANGELOG.md`).
+  - Recorded [ADR 0004](docs/adr/0004-frontend-engine-message-bus-architecture.md) with Mermaid architecture and sequence diagrams.
+
+### Changed
+- **Constrained Container Performance**: Eliminated 200+ synchronous `gpg --verify` subprocess forks in `GET /catalog/vulnerabilities` (`verify_signatures=false` default) and skipped redundant archive unpacking during OSV/Trivy CVE remediation rescans.
+
 ## [0.3.0] - 2026-11-14
 
 ### Added

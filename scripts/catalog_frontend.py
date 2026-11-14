@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -173,6 +174,7 @@ def catalog_frontend(
     ecosystem: str = "all",
     components_filter: str = "",
     remediate: bool = False,
+    wait: bool = False,
 ) -> dict[str, Any]:
     """Optionally remediate newly vulnerable cached versions, then return per-version inventory & history."""
     base = base_url.rstrip("/")
@@ -190,10 +192,23 @@ def catalog_frontend(
             rem_params["ecosystem"] = eco_param
         if comp_param:
             rem_params["components"] = comp_param
+        if wait:
+            rem_params["wait"] = "true"
         rem_qs = urllib.parse.urlencode(rem_params)
         rem_url = f"{base}/catalog/remediate" + (f"?{rem_qs}" if rem_qs else "")
         try:
             remediation_result = _post_json(rem_url, ssl_ctx=ssl_ctx, token=token)
+            if wait and remediation_result.get("job_id") and remediation_result.get("status") in ("queued", "running"):
+                job_id = str(remediation_result["job_id"])
+                for _ in range(150):
+                    time.sleep(2.0)
+                    job_state = _get_json(f"{base}/jobs/{job_id}", ssl_ctx=ssl_ctx, token=token)
+                    if job_state.get("status") == "completed" and isinstance(job_state.get("result"), dict):
+                        remediation_result = job_state["result"]
+                        break
+                    if job_state.get("status") == "failed":
+                        remediation_result = job_state
+                        break
         except urllib.error.HTTPError as exc:
             if exc.code not in (404, 403, 503):
                 raise
@@ -323,11 +338,17 @@ def _print_report(report: dict[str, Any]) -> None:
     )
 
     rem = report.get("remediation")
-    if rem and (rem.get("quarantined_count") or rem.get("upgraded_count")):
-        print(
-            f"Auto-Remediation     : quarantined={rem.get('quarantined_count', 0)}, "
-            f"upgraded_to_latest={rem.get('upgraded_count', 0)}"
-        )
+    if rem:
+        if rem.get("job_id") and rem.get("status") in ("queued", "running", "failed"):
+            print(
+                f"Auto-Remediation     : job_id={rem.get('job_id')} status={rem.get('status')} "
+                "(engine processing asynchronously via message bus)"
+            )
+        elif rem.get("quarantined_count") or rem.get("upgraded_count"):
+            print(
+                f"Auto-Remediation     : quarantined={rem.get('quarantined_count', 0)}, "
+                f"upgraded_to_latest={rem.get('upgraded_count', 0)}"
+            )
 
     print("\n[Active Cached Components]")
     if report["components"]:
@@ -447,6 +468,11 @@ def main() -> int:
         action="store_true",
         help="Trigger POST /catalog/remediate CVE rescan/auto-upgrade before listing (opt-in; hourly background rescan already runs on the server)",
     )
+    parser.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait for async engine remediation job to finish when --remediate is used",
+    )
     parser.add_argument("--ca-bundle", default="", help="Path to custom CA certificate bundle")
     parser.add_argument("--insecure", action="store_true", help="Skip TLS certificate verification")
     parser.add_argument("--json", action="store_true", help="Output JSON inventory")
@@ -461,6 +487,7 @@ def main() -> int:
             ecosystem=args.ecosystem,
             components_filter=args.components,
             remediate=args.remediate,
+            wait=args.wait,
         )
     except Exception as exc:
         print(f"[ERROR] Could not reach frontend at {args.url}: {exc}")

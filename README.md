@@ -8,41 +8,50 @@ Self-hosted, containerized **Trusted Open-Source Software (OSS) Supply Chain Pla
 
 ```mermaid
 flowchart LR
-    Client["Developer / CI Client"] -->|":8080 /maven/virtual, /pypi/virtual, /v2/virtual"| Gateway["Nginx Gateway (Wolfi)"]
-    Gateway --> API["Gatekeeper FastAPI (Python 3.13)"]
-    API -->|"Cache HIT"| Store["Trusted Store (.asc + .mldsa65)"]
-    API -->|"Cache MISS (asyncio.Lock)"| Upstream["Maven Central / PyPI / cgr.dev"]
+    Client["Developer / CI Client"] -->|":8080 /maven/virtual, /pypi/virtual, /v2/virtual, /jobs"| Gateway["Nginx Gateway (Wolfi)"]
+    Gateway --> Frontend["oss-frontend (FastAPI, GATEKEEPER_ROLE=frontend)"]
+    Frontend -->|"Cache HIT"| Store["Trusted Store (.asc + .mldsa65)"]
+    Frontend -->|"Enqueue remediate / warm (202 Accepted)"| Bus["oss-bus (Valkey Streams)"]
+    Bus -->|"XREADGROUP (bounded concurrency)"| Engine["oss-engine (python -m app.worker)"]
+    Engine -->|"Upstream Pull / Auto-Upgrade"| Upstream["Maven Central / PyPI / cgr.dev"]
     Upstream --> Quarantine["Quarantine Staging"]
     Quarantine --> ClamAV["ClamAV 1.5 (:3310)"]
     ClamAV --> CVE["OSV / Trivy Gate (CVSS >= 7.0)"]
     CVE -->|"Clean"| Signer["GPG RSA-3072 + ML-DSA-65"]
-    CVE -->|"Infected or High/Crit CVE"| Reject["HTTP 451 Blocked"]
+    CVE -->|"Infected or High/Crit CVE"| Reject["Quarantined / HTTP 451"]
     Signer --> Store
-    API -->|"stdout [CACHE] events"| Logs["TrueNAS App Logs / docker logs"]
+    Frontend & Engine -->|"stdout [CACHE] / [ENGINE] events"| Logs["TrueNAS App Logs / docker logs"]
     Store --> VulnAPI["GET /catalog/vulnerabilities"]
 ```
 
 ```mermaid
 sequenceDiagram
-    participant C as Client
-    participant G as Gatekeeper (:8080)
-    participant U as Upstream Registry
+    participant C as Client / catalog_frontend.py
+    participant FE as oss-frontend (:8080)
+    participant Bus as oss-bus (Valkey)
+    participant Eng as oss-engine (Worker)
     participant S as ClamAV + OSV/Trivy
     participant K as GPG + ML-DSA-65
-    C->>G: GET /pypi/virtual/packages/pkg/pkg-1.0.whl
+    C->>FE: GET /pypi/virtual/packages/pkg/pkg-1.0.whl
     alt Cache HIT
-        G-->>C: 200 OK (X-Cache-Status: HIT) + log [CACHE] HIT
+        FE-->>C: 200 OK (X-Cache-Status: HIT) + log [CACHE] HIT
     else Cache MISS (single-flight asyncio.Lock)
-        G->>U: Fetch artifact into quarantine
-        U-->>G: Artifact stream
-        G->>S: Scan archive + ClamAV + OSV/Trivy
+        FE->>S: Fetch & scan archive + ClamAV + OSV/Trivy
         alt CVSS >= 7.0 or Malware
-            G-->>C: 451 Unavailable For Legal Reasons + log [CACHE] BLOCKED
+            FE-->>C: 451 Unavailable For Legal Reasons + log [CACHE] BLOCKED
         else Clean
-            G->>K: Dual-sign (.asc + .mldsa65) & promote
-            G-->>C: 200 OK (X-Cache-Status: MISS) + log [CACHE] PROMOTED
+            FE->>K: Dual-sign (.asc + .mldsa65) & promote
+            FE-->>C: 200 OK (X-Cache-Status: MISS) + log [CACHE] PROMOTED
         end
     end
+    C->>FE: POST /catalog/remediate?ecosystem=pypi
+    FE->>Bus: XADD trusted_oss:jobs:stream
+    FE-->>C: 202 Accepted {job_id, status: "queued"}
+    Eng->>Bus: XREADGROUP (bounded ENGINE_MAX_CONCURRENCY)
+    Eng->>S: Rescan cached components & quarantine failing CVEs
+    Eng->>K: Fetch clean replacement & tag 'latest'
+    C->>FE: GET /jobs/{job_id} (--wait)
+    FE-->>C: 200 OK {status: "completed"}
 ```
 
 ## Architecture Highlights
@@ -53,11 +62,11 @@ sequenceDiagram
    - `packages/trusted-maven/` & `packages/trusted-pypi/`: Immutable, ClamAV-scanned, CVE-verified, and GPG-signed (`.asc`) package repositories (with `AUTO_PROMOTE_CLEAN_ARTIFACTS=true`).
    - `scanners/`: Persistent ClamAV virus definitions (`freshclam`), Trivy DB, and OWASP NVD H2 cache (`jsoehner/nvd-cache`).
    - `audit/provenance.jsonl`: Append-only cryptographic provenance log for every promoted component.
-2. **Defense-in-Depth Quarantine & Signing Pipeline (`oss-gatekeeper`)**:
-   - **Dynamic Pull-Through**: Automatically fetches requested dependencies on cache miss into `quarantine/`.
-   - **Antivirus & Archive Inspection**: Streams artifacts over TCP `INSTREAM` to `clamd` (`clamav/clamav:1.4`) and inspects `.jar`/`.whl`/`.tar.gz` archives for Zip-Slip path traversal and symlinks.
-   - **Vulnerability Gate & Auto-Approval**: Automatically promotes clean artifacts (`CVSS < 7.0`, `AUTO_PROMOTE_CLEAN_ARTIFACTS=true`) and blocks vulnerable or infected packages.
-   - **Cryptographic Signing & Read-Time Verification**: Signs every promoted artifact with your **Trusted OSS GPG Key** (`.asc`) and verifies the detached signature before serving any file to a client.
+2. **Decoupled Frontend, Engine Worker & Valkey Message Bus (`oss-frontend`, `oss-engine`, `oss-bus`)**:
+   - **Frontend (`oss-frontend`, `GATEKEEPER_ROLE=frontend`)**: Serves HTTP requests, artifact reads, `maven-metadata.xml`, PEP 503 indices, `/catalog/vulnerabilities`, and `/jobs/{job_id}` without blocking on heavy scans.
+   - **Message Bus (`oss-bus`, `valkey/valkey:8-alpine`)**: Queues `remediate` and `warm` jobs via Redis/Valkey Streams (`BUS_URL=redis://oss-bus:6379/0`), with an automatic `InMemoryJobBus` fallback for single-container NAS appliance deployments (`GATEKEEPER_ROLE=all`).
+   - **Engine Worker (`oss-engine`, `python -m app.worker`)**: Executes ClamAV/Trivy/OSV scans, hourly CVE rescans, auto-quarantine, `'latest'` tagging, and GPG/ML-DSA-65 signing with bounded concurrency (`ENGINE_MAX_CONCURRENCY=2`).
+   - **Cryptographic Signing & Read-Time Verification**: Signs every promoted artifact with your **Trusted OSS GPG Key** (`.asc`) and **NIST FIPS 204 ML-DSA-65** (`.mldsa65`).
 3. **pfSense Edge Security (`config/pfsense/`)**:
    - Terminates TLS + Client Certificate Authentication (**mTLS**) at **pfSense HAProxy** and restricts WAN ingress to GitHub Actions IP ranges (`config/pfsense/update-github-cidrs.sh`).
 4. **TrueNAS iSCSI Block & Object Storage Roadmap (`docs/roadmap/truenas-iscsi-storage-roadmap.md`)**:
@@ -140,7 +149,8 @@ The appliance automatically:
 - Auto-downloads and updates ClamAV virus signatures with persistent caching in `/data/scanners/clamav`.
 - Serves the unified rate-limited gateway on port `8080`.
 
-- **Chainguard Wolfi Zero-CVE Base (`cgr.dev/chainguard/wolfi-base:latest`, Python 3.13)**: Multi-stage build strips `pip` and build tooling from the runtime image (317 MB vs. 467 MB Debian), bundling `clamav-1.5`, `nginx-stable`, `gpg`, `supervisor`, and `gatekeeper` (`0.3.0`).
+- **Chainguard Wolfi Zero-CVE Base (`cgr.dev/chainguard/wolfi-base:latest`, Python 3.13)**: Multi-stage build strips `pip` and build tooling from the runtime image (317 MB vs. 467 MB Debian), bundling `clamav-1.5`, `nginx-stable`, `gpg`, `supervisor`, and `gatekeeper` (`1.0.0`).
+- **Operations Manual & ADRs**: See [`docs/operations-manual.md`](docs/operations-manual.md) for live command screenshots, maintenance runbooks, and project integration guides, and [`docs/adr/0004-frontend-engine-message-bus-architecture.md`](docs/adr/0004-frontend-engine-message-bus-architecture.md) for the Frontend / Engine / Valkey Bus ADR.
 - **TrueNAS Container App Cache Logging**: `gatekeeper` emits structured `[CACHE]` telemetry (`HIT`, `PROMOTED`, `BLOCKED`, `WARMUP_SUMMARY`) to container `stdout` so all caching and security gate activity is visible directly in TrueNAS SCALE's App Logs UI (`docker logs -f trusted-oss-gatekeeper`).
 - **Virtual Repository Pull-Through**: Configure clients against `/maven/virtual/`, `/pypi/virtual/simple/`, or `/v2/virtual/` for automatic upstream fetch, ClamAV + OSV/Trivy CVE gating (`CVSS >= 7.0`), and dual GPG/ML-DSA-65 signing on cache miss.
 

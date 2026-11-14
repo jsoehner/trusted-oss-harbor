@@ -62,6 +62,9 @@ class Settings(BaseSettings):
     cve_rescan_interval_seconds: int = Field(
         default=3600, alias="CVE_RESCAN_INTERVAL_SECONDS"
     )
+    gatekeeper_role: str = Field(default="all", alias="GATEKEEPER_ROLE")
+    bus_url: str = Field(default="", alias="BUS_URL")
+    engine_max_concurrency: int = Field(default=2, alias="ENGINE_MAX_CONCURRENCY")
     trusted_sources: list[str] = Field(
         default=["cgr.dev", "docker.io", "ghcr.io", "quay.io"],
         alias="TRUSTED_SOURCES",

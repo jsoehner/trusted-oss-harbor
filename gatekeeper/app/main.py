@@ -15,6 +15,7 @@ from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, Uplo
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
+from app.bus import BaseJobBus, create_job_bus
 from app.config import Settings
 from app.discovery import (
     discover_github_projects,
@@ -136,33 +137,104 @@ def get_settings_from_app(app: FastAPI) -> Settings:
     return settings
 
 
+def get_job_bus(app_instance: FastAPI, settings: Settings) -> BaseJobBus:
+    """Lazily create and attach the message bus instance to app.state."""
+    bus = getattr(app_instance.state, "job_bus", None)
+    if bus is None:
+        bus = create_job_bus(settings.bus_url)
+        app_instance.state.job_bus = bus
+    return bus
+
+
+async def handle_engine_job(
+    job: dict[str, Any],
+    settings: Settings,
+    app_instance: FastAPI,
+) -> dict[str, Any]:
+    """Execute a queued engine job (remediate or warm) with bounded worker concurrency."""
+    job_type = str(job.get("job_type", ""))
+    payload = job.get("payload") or {}
+    if job_type == "remediate":
+        return await remediate_vulnerable_components(
+            settings=settings,
+            app_instance=app_instance,
+            ecosystems=_parse_ecosystem_filter(payload.get("ecosystem")),
+            comp_filters=_parse_component_filter(payload.get("components")),
+            concurrency=payload.get("concurrency"),
+        )
+    if job_type == "warm":
+        params = WarmRequest(**payload)
+        if params.discover:
+            catalog = await _build_dynamic_catalog(
+                settings=settings,
+                scan_roots=params.scan_roots,
+                include_github=params.include_github,
+                github_username=params.github_username,
+                max_projects=params.max_projects,
+            )
+            _save_dynamic_catalog(settings, catalog)
+        else:
+            cat_path = _active_catalog_path(settings)
+            if not cat_path.exists():
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Seed catalog file not found: {cat_path}",
+                )
+            catalog = json.loads(cat_path.read_text(encoding="utf-8"))
+        ecosystems = {e.lower() for e in params.ecosystems} if params.ecosystems else None
+        return await _execute_catalog_warmup(
+            catalog=catalog,
+            settings=settings,
+            app_instance=app_instance,
+            ecosystems=ecosystems,
+            concurrency=params.concurrency or settings.warmup_concurrency,
+        )
+    raise ValueError(f"Unsupported engine job_type: {job_type}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize storage directories and GPG/PQC signing authorities on startup."""
+    """Initialize storage directories, signing authorities, and message bus/worker."""
     settings = get_settings_from_app(app)
     initialize_storage_and_keys(settings)
+    bus = get_job_bus(app, settings)
+    stop_event = asyncio.Event()
     rescan_task: asyncio.Task[Any] | None = None
-    if settings.cve_rescan_interval_seconds > 0:
-        rescan_task = asyncio.create_task(_hourly_cve_rescan_loop(app))
+    worker_task: asyncio.Task[Any] | None = None
+    if settings.gatekeeper_role != "frontend":
+        if settings.cve_rescan_interval_seconds > 0:
+            rescan_task = asyncio.create_task(_hourly_cve_rescan_loop(app))
+        worker_task = asyncio.create_task(
+            bus.run_worker(
+                lambda job: handle_engine_job(job, settings, app),
+                consumer_name=f"engine-{settings.gatekeeper_role}",
+                max_concurrency=settings.engine_max_concurrency,
+                stop_event=stop_event,
+            )
+        )
     try:
         yield
     finally:
-        if rescan_task is not None:
-            rescan_task.cancel()
-            try:
-                await rescan_task
-            except asyncio.CancelledError:
-                pass
+        stop_event.set()
+        for task in (rescan_task, worker_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        await bus.close()
+        app.state.job_bus = None
 
 
 app = FastAPI(
     title="Trusted OSS Supply Chain Gatekeeper",
     description=(
-        "Dynamic pull-through quarantine, Harbor Chainguard OCI proxy cache, "
-        "ClamAV antivirus inspection, Trivy/NVD vulnerability gating, GPG/Cosign signing, "
-        "and NIST FIPS 204 ML-DSA-65 Post-Quantum Cryptography dual-signing."
+        "Decoupled Frontend/Engine OSS supply chain gateway with Valkey/Redis Streams bus, "
+        "Harbor Chainguard OCI proxy cache, ClamAV antivirus inspection, Trivy/NVD vulnerability gating, "
+        "GPG/Cosign signing, and NIST FIPS 204 ML-DSA-65 Post-Quantum Cryptography dual-signing."
     ),
-    version="0.3.0",
+    version="1.0.0",
     lifespan=lifespan,
 )
 
@@ -563,12 +635,17 @@ async def ensure_oci_manifest_cached(
 
 @app.api_route("/healthz", methods=["GET", "HEAD"])
 async def healthz(
+    request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, Any]:
     """Liveness and readiness probe."""
     pubkey = settings.public_keys_dir / "trusted-oss-pubkey.asc"
+    bus = get_job_bus(request.app, settings)
     return {
         "status": "ok",
+        "version": request.app.version,
+        "role": settings.gatekeeper_role,
+        "bus_backend": bus.backend_name,
         "signing_authority_ready": pubkey.exists(),
         "cvss_fail_threshold": settings.cvss_fail_threshold,
     }
@@ -959,12 +1036,19 @@ async def warm_seed_catalog(
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
     body: Annotated[WarmRequest | None, Body()] = None,
+    wait: bool | None = None,
     x_gatekeeper_token: Annotated[str | None, Header()] = None,
-) -> dict[str, Any]:
-    """Warm the Harbor Chainguard, Maven, and PyPI component caches (with optional dynamic discovery)."""
+) -> Any:
+    """Warm the Harbor Chainguard, Maven, and PyPI component caches (async via message bus in frontend role)."""
     require_admin_token(x_gatekeeper_token, settings)
 
     params = body or WarmRequest()
+    should_enqueue = wait is False or (wait is None and settings.gatekeeper_role == "frontend")
+    if should_enqueue:
+        bus = get_job_bus(request.app, settings)
+        job = await bus.enqueue("warm", params.model_dump())
+        return JSONResponse(status_code=202, content=job)
+
     if params.discover:
         catalog = await _build_dynamic_catalog(
             settings=settings,
@@ -1652,10 +1736,24 @@ async def remediate_catalog_endpoint(
     ecosystem: str | None = None,
     components: str | None = None,
     concurrency: int | None = None,
+    wait: bool | None = None,
     x_gatekeeper_token: Annotated[str | None, Header()] = None,
-) -> dict[str, Any]:
-    """Rescan cached components (optionally comma-separated ecosystems/components) and upgrade vulnerable versions to clean 'latest'."""
+) -> Any:
+    """Rescan cached components and upgrade vulnerable versions to clean 'latest' (async via bus in frontend role)."""
     require_admin_token(x_gatekeeper_token, settings)
+    should_enqueue = wait is False or (wait is None and settings.gatekeeper_role == "frontend")
+    if should_enqueue:
+        bus = get_job_bus(request.app, settings)
+        job = await bus.enqueue(
+            "remediate",
+            {
+                "ecosystem": ecosystem,
+                "components": components,
+                "concurrency": concurrency,
+            },
+        )
+        return JSONResponse(status_code=202, content=job)
+
     ecosystems = _parse_ecosystem_filter(ecosystem)
     comp_filters = _parse_component_filter(components)
     return await remediate_vulnerable_components(
@@ -1665,6 +1763,36 @@ async def remediate_catalog_endpoint(
         comp_filters=comp_filters,
         concurrency=concurrency,
     )
+
+
+@app.get("/jobs")
+async def list_engine_jobs(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    limit: int = 50,
+    x_gatekeeper_token: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """List recent background engine jobs from the message bus."""
+    require_admin_token(x_gatekeeper_token, settings)
+    bus = get_job_bus(request.app, settings)
+    jobs = await bus.list_jobs(limit=max(1, min(limit, 200)))
+    return {"count": len(jobs), "bus_backend": bus.backend_name, "jobs": jobs}
+
+
+@app.get("/jobs/{job_id}")
+async def get_engine_job(
+    job_id: str,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    x_gatekeeper_token: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """Fetch status and result for a specific background engine job."""
+    require_admin_token(x_gatekeeper_token, settings)
+    bus = get_job_bus(request.app, settings)
+    job = await bus.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+    return job
 
 
 @app.api_route("/keys/trusted-oss-pubkey.asc", methods=["GET", "HEAD"], response_class=PlainTextResponse)

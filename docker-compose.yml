@@ -35,15 +35,33 @@ services:
     networks:
       - oss-trust-net
 
-  oss-gatekeeper:
+  oss-bus:
+    image: valkey/valkey:8-alpine
+    container_name: oss-bus
+    restart: unless-stopped
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - oss-trust-net
+
+  oss-frontend:
     build:
       context: ./gatekeeper
       dockerfile: Dockerfile
-    container_name: oss-gatekeeper
+    container_name: oss-frontend
     restart: unless-stopped
     depends_on:
-      - clamav
+      oss-bus:
+        condition: service_healthy
     environment:
+      GATEKEEPER_ROLE: frontend
+      BUS_URL: redis://oss-bus:6379/0
       OSS_DATA_ROOT: /data/trusted-oss
       CLAMAV_HOST: clamav
       CLAMAV_PORT: "3310"
@@ -66,6 +84,42 @@ services:
       timeout: 5s
       retries: 3
     networks:
+      oss-trust-net:
+        aliases:
+          - oss-gatekeeper
+
+  oss-engine:
+    build:
+      context: ./gatekeeper
+      dockerfile: Dockerfile
+    container_name: oss-engine
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      oss-bus:
+        condition: service_healthy
+      clamav:
+        condition: service_started
+    environment:
+      GATEKEEPER_ROLE: engine
+      BUS_URL: redis://oss-bus:6379/0
+      ENGINE_MAX_CONCURRENCY: ${ENGINE_MAX_CONCURRENCY:-2}
+      CVE_RESCAN_INTERVAL_SECONDS: ${CVE_RESCAN_INTERVAL_SECONDS:-3600}
+      OSS_DATA_ROOT: /data/trusted-oss
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: "3310"
+      CVSS_FAIL_THRESHOLD: ${CVSS_FAIL_THRESHOLD:-7.0}
+      AUTO_PROMOTE_CLEAN_ARTIFACTS: ${AUTO_PROMOTE_CLEAN_ARTIFACTS:-true}
+      UPSTREAM_MAVEN_URL: ${UPSTREAM_MAVEN_URL:-https://repo.maven.apache.org/maven2}
+      UPSTREAM_PYPI_SIMPLE_URL: ${UPSTREAM_PYPI_SIMPLE_URL:-https://pypi.org/simple}
+      GNUPGHOME: /data/trusted-oss/keys/gnupg
+      COSIGN_PRIVATE_KEY_PATH: /data/trusted-oss/keys/cosign/cosign.key
+      COSIGN_PUBLIC_KEY_PATH: /data/trusted-oss/keys/cosign/cosign.pub
+      COSIGN_PASSWORD: ${COSIGN_PASSWORD:-}
+      GATEKEEPER_ADMIN_TOKEN: ${GATEKEEPER_ADMIN_TOKEN:?GATEKEEPER_ADMIN_TOKEN must be set}
+    volumes:
+      - ${OSS_DATA_ROOT:-/home/jsoehner/trusted-oss-data}:/data/trusted-oss
+    networks:
       - oss-trust-net
 
   oss-gateway:
@@ -73,7 +127,7 @@ services:
     container_name: oss-gateway
     restart: unless-stopped
     depends_on:
-      - oss-gatekeeper
+      - oss-frontend
     ports:
       - "8443:8443"
       - "8080:8080"

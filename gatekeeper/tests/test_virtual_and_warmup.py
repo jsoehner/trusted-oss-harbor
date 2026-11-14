@@ -401,3 +401,48 @@ def test_remediation_quarantines_vulnerable_version_and_tags_latest(tmp_path: Pa
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_job_bus_async_remediation_and_frontend_role(tmp_path, monkeypatch):
+    """Verify frontend role enqueues remediation jobs onto the bus (202) and GET /jobs reports status."""
+    settings = Settings(
+        oss_data_root=tmp_path,
+        gatekeeper_admin_token="test-admin-token",
+        clamav_required=False,
+        pqc_signing_enabled=False,
+        cve_scanner_mode="osv",
+        cve_rescan_interval_seconds=0,
+        gatekeeper_role="frontend",
+    )
+    app.state.settings = settings
+    if hasattr(app.state, "job_bus"):
+        delattr(app.state, "job_bus")
+
+    with TestClient(app) as client:
+        hz = client.get("/healthz")
+        assert hz.status_code == 200
+        hz_body = hz.json()
+        assert hz_body["version"] == "1.0.0"
+        assert hz_body["role"] == "frontend"
+        assert hz_body["bus_backend"] == "memory"
+
+        rem = client.post(
+            "/catalog/remediate?ecosystem=pypi&components=requests",
+            headers={"X-Gatekeeper-Token": "test-admin-token"},
+        )
+        assert rem.status_code == 202
+        job = rem.json()
+        assert job["status"] == "queued"
+        assert job["job_type"] == "remediate"
+        assert job["payload"]["ecosystem"] == "pypi"
+        assert job["payload"]["components"] == "requests"
+        job_id = job["job_id"]
+
+        job_get = client.get(f"/jobs/{job_id}", headers={"X-Gatekeeper-Token": "test-admin-token"})
+        assert job_get.status_code == 200
+        assert job_get.json()["job_id"] == job_id
+
+        jobs_list = client.get("/jobs", headers={"X-Gatekeeper-Token": "test-admin-token"})
+        assert jobs_list.status_code == 200
+        assert jobs_list.json()["count"] >= 1
+        assert jobs_list.json()["bus_backend"] == "memory"
