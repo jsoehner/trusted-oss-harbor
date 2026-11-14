@@ -238,11 +238,13 @@ def test_virtual_repo_pypi_maven_and_dynamic_warmup_e2e(tmp_path: Path) -> None:
             disc_resp = client.post(
                 "/catalog/discover",
                 headers={"X-Gatekeeper-Token": "test-admin-token"},
-                json={"scan_roots": [str(workspace)], "warm": True},
+                json={"scan_roots": [str(workspace)], "save_to_catalog": True, "warm": True},
             )
             assert disc_resp.status_code == 200
             body = disc_resp.json()
             assert body["source_projects"] == ["sample-app"]
+            assert body["saved_catalog_path"].endswith("dynamic-catalog.json")
+            assert Path(body["saved_catalog_path"]).is_file()
             assert body["warmup"]["chainguard_containers_cached"] == 1
             assert body["warmup"]["spring_boot_artifacts_cached"] == 2
             assert body["warmup"]["pypi_artifacts_cached"] == 1

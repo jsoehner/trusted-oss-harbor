@@ -124,7 +124,9 @@ def main() -> int:
             },
             timeout=300.0,
         )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            print(f"[ERROR] {endpoint} returned {resp.status_code}: {resp.text[:1000]}")
+            return 1
         summary = resp.json().get("warmup") or {}
         print(
             f"[WARM] OCI={summary.get('chainguard_containers_cached', 0)} "

@@ -6,7 +6,7 @@
 #   3. Trusted OSS Gatekeeper (FastAPI on port 8000)
 #   4. Dual Cryptographic Signer (RSA-3072 GPG + NIST FIPS 204 ML-DSA-65 PQC)
 # ==============================================================================
-FROM python:3.12-slim-bookworm
+FROM python:3.13-slim-bookworm
 
 LABEL org.opencontainers.image.title="Trusted OSS Harbor NAS Appliance" \
       org.opencontainers.image.description="All-in-one Trusted OSS Supply Chain Gatekeeper, ClamAV Antivirus, and PQC Signer for NAS and homelabs" \

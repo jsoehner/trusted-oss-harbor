@@ -22,6 +22,7 @@ mkdir -p \
   "${OSS_DATA_ROOT}/keys/public" \
   "${OSS_DATA_ROOT}/keys/cosign" \
   "${OSS_DATA_ROOT}/audit" \
+  "${OSS_DATA_ROOT}/catalog" \
   /var/log/supervisor \
   /var/run/clamav \
   /var/log/clamav
@@ -30,7 +31,8 @@ mkdir -p \
 chown -R gatekeeper:gatekeeper \
   "${OSS_DATA_ROOT}/packages" \
   "${OSS_DATA_ROOT}/keys" \
-  "${OSS_DATA_ROOT}/audit" 2>/dev/null || true
+  "${OSS_DATA_ROOT}/audit" \
+  "${OSS_DATA_ROOT}/catalog" 2>/dev/null || true
 chmod 0700 \
   "${OSS_DATA_ROOT}/keys/gnupg" \
   "${OSS_DATA_ROOT}/keys/mldsa" \

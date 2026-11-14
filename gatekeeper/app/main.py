@@ -173,10 +173,29 @@ def require_admin_token(x_gatekeeper_token: str | None, settings: Settings) -> N
 
 def _active_catalog_path(settings: Settings) -> Path:
     """Return dynamic catalog path if it exists, otherwise the configured seed catalog."""
-    dynamic_path = settings.oss_data_root / "catalog" / "dynamic-catalog.json"
-    if dynamic_path.is_file():
-        return dynamic_path
+    for candidate in (
+        settings.oss_data_root / "catalog" / "dynamic-catalog.json",
+        settings.oss_data_root / "audit" / "dynamic-catalog.json",
+    ):
+        if candidate.is_file():
+            return candidate
     return settings.seed_catalog_path
+
+
+def _save_dynamic_catalog(settings: Settings, catalog: dict[str, Any]) -> str:
+    """Persist dynamic catalog to OSS_DATA_ROOT/catalog or fall back to OSS_DATA_ROOT/audit."""
+    payload = json.dumps(catalog, indent=2)
+    for candidate in (
+        settings.oss_data_root / "catalog" / "dynamic-catalog.json",
+        settings.oss_data_root / "audit" / "dynamic-catalog.json",
+    ):
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_text(payload, encoding="utf-8")
+            return str(candidate)
+        except OSError as exc:
+            logger.warning("Unable to persist dynamic catalog to %s: %s", candidate, exc)
+    return ""
 
 
 async def quarantine_scan_sign_and_promote(
@@ -815,10 +834,7 @@ async def discover_project_catalog(
 
     saved_path = ""
     if params.save_to_catalog:
-        dyn_path = settings.oss_data_root / "catalog" / "dynamic-catalog.json"
-        dyn_path.parent.mkdir(parents=True, exist_ok=True)
-        dyn_path.write_text(json.dumps(catalog, indent=2), encoding="utf-8")
-        saved_path = str(dyn_path)
+        saved_path = _save_dynamic_catalog(settings, catalog)
 
     warmup_summary: dict[str, Any] | None = None
     if params.warm:
@@ -865,6 +881,7 @@ async def warm_seed_catalog(
             github_username=params.github_username,
             max_projects=params.max_projects,
         )
+        _save_dynamic_catalog(settings, catalog)
     else:
         cat_path = _active_catalog_path(settings)
         if not cat_path.exists():
