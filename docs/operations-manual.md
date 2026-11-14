@@ -94,19 +94,27 @@ GATEKEEPER_ADMIN_TOKEN="<token>" \
   1. The vulnerable version and its sidecars are moved to `packages/quarantine/` with CVE metadata (`max_cvss`, `cve_ids`, `superseded_by`).
   2. The newest clean upstream version is fetched, scanned, dual-signed, and tagged as **`latest`** (`maven-metadata.xml` for Maven; `latest` resolution metadata for PyPI).
   3. `GET /catalog/vulnerabilities` and `catalog_frontend.py` display the active `'latest'` version, the `[Quarantined (Vulnerable)]` table, and the `[Component Caching History & Active 'latest' Resolution]` table.
-- **`N-2` Garbage Collection (`POST /catalog/gc`)**: Automatically prunes cached versions that are 2+ versions older than `latest` (retaining `GC_RETENTION_VERSIONS=2`, i.e., `N` and `N-1`), removing `N-2` and older artifacts and their sidecars (`.asc`, `.mldsa65`, `.sha256`, `.sha384`, `.sha512`). You can also view scheduled activity or trigger scans/GC directly from `scripts/catalog_frontend.py`:
+- **Scheduled Task Activity Log (`--activity` / `GET /audit/activity`)**:
+  `oss-engine` and the scheduler write structured events (`INITIAL_UNSCANNED_SCAN`, `HOURLY_CVE_RESCAN`, `HOURLY_GC`, `GC_REMOVED`, `QUARANTINED`, `LATEST_TAG_UPDATED`) to `audit/activity.jsonl`. Query them from the CLI without dumping the full component table:
   ```bash
-  # View scheduled task, rescan, quarantine, and GC activity log
+  # View the 50 most recent scheduled task and engine events
   GATEKEEPER_ADMIN_TOKEN="<token>" \
     python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --activity
 
-  # Force scanning of only UNSCANNED components
+  # Filter activity by event type and limit
+  GATEKEEPER_ADMIN_TOKEN="<token>" \
+    python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 \
+    --activity --activity-limit 20 --activity-event HOURLY_CVE_RESCAN,GC_REMOVED,QUARANTINED
+
+  # Force scanning of only UNSCANNED components, wait, and print activity
   GATEKEEPER_ADMIN_TOKEN="<token>" \
     python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --scan-unscanned --wait --activity
 
-  # Preview or force N-2+ version garbage collection
+  # Preview or force N-2+ version garbage collection (override retention with --gc-keep)
   GATEKEEPER_ADMIN_TOKEN="<token>" \
     python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --gc --gc-dry-run --wait
+  GATEKEEPER_ADMIN_TOKEN="<token>" \
+    python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --gc --gc-keep 2 --wait
   ```
 
 ### 2.5 Asynchronous Engine Jobs (`POST /catalog/remediate`, `GET /jobs`)

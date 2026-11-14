@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `gatekeeper/app/bus.py` (`ValkeyJobBus` via Redis/Valkey Streams + `InMemoryJobBus` fallback) and `gatekeeper/app/worker.py` (`python -m app.worker`) to separate HTTP serving (`oss-frontend`, `GATEKEEPER_ROLE=frontend`) from background scanning, warming, and remediation (`oss-engine`, `GATEKEEPER_ROLE=engine`).
   - Added `oss-bus` (`valkey/valkey:8-alpine`), `oss-frontend`, and `oss-engine` services to `docker-compose.yml` with bounded worker concurrency (`ENGINE_MAX_CONCURRENCY=2`), and updated `config/nginx/oss-gateway.conf` and `config/nginx/appliance-gateway.conf` to route `/jobs`.
   - Added `GET /jobs` and `GET /jobs/{job_id}` endpoints, plus `202 Accepted` async job enqueuing on `POST /catalog/remediate` and `POST /catalog/warm` when running in `frontend` role (or `wait=false`).
+- **Scheduled Unscanned Sweeps, `N-2` Garbage Collection & Activity Log**:
+  - Added `gatekeeper/app/activity.py` (`audit/activity.jsonl`) and `GET /audit/activity` to record and serve scheduled scan, quarantine, `'latest'` tag, and GC events.
+  - Added startup `only_unscanned=true` sweep and `GC_RETENTION_VERSIONS=2` (`N-2+` pruning via `gc_old_component_versions` and `POST /catalog/gc`) to `oss-engine` and `_hourly_cve_rescan_loop`.
+  - Updated `scripts/catalog_frontend.py` with `--activity`, `--activity-limit`, `--activity-event`, `--scan-unscanned`, `--gc`, `--gc-dry-run`, `--gc-keep`, and `--wait`.
 - **Auto-Quarantine, `'latest'` Tagging & Caching History**:
   - Added `gatekeeper/app/remediation.py`, `CVE_RESCAN_INTERVAL_SECONDS` (hourly background rescan), `maven-metadata.xml` resolution, quarantine tracking for newly vulnerable versions above `CVSS_FAIL_THRESHOLD`, and per-component caching history in `GET /catalog/vulnerabilities`.
   - Updated `scripts/catalog_frontend.py` to support comma-separated `--ecosystem` and `--components` filters, ASCII table formatting, opt-in `--remediate`, and `--wait` job polling.

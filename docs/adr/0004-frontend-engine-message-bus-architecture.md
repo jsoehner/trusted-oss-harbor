@@ -27,19 +27,20 @@ We split `oss-gatekeeper` into a three-tier decoupled architecture (`1.0.0`):
    - Implemented in `gatekeeper/app/bus.py` (`ValkeyJobBus`) using Redis/Valkey Streams (`XADD`, `XREADGROUP`, `XACK`) and TTL-bounded job state keys (`trusted_oss:job:<job_id>`).
    - Falls back to `InMemoryJobBus` (`asyncio.Queue`) when `BUS_URL` is empty (single-container appliance and tests).
 3. **Engine Worker (`oss-engine`, `python -m app.worker`, `GATEKEEPER_ROLE=engine`)**:
-   - Consumes `remediate` and `warm` jobs from `oss-bus` with bounded concurrency (`ENGINE_MAX_CONCURRENCY`, default `2`).
-   - Executes the hourly CVE rescan loop (`CVE_RESCAN_INTERVAL_SECONDS=3600`), OSV/Trivy vulnerability checks, ClamAV scans, GPG + ML-DSA-65 signing, quarantine moves, and `'latest'` tag updates on the shared `/data/trusted-oss` volume.
+   - Consumes `remediate`, `warm`, and `gc` jobs from `oss-bus` with bounded concurrency (`ENGINE_MAX_CONCURRENCY`, default `2`).
+   - Runs a startup `only_unscanned=true` sweep to clear `UNSCANNED` components, then runs the hourly CVE rescan (`CVE_RESCAN_INTERVAL_SECONDS=3600`) and `N-2` version garbage collection (`GC_RETENTION_VERSIONS=2`, `gc_old_component_versions`).
+   - Records structured events (`INITIAL_UNSCANNED_SCAN`, `HOURLY_CVE_RESCAN`, `HOURLY_GC`, `GC_REMOVED`, `QUARANTINED`, `LATEST_TAG_UPDATED`) to `audit/activity.jsonl`, which `oss-frontend` serves via `GET /audit/activity`.
 
 ```mermaid
 flowchart LR
     Client["Client / catalog_frontend.py"] --> Gateway["oss-gateway (Nginx)"]
     Gateway --> Frontend["oss-frontend (GATEKEEPER_ROLE=frontend)"]
     Frontend -- "XADD job (202 Accepted)" --> Bus["oss-bus (Valkey Streams)"]
-    Frontend -- "GET /jobs/{id}" --> Bus
+    Frontend -- "GET /jobs/{id}, GET /audit/activity" --> Bus
     Bus -- "XREADGROUP (bounded concurrency)" --> Engine["oss-engine (python -m app.worker)"]
     Engine --> ClamAV["oss-clamav"]
     Engine --> OSV["OSV / Trivy / Upstream"]
-    Engine --> Data[("/data/trusted-oss (shared volume)")]
+    Engine -- "Scan, Quarantine, N-2 GC, Activity JSONL" --> Data[("/data/trusted-oss (shared volume)")]
     Frontend --> Data
 ```
 
