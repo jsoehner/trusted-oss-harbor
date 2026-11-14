@@ -199,6 +199,41 @@ PYTHONPATH=gatekeeper uv run --python 3.11 --with-requirements gatekeeper/requir
 
 ![Offline Verification Suite](images/04-verification-ci-pytest.png)
 
+### 3.5 Daily Email & SMS Notifications (Outlook Port 587 / Graph 443 / SMS)
+
+When outbound port `25` is blocked and no local SMTP relay is available, `scripts/daily_digest.py` can send a daily summary of gateway health, vulnerability counts, and the last 24 hours of `/audit/activity` events using authenticated **Outlook / Microsoft 365 SMTP `STARTTLS` on port `587`**, **Microsoft Graph API over HTTPS port `443`**, **carrier Email-to-SMS** (via Outlook port 587), or **Twilio SMS over HTTPS port `443`**.
+
+Preview the digest locally without sending:
+
+```bash
+GATEKEEPER_ADMIN_TOKEN="<token>" \
+  python3 scripts/daily_digest.py --url http://oss.jsigroup.local:8080 --dry-run
+```
+
+Send via personal Outlook.com (`smtp-mail.outlook.com:587`) or Microsoft 365 (`smtp.office365.com:587`) using an app password, plus optional carrier Email-to-SMS (`@vtext.com`, `@txt.att.net`, `@tmomail.net`):
+
+```bash
+GATEKEEPER_ADMIN_TOKEN="<token>" \
+  SMTP_HOST="smtp-mail.outlook.com" \
+  SMTP_PORT=587 \
+  SMTP_USER="you@outlook.com" \
+  SMTP_PASSWORD="<app-password>" \
+  python3 scripts/daily_digest.py \
+    --url http://oss.jsigroup.local:8080 \
+    --to "ops@example.com" \
+    --sms-to "5551234567@vtext.com"
+```
+
+Alternative HTTPS port `443` transports (when even port `587` is restricted):
+- **Microsoft Graph**: pass `--graph-token "$GRAPH_ACCESS_TOKEN"` and `--to "ops@example.com"` (requires `Mail.Send` OAuth scope).
+- **Twilio SMS**: pass `--twilio-sid`, `--twilio-token`, `--twilio-from`, and `--twilio-to "+15551234567"`.
+
+Schedule a daily cron job (e.g., 07:30 every day) in `crontab -e`:
+
+```cron
+30 7 * * * cd /home/jsoehner/trusted-oss-harbor && GATEKEEPER_ADMIN_TOKEN="<token>" SMTP_USER="you@outlook.com" SMTP_PASSWORD="<app-password>" /usr/bin/python3 scripts/daily_digest.py --url http://oss.jsigroup.local:8080 --to "ops@example.com" >> /var/log/oss-harbor-digest.log 2>&1
+```
+
 ---
 
 ## 4. Integrating Existing Software Projects

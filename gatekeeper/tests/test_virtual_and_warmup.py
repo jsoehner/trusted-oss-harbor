@@ -533,3 +533,80 @@ def test_unscanned_component_scan_and_n_minus_2_garbage_collection(tmp_path, mon
         act_body = act_resp.json()
         assert act_body["count"] == 2
         assert {ev["version"] for ev in act_body["events"]} == {"1.0.0", "1.1.0"}
+
+
+def test_daily_digest_formatting_and_smtp_starttls():
+    """Verify daily digest formatting and Outlook port 587 STARTTLS dispatch."""
+    from datetime import datetime, timezone
+    from unittest.mock import MagicMock, patch
+
+    from app.notifications import build_daily_digest, send_smtp_starttls
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    health = {
+        "status": "ok",
+        "total_components": 765,
+        "quarantined_count": 32,
+        "provenance_count": 943,
+        "signing_keys": {"gpg_ready": True, "pqc_ready": True},
+    }
+    vuln_data = {
+        "summary": {
+            "total": 765,
+            "clean": 476,
+            "unscanned": 289,
+            "quarantined": 32,
+        },
+        "quarantined": [],
+    }
+    events = [
+        {
+            "timestamp": now_iso,
+            "source": "scheduler",
+            "event": "UNSCANNED_SCAN",
+            "ecosystem": "maven",
+            "component": "org.example/demo",
+            "version": "1.2.3",
+            "details": "status=CLEAN",
+        },
+        {
+            "timestamp": "2020-01-01T00:00:00+00:00",
+            "source": "scheduler",
+            "event": "OLD_EVENT",
+            "ecosystem": "pypi",
+            "component": "old",
+            "version": "0.0.1",
+            "details": "should be excluded",
+        },
+    ]
+
+    subject, body, sms = build_daily_digest(
+        health=health, vuln_data=vuln_data, activity_events=events, hours=24
+    )
+    assert "[Trusted-OSS] Daily Digest" in subject
+    assert "UNSCANNED_SCAN=1" in body
+    assert "OLD_EVENT" not in body
+    assert "UNSCANNED=289" in body
+    assert len(sms) <= 160
+    assert "UNSCANNED=289" in sms
+    assert "Events(24h)=1" in sms
+
+    mock_smtp_instance = MagicMock()
+    with patch("app.notifications.smtplib.SMTP") as mock_smtp_cls:
+        mock_smtp_cls.return_value.__enter__.return_value = mock_smtp_instance
+        send_smtp_starttls(
+            smtp_host="smtp-mail.outlook.com",
+            smtp_port=587,
+            username="harbor@outlook.com",
+            password="app-password",
+            sender="harbor@outlook.com",
+            recipients=["ops@example.com"],
+            subject=subject,
+            body=body,
+        )
+
+    mock_smtp_cls.assert_called_once_with("smtp-mail.outlook.com", 587, timeout=20.0)
+    mock_smtp_instance.ehlo.assert_called()
+    mock_smtp_instance.starttls.assert_called_once()
+    mock_smtp_instance.login.assert_called_once_with("harbor@outlook.com", "app-password")
+    mock_smtp_instance.send_message.assert_called_once()
