@@ -371,16 +371,16 @@ def test_remediation_quarantines_vulnerable_version_and_tags_latest(tmp_path: Pa
 
             monkeypatch.setattr("app.scanner.query_osv_vulnerabilities", fake_osv_after_cve)
 
-            # 3. Trigger remediation
-            rem = client.post("/catalog/remediate", headers={"X-Gatekeeper-Token": "test-admin-token"})
+            # 3. Trigger scoped remediation by ecosystem
+            rem = client.post("/catalog/remediate?ecosystem=pypi", headers={"X-Gatekeeper-Token": "test-admin-token"})
             assert rem.status_code == 200
             rem_body = rem.json()
             assert rem_body["quarantined_count"] == 1
             assert rem_body["upgraded_count"] == 1
             assert rem_body["upgraded"][0]["latest_version"] == "2.32.4"
 
-            # 4. Verify /catalog/vulnerabilities shows 2.32.4 as 'latest' and 2.32.3 as quarantined with CVEs
-            vulns = client.get("/catalog/vulnerabilities").json()
+            # 4. Verify /catalog/vulnerabilities shows 2.32.4 as 'latest', 2.32.3 as quarantined, and history
+            vulns = client.get("/catalog/vulnerabilities?ecosystem=pypi&components=requests").json()
             assert vulns["summary"]["quarantined"] == 1
             assert len(vulns["components"]) == 1
             assert vulns["components"][0]["version"] == "2.32.4"
@@ -393,6 +393,11 @@ def test_remediation_quarantines_vulnerable_version_and_tags_latest(tmp_path: Pa
             assert q_item["max_cvss"] == 8.5
             assert "CVE-2026-88888" in q_item["cve_ids"]
             assert q_item["superseded_by"] == "2.32.4"
+
+            hist = vulns["history"][0]
+            assert hist["serving_latest_version"] == "2.32.4"
+            states = {v["version"]: v["state"] for v in hist["versions"]}
+            assert states == {"2.32.4": "SERVING_LATEST", "2.32.3": "QUARANTINED"}
     finally:
         srv.shutdown()
         srv.server_close()

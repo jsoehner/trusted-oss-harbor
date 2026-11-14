@@ -1110,15 +1110,184 @@ def _load_latest_provenance_map(provenance_log_path: Path) -> dict[str, dict[str
     return latest
 
 
+def _parse_ecosystem_filter(ecosystem: str | None) -> set[str] | None:
+    """Parse a comma-separated ecosystem parameter ('oci,maven,pypi' or 'all')."""
+    if not ecosystem:
+        return None
+    tokens = [t.strip().lower() for t in ecosystem.split(",") if t.strip()]
+    if not tokens or "all" in tokens:
+        return None
+    invalid = [t for t in tokens if t not in {"oci", "maven", "pypi"}]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported ecosystem filter: {','.join(invalid)}",
+        )
+    return set(tokens)
+
+
+def _parse_component_filter(components: str | None) -> list[str]:
+    """Parse a comma-separated component name filter."""
+    if not components:
+        return []
+    return [c.strip().lower() for c in components.split(",") if c.strip()]
+
+
+def _matches_component_filter(component_name: str, filters: list[str]) -> bool:
+    if not filters:
+        return True
+    low = component_name.lower()
+    return any(f in low for f in filters)
+
+
+def _build_component_history(
+    components: list[dict[str, Any]],
+    quarantined: list[dict[str, Any]],
+    provenance_log_path: Path,
+    latest_tags: dict[str, dict[str, Any]],
+    eco_filters: set[str] | None = None,
+    comp_filters: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Build per-component caching history showing active 'latest', older cached, quarantined, and historical versions."""
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    c_filters = comp_filters or []
+
+    def _bucket(eco: str, comp: str) -> dict[str, Any]:
+        key = (eco, comp)
+        if key not in grouped:
+            tag_entry = latest_tags.get(f"{eco}:{comp}", {})
+            grouped[key] = {
+                "ecosystem": eco,
+                "component": comp,
+                "serving_latest_version": tag_entry.get("latest_version", ""),
+                "versions": [],
+            }
+        return grouped[key]
+
+    seen_keys: set[tuple[str, str, str, str]] = set()
+    for item in components:
+        eco = str(item.get("ecosystem", ""))
+        comp = str(item.get("component", ""))
+        if (eco_filters and eco not in eco_filters) or not _matches_component_filter(comp, c_filters):
+            continue
+        ver = str(item.get("version", ""))
+        tags = list(item.get("tags") or [])
+        state = "SERVING_LATEST" if "latest" in tags else "CACHED"
+        bucket = _bucket(eco, comp)
+        if state == "SERVING_LATEST" and not bucket["serving_latest_version"]:
+            bucket["serving_latest_version"] = ver
+        bucket["versions"].append(
+            {
+                "version": ver,
+                "state": state,
+                "tags": tags,
+                "vulnerability_status": item.get("vulnerability_status", "UNSCANNED"),
+                "max_cvss": item.get("max_cvss", 0.0),
+                "cve_ids": item.get("cve_ids", []),
+                "timestamp": item.get("last_scanned_at", ""),
+                "artifact": item.get("artifact", ""),
+            }
+        )
+        seen_keys.add((eco, comp, ver, state))
+
+    for q in quarantined:
+        eco = str(q.get("ecosystem", ""))
+        comp = str(q.get("component", ""))
+        if (eco_filters and eco not in eco_filters) or not _matches_component_filter(comp, c_filters):
+            continue
+        ver = str(q.get("version", ""))
+        bucket = _bucket(eco, comp)
+        bucket["versions"].append(
+            {
+                "version": ver,
+                "state": "QUARANTINED",
+                "tags": [],
+                "vulnerability_status": "VULNERABLE",
+                "max_cvss": q.get("max_cvss", 0.0),
+                "cve_ids": q.get("cve_ids", []),
+                "superseded_by": q.get("superseded_by", ""),
+                "timestamp": q.get("quarantined_at", ""),
+                "artifact": q.get("artifact", ""),
+            }
+        )
+        seen_keys.add((eco, comp, ver, "QUARANTINED"))
+
+    if provenance_log_path.is_file():
+        for line in provenance_log_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            raw_eco = str(rec.get("ecosystem", ""))
+            eco = "oci" if raw_eco == "oci-harbor" else raw_eco
+            art = str(rec.get("artifact", ""))
+            if eco == "oci" and "/manifests/" in art:
+                comp_part, _, ver = art.partition("/manifests/")
+                comp = comp_part.split("/", 1)[-1] if "/" in comp_part else comp_part
+            else:
+                comp, ver = extract_package_coordinates(eco, art)
+            comp = comp or art
+            ver = ver or "unknown"
+            if (eco_filters and eco not in eco_filters) or not _matches_component_filter(comp, c_filters):
+                continue
+            if any(
+                (eco, comp, ver, st) in seen_keys
+                for st in ("SERVING_LATEST", "CACHED", "QUARANTINED", "HISTORICAL")
+            ):
+                continue
+            bucket = _bucket(eco, comp)
+            bucket["versions"].append(
+                {
+                    "version": ver,
+                    "state": "HISTORICAL",
+                    "tags": [],
+                    "vulnerability_status": "CLEAN",
+                    "max_cvss": rec.get("max_cvss", 0.0),
+                    "cve_ids": rec.get("cve_ids", []),
+                    "timestamp": rec.get("timestamp", ""),
+                    "artifact": art,
+                }
+            )
+            seen_keys.add((eco, comp, ver, "HISTORICAL"))
+
+    for bucket in grouped.values():
+        bucket["versions"].sort(
+            key=lambda v: (
+                1 if v["state"] == "SERVING_LATEST" else 0,
+                version_sort_key(str(v["version"])),
+            ),
+            reverse=True,
+        )
+        if not bucket["serving_latest_version"]:
+            clean_vers = [v for v in bucket["versions"] if v["state"] in ("SERVING_LATEST", "CACHED")]
+            if clean_vers:
+                bucket["serving_latest_version"] = clean_vers[0]["version"]
+
+    return sorted(grouped.values(), key=lambda b: (b["ecosystem"], b["component"]))
+
+
 @app.get("/catalog/vulnerabilities")
 async def get_catalog_vulnerabilities(
     settings: Annotated[Settings, Depends(get_settings)],
+    ecosystem: str | None = None,
+    components: str | None = None,
+    verify_signatures: bool = False,
 ) -> dict[str, Any]:
-    """Return all cached components on disk with per-version signature and vulnerability status."""
+    """Return all cached components on disk with per-version signature, CVE status, and caching history."""
+    eco_filters = _parse_ecosystem_filter(ecosystem)
+    comp_filters = _parse_component_filter(components)
     provenance_map = _load_latest_provenance_map(settings.provenance_log_path)
     latest_tags = load_latest_tags(settings)
     quarantined = load_quarantined_components(settings.quarantine_dir)
-    components: list[dict[str, Any]] = []
+    if eco_filters:
+        quarantined = [q for q in quarantined if q.get("ecosystem") in eco_filters]
+    if comp_filters:
+        quarantined = [
+            q for q in quarantined if _matches_component_filter(str(q.get("component", "")), comp_filters)
+        ]
+    cached_components: list[dict[str, Any]] = []
 
     # 1. OCI / Harbor proxy cache (all namespaces under harbor/registry)
     registry_root = settings.oss_data_root / "harbor" / "registry"
@@ -1143,7 +1312,7 @@ async def get_catalog_vulnerabilities(
                 cve_ids = list(prov.get("cve_ids") or [])
                 tag_entry = latest_tags.get(f"oci:{repo_part}", {})
                 comp_tags = ["latest"] if (tag_part == "latest" or tag_entry.get("latest_version") == (tag_part or "latest")) else []
-                components.append(
+                cached_components.append(
                     {
                         "ecosystem": "oci",
                         "namespace": ns,
@@ -1151,8 +1320,12 @@ async def get_catalog_vulnerabilities(
                         "version": tag_part or "latest",
                         "artifact": rel,
                         "tags": comp_tags,
-                        "signature_valid": verify_artifact_signature(
-                            path, path.with_name(f"{path.name}.asc"), settings.gnupghome
+                        "signature_valid": (
+                            verify_artifact_signature(
+                                path, path.with_name(f"{path.name}.asc"), settings.gnupghome
+                            )
+                            if verify_signatures
+                            else path.with_name(f"{path.name}.asc").is_file()
                         ),
                         "pqc_signed": path.with_name(f"{path.name}.mldsa65").is_file(),
                         "clamav_status": str(prov.get("clamav_status", "UNKNOWN")),
@@ -1185,15 +1358,19 @@ async def get_catalog_vulnerabilities(
             cve_ids = list(prov.get("cve_ids") or [])
             tag_entry = latest_tags.get(f"{eco}:{pkg_name or rel}", {})
             comp_tags = ["latest"] if tag_entry.get("latest_version") == (pkg_version or "unknown") else []
-            components.append(
+            cached_components.append(
                 {
                     "ecosystem": eco,
                     "component": pkg_name or rel,
                     "version": pkg_version or "unknown",
                     "artifact": rel,
                     "tags": comp_tags,
-                    "signature_valid": verify_artifact_signature(
-                        path, path.with_name(f"{path.name}.asc"), settings.gnupghome
+                    "signature_valid": (
+                        verify_artifact_signature(
+                            path, path.with_name(f"{path.name}.asc"), settings.gnupghome
+                        )
+                        if verify_signatures
+                        else path.with_name(f"{path.name}.asc").is_file()
                     ),
                     "pqc_signed": path.with_name(f"{path.name}.mldsa65").is_file(),
                     "clamav_status": str(prov.get("clamav_status", "UNKNOWN")),
@@ -1207,19 +1384,40 @@ async def get_catalog_vulnerabilities(
                 }
             )
 
+    if eco_filters:
+        cached_components = [c for c in cached_components if c.get("ecosystem") in eco_filters]
+    if comp_filters:
+        cached_components = [
+            c
+            for c in cached_components
+            if _matches_component_filter(str(c.get("component", "")), comp_filters)
+        ]
+
+    history = _build_component_history(
+        components=cached_components,
+        quarantined=quarantined,
+        provenance_log_path=settings.provenance_log_path,
+        latest_tags=latest_tags,
+        eco_filters=eco_filters,
+        comp_filters=comp_filters,
+    )
+
     summary = {
-        "total": len(components),
-        "clean": sum(1 for c in components if c["vulnerability_status"] == "CLEAN"),
-        "vulnerable": sum(1 for c in components if c["vulnerability_status"] == "VULNERABLE"),
-        "unscanned": sum(1 for c in components if c["vulnerability_status"] == "UNSCANNED"),
+        "total": len(cached_components),
+        "clean": sum(1 for c in cached_components if c["vulnerability_status"] == "CLEAN"),
+        "vulnerable": sum(1 for c in cached_components if c["vulnerability_status"] == "VULNERABLE"),
+        "unscanned": sum(1 for c in cached_components if c["vulnerability_status"] == "UNSCANNED"),
         "quarantined": len(quarantined),
     }
     return {
         "cvss_fail_threshold": settings.cvss_fail_threshold,
+        "ecosystem_filter": ",".join(sorted(eco_filters)) if eco_filters else "all",
+        "component_filter": ",".join(comp_filters) if comp_filters else "all",
         "summary": summary,
-        "components": components,
+        "components": cached_components,
         "quarantined": quarantined,
         "latest_tags": latest_tags,
+        "history": history,
     }
 
 
@@ -1306,9 +1504,15 @@ async def remediate_vulnerable_components(
     settings: Settings,
     app_instance: FastAPI,
     ecosystems: set[str] | None = None,
+    comp_filters: list[str] | None = None,
+    concurrency: int | None = None,
 ) -> dict[str, Any]:
-    """Rescan cached artifacts for newly published CVEs, quarantine vulnerable versions, and fetch clean 'latest'."""
+    """Rescan cached artifacts concurrently for newly published CVEs, quarantine vulnerable versions, and fetch clean 'latest'."""
+    import app.scanner as scanner_mod
+
     active_ecosystems = ecosystems or {"oci", "maven", "pypi"}
+    c_filters = comp_filters or []
+    sem = asyncio.Semaphore(max(1, concurrency or settings.warmup_concurrency))
     scanned = 0
     clean_count = 0
     quarantined_items: list[dict[str, Any]] = []
@@ -1344,81 +1548,92 @@ async def remediate_vulnerable_components(
             pkg_name, pkg_version = extract_package_coordinates(eco, rel)
             targets.append((eco, root_dir, path, rel, pkg_name or rel, pkg_version or "unknown"))
 
-    for eco, root_dir, path, rel, component, version in targets:
-        if not path.exists():
-            continue
-        scanned += 1
-        verdict = await evaluate_artifact_security(
-            file_path=path,
-            clamav_host=settings.clamav_host,
-            clamav_port=settings.clamav_port,
-            clamav_required=False,
-            cvss_threshold=settings.cvss_fail_threshold,
-            cve_scanner_mode=settings.cve_scanner_mode,
-            package_ecosystem=eco,
-            package_name=component,
-            package_version=version,
-        )
-        if verdict.passed and verdict.max_cvss < settings.cvss_fail_threshold:
-            clean_count += 1
-            continue
+    async def _process_target(target: tuple[str, Path, Path, str, str, str]) -> None:
+        nonlocal scanned, clean_count
+        eco, root_dir, path, rel, component, version = target
+        if not path.exists() or not _matches_component_filter(component, c_filters):
+            return
+        async with sem:
+            scanned += 1
+            mode = (settings.cve_scanner_mode or "auto").lower()
+            max_cvss = 0.0
+            cve_ids: list[str] = []
+            cve_status = "OSV_SKIPPED"
+            if mode in {"auto", "osv", "both"} and component and version not in {"", "unknown", "latest"}:
+                _, max_cvss, cve_ids, cve_status = await scanner_mod.query_osv_vulnerabilities(
+                    eco, component, version
+                )
+            if mode in {"trivy", "both"}:
+                _, t_cvss, t_ids, t_status = await scanner_mod.scan_with_trivy(path)
+                if t_cvss > max_cvss:
+                    max_cvss = t_cvss
+                cve_ids = sorted(set(cve_ids + t_ids))
+                cve_status = f"{cve_status}+{t_status}"
 
-        upgrade = await _try_upgrade_component(
-            ecosystem=eco,
-            component=component,
-            vulnerable_version=version,
-            rel_path=rel,
-            settings=settings,
-            app_instance=app_instance,
-        )
-        superseded_by = upgrade["version"] if upgrade else ""
-        if upgrade:
-            upgraded_items.append(
+            if max_cvss < settings.cvss_fail_threshold:
+                clean_count += 1
+                return
+
+            upgrade = await _try_upgrade_component(
+                ecosystem=eco,
+                component=component,
+                vulnerable_version=version,
+                rel_path=rel,
+                settings=settings,
+                app_instance=app_instance,
+            )
+            superseded_by = upgrade["version"] if upgrade else ""
+            if upgrade:
+                upgraded_items.append(
+                    {
+                        "ecosystem": eco,
+                        "component": component,
+                        "previous_version": version,
+                        "latest_version": upgrade["version"],
+                        "artifact": upgrade["artifact"],
+                    }
+                )
+            else:
+                failed_upgrades.append({"ecosystem": eco, "component": component, "version": version})
+
+            quarantine_artifact_with_sidecars(
+                artifact_path=path,
+                root_dir=root_dir,
+                quarantine_root=settings.quarantine_dir,
+                ecosystem=eco,
+                component=component,
+                version=version,
+                max_cvss=max_cvss,
+                cve_ids=cve_ids,
+                cve_status=cve_status,
+                superseded_by=superseded_by,
+            )
+            logger.warning(
+                "[CACHE] QUARANTINED ecosystem=%s component=%s version=%s max_cvss=%.1f cves=%s superseded_by=%s",
+                eco,
+                component,
+                version,
+                max_cvss,
+                ",".join(cve_ids) if cve_ids else "none",
+                superseded_by or "none",
+            )
+            quarantined_items.append(
                 {
                     "ecosystem": eco,
                     "component": component,
-                    "previous_version": version,
-                    "latest_version": upgrade["version"],
-                    "artifact": upgrade["artifact"],
+                    "version": version,
+                    "max_cvss": max_cvss,
+                    "cve_ids": cve_ids,
+                    "superseded_by": superseded_by,
                 }
             )
-        else:
-            failed_upgrades.append({"ecosystem": eco, "component": component, "version": version})
 
-        quarantine_artifact_with_sidecars(
-            artifact_path=path,
-            root_dir=root_dir,
-            quarantine_root=settings.quarantine_dir,
-            ecosystem=eco,
-            component=component,
-            version=version,
-            max_cvss=verdict.max_cvss,
-            cve_ids=verdict.cve_ids,
-            cve_status=verdict.cve_status,
-            superseded_by=superseded_by,
-        )
-        logger.warning(
-            "[CACHE] QUARANTINED ecosystem=%s component=%s version=%s max_cvss=%.1f cves=%s superseded_by=%s",
-            eco,
-            component,
-            version,
-            verdict.max_cvss,
-            ",".join(verdict.cve_ids) if verdict.cve_ids else "none",
-            superseded_by or "none",
-        )
-        quarantined_items.append(
-            {
-                "ecosystem": eco,
-                "component": component,
-                "version": version,
-                "max_cvss": verdict.max_cvss,
-                "cve_ids": verdict.cve_ids,
-                "superseded_by": superseded_by,
-            }
-        )
+    if targets:
+        await asyncio.gather(*(_process_target(t) for t in targets))
 
     return {
         "status": "remediated",
+        "ecosystems": sorted(active_ecosystems),
         "scanned": scanned,
         "clean_count": clean_count,
         "quarantined_count": len(quarantined_items),
@@ -1434,11 +1649,22 @@ async def remediate_vulnerable_components(
 async def remediate_catalog_endpoint(
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
+    ecosystem: str | None = None,
+    components: str | None = None,
+    concurrency: int | None = None,
     x_gatekeeper_token: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
-    """Rescan cached components for newly published CVEs, quarantine vulnerable versions, and fetch clean 'latest'."""
+    """Rescan cached components (optionally comma-separated ecosystems/components) and upgrade vulnerable versions to clean 'latest'."""
     require_admin_token(x_gatekeeper_token, settings)
-    return await remediate_vulnerable_components(settings=settings, app_instance=request.app)
+    ecosystems = _parse_ecosystem_filter(ecosystem)
+    comp_filters = _parse_component_filter(components)
+    return await remediate_vulnerable_components(
+        settings=settings,
+        app_instance=request.app,
+        ecosystems=ecosystems,
+        comp_filters=comp_filters,
+        concurrency=concurrency,
+    )
 
 
 @app.api_route("/keys/trusted-oss-pubkey.asc", methods=["GET", "HEAD"], response_class=PlainTextResponse)
@@ -1540,6 +1766,9 @@ async def _serve_maven_artifact(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if requested_file.name == "maven-metadata.xml" and requested_file.is_file():
+        return FileResponse(requested_file, media_type="application/xml", headers={"X-Cache-Status": "HIT"})
 
     base_rel_path = artifact_path
     for suffix in (".asc", ".mldsa65", ".sha256", ".sha384", ".sha512"):

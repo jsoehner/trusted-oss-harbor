@@ -8,6 +8,7 @@ import json
 import os
 import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -25,7 +26,7 @@ def _build_ssl_context(ca_bundle: str = "", insecure: bool = False) -> ssl.SSLCo
 
 def _get_json(
     url: str,
-    timeout: float = 15.0,
+    timeout: float = 60.0,
     ssl_ctx: ssl.SSLContext | None = None,
     token: str = "",
 ) -> dict[str, Any]:
@@ -37,7 +38,7 @@ def _get_json(
 
 def _post_json(
     url: str,
-    timeout: float = 120.0,
+    timeout: float = 300.0,
     ssl_ctx: ssl.SSLContext | None = None,
     token: str = "",
 ) -> dict[str, Any]:
@@ -170,30 +171,49 @@ def catalog_frontend(
     insecure: bool = False,
     token: str = "",
     ecosystem: str = "all",
-    remediate: bool = True,
+    components_filter: str = "",
+    remediate: bool = False,
 ) -> dict[str, Any]:
-    """Optionally remediate newly vulnerable cached versions, then return per-version inventory."""
+    """Optionally remediate newly vulnerable cached versions, then return per-version inventory & history."""
     base = base_url.rstrip("/")
     ssl_ctx = _build_ssl_context(ca_bundle=ca_bundle, insecure=insecure)
 
+    eco_tokens = [t.strip().lower() for t in ecosystem.split(",") if t.strip()]
+    eco_param = "" if (not eco_tokens or "all" in eco_tokens) else ",".join(eco_tokens)
+    comp_tokens = [c.strip().lower() for c in components_filter.split(",") if c.strip()]
+    comp_param = ",".join(comp_tokens)
+
     remediation_result: dict[str, Any] | None = None
     if remediate and token:
+        rem_params: dict[str, str] = {}
+        if eco_param:
+            rem_params["ecosystem"] = eco_param
+        if comp_param:
+            rem_params["components"] = comp_param
+        rem_qs = urllib.parse.urlencode(rem_params)
+        rem_url = f"{base}/catalog/remediate" + (f"?{rem_qs}" if rem_qs else "")
         try:
-            remediation_result = _post_json(
-                f"{base}/catalog/remediate", ssl_ctx=ssl_ctx, token=token
-            )
+            remediation_result = _post_json(rem_url, ssl_ctx=ssl_ctx, token=token)
         except urllib.error.HTTPError as exc:
             if exc.code not in (404, 403, 503):
                 raise
 
     health = _get_json(f"{base}/healthz", ssl_ctx=ssl_ctx, token=token)
-    status = _get_json(f"{base}/catalog/status", ssl_ctx=ssl_ctx, token=token)
     provenance = _get_json(f"{base}/audit/provenance", ssl_ctx=ssl_ctx, token=token)
 
+    vuln_params: dict[str, str] = {}
+    if eco_param:
+        vuln_params["ecosystem"] = eco_param
+    if comp_param:
+        vuln_params["components"] = comp_param
+    vuln_qs = urllib.parse.urlencode(vuln_params)
+    vuln_url = f"{base}/catalog/vulnerabilities" + (f"?{vuln_qs}" if vuln_qs else "")
+
     try:
-        vuln_data = _get_json(f"{base}/catalog/vulnerabilities", ssl_ctx=ssl_ctx, token=token)
+        vuln_data = _get_json(vuln_url, ssl_ctx=ssl_ctx, token=token)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
+            status = _get_json(f"{base}/catalog/status", ssl_ctx=ssl_ctx, token=token)
             vuln_data = _fallback_vulnerabilities_from_status(
                 status, provenance, float(health.get("cvss_fail_threshold", 7.0))
             )
@@ -208,14 +228,31 @@ def catalog_frontend(
 
     components = vuln_data.get("components", [])
     quarantined = vuln_data.get("quarantined", [])
-    if ecosystem != "all":
-        components = [c for c in components if c.get("ecosystem") == ecosystem]
-        quarantined = [q for q in quarantined if q.get("ecosystem") == ecosystem]
+    history = vuln_data.get("history", [])
+    if eco_tokens and "all" not in eco_tokens:
+        eco_set = set(eco_tokens)
+        components = [c for c in components if c.get("ecosystem") in eco_set]
+        quarantined = [q for q in quarantined if q.get("ecosystem") in eco_set]
+        history = [h for h in history if h.get("ecosystem") in eco_set]
+    if comp_tokens:
+        components = [
+            c for c in components if any(t in str(c.get("component", "")).lower() for t in comp_tokens)
+        ]
+        quarantined = [
+            q for q in quarantined if any(t in str(q.get("component", "")).lower() for t in comp_tokens)
+        ]
+        history = [
+            h for h in history if any(t in str(h.get("component", "")).lower() for t in comp_tokens)
+        ]
 
     return {
         "frontend_url": base,
         "health": health,
         "remediation": remediation_result,
+        "filters": {
+            "ecosystem": eco_param or "all",
+            "components": comp_param or "all",
+        },
         "keys": {
             "gpg_public_key": gpg_ok,
             "mldsa65_public_key": mldsa_ok,
@@ -238,7 +275,23 @@ def catalog_frontend(
         },
         "components": components,
         "quarantined": quarantined,
+        "history": history,
     }
+
+
+def _render_table(headers: list[str], rows: list[list[str]]) -> str:
+    """Format rows into a clean aligned ASCII table."""
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(cell))
+    sep = "+-" + "-+-".join("-" * w for w in widths) + "-+"
+    header_line = "| " + " | ".join(h.ljust(widths[i]) for i, h in enumerate(headers)) + " |"
+    lines = [sep, header_line, sep]
+    for row in rows:
+        lines.append("| " + " | ".join(row[i].ljust(widths[i]) for i in range(len(headers))) + " |")
+    lines.append(sep)
+    return "\n".join(lines)
 
 
 def _print_report(report: dict[str, Any]) -> None:
@@ -246,6 +299,7 @@ def _print_report(report: dict[str, Any]) -> None:
     keys = report["keys"]
     c = report["counts"]
     vs = report["vulnerability_summary"]
+    filt = report.get("filters", {})
 
     print(f"Frontend Gateway URL : {report['frontend_url']} (status={health.get('status', 'unknown')})")
     print(
@@ -254,6 +308,10 @@ def _print_report(report: dict[str, Any]) -> None:
         + (f" ({keys['mldsa65_fingerprint']})" if keys["mldsa65_fingerprint"] else "")
     )
     print(f"Policy Threshold     : CVSS >= {health.get('cvss_fail_threshold', 'N/A')}")
+    print(
+        f"Filters              : ecosystem={filt.get('ecosystem', 'all')} | "
+        f"components={filt.get('components', 'all')}"
+    )
     print(
         f"Cached Components    : Total={c['cached_total']} (OCI={c['oci_cached']}, "
         f"Maven={c['maven_cached']}, PyPI={c['pypi_cached']}) | "
@@ -271,39 +329,93 @@ def _print_report(report: dict[str, Any]) -> None:
             f"upgraded_to_latest={rem.get('upgraded_count', 0)}"
         )
 
-    for eco, label in (("oci", "OCI / Harbor Cache"), ("maven", "Trusted Maven"), ("pypi", "Trusted PyPI")):
-        rows = [item for item in report["components"] if item.get("ecosystem") == eco]
-        print(f"\n[{label}] (cached={len(rows)})")
-        if not rows:
-            print("  (empty)")
-            continue
-        for item in rows:
+    print("\n[Active Cached Components]")
+    if report["components"]:
+        active_rows = []
+        for item in report["components"]:
             sig = "GPG-VALID" if item.get("signature_valid") else "UNSIGNED"
-            pqc = "+PQC" if item.get("pqc_signed") else ""
-            tags = item.get("tags") or []
-            tag_str = f" [tag:{','.join(tags)}]" if tags else ""
-            vstat = item.get("vulnerability_status", "UNSCANNED")
-            cve_status = item.get("cve_status", "UNKNOWN")
-            cvss = float(item.get("max_cvss", 0.0) or 0.0)
+            if item.get("pqc_signed"):
+                sig += "+PQC"
+            tags = ",".join(item.get("tags") or []) or "-"
             cves = ",".join(item.get("cve_ids") or []) or "none"
-            print(
-                f"  - {item.get('component')}@{item.get('version')}{tag_str} "
-                f"[{sig}{pqc}] vuln={vstat} (scanner={cve_status}, max_cvss={cvss:.1f}, cves={cves}) "
-                f"clamav={item.get('clamav_status', 'UNKNOWN')}"
+            active_rows.append(
+                [
+                    str(item.get("ecosystem", "")),
+                    str(item.get("component", "")),
+                    str(item.get("version", "")),
+                    tags,
+                    sig,
+                    str(item.get("vulnerability_status", "UNSCANNED")),
+                    f"{float(item.get('max_cvss', 0.0) or 0.0):.1f}",
+                    cves,
+                    str(item.get("clamav_status", "UNKNOWN")),
+                ]
             )
+        print(
+            _render_table(
+                ["ECOSYSTEM", "COMPONENT", "VERSION", "TAGS", "SIGNATURE", "VULN_STATUS", "CVSS", "CVES", "CLAMAV"],
+                active_rows,
+            )
+        )
+    else:
+        print("  (empty)")
 
     quarantined = report.get("quarantined") or []
     print(f"\n[Quarantined (Vulnerable)] (count={len(quarantined)})")
-    if not quarantined:
-        print("  (none)")
-    for q in quarantined:
-        cves = ",".join(q.get("cve_ids") or []) or "none"
-        cvss = float(q.get("max_cvss", 0.0) or 0.0)
-        sup = f" -> superseded_by={q['superseded_by']} (tag:latest)" if q.get("superseded_by") else ""
+    if quarantined:
+        q_rows = []
+        for q in quarantined:
+            cves = ",".join(q.get("cve_ids") or []) or "none"
+            q_rows.append(
+                [
+                    str(q.get("ecosystem", "")),
+                    str(q.get("component", "")),
+                    str(q.get("version", "")),
+                    str(q.get("status", "QUARANTINED")),
+                    f"{float(q.get('max_cvss', 0.0) or 0.0):.1f}",
+                    cves,
+                    str(q.get("superseded_by") or "-"),
+                ]
+            )
         print(
-            f"  - [{q.get('ecosystem')}] {q.get('component')}@{q.get('version')} "
-            f"[QUARANTINED] max_cvss={cvss:.1f} failing_cves={cves}{sup}"
+            _render_table(
+                ["ECOSYSTEM", "COMPONENT", "VERSION", "STATUS", "MAX_CVSS", "FAILING_CVES", "LATEST_REPLACEMENT"],
+                q_rows,
+            )
         )
+    else:
+        print("  (none)")
+
+    history = report.get("history") or []
+    print(f"\n[Component Caching History & Active 'latest' Resolution] (components={len(history)})")
+    if history:
+        h_rows = []
+        for bucket in history:
+            eco = str(bucket.get("ecosystem", ""))
+            comp = str(bucket.get("component", ""))
+            for ver in bucket.get("versions", []):
+                cves = ",".join(ver.get("cve_ids") or []) or "none"
+                ts = str(ver.get("timestamp", ""))[:19] or "-"
+                h_rows.append(
+                    [
+                        eco,
+                        comp,
+                        str(ver.get("version", "")),
+                        str(ver.get("state", "")),
+                        str(ver.get("vulnerability_status", "")),
+                        f"{float(ver.get('max_cvss', 0.0) or 0.0):.1f}",
+                        cves,
+                        ts,
+                    ]
+                )
+        print(
+            _render_table(
+                ["ECOSYSTEM", "COMPONENT", "VERSION", "STATE", "VULN_STATUS", "CVSS", "CVES", "TIMESTAMP"],
+                h_rows,
+            )
+        )
+    else:
+        print("  (empty)")
 
 
 def main() -> int:
@@ -322,14 +434,18 @@ def main() -> int:
     )
     parser.add_argument(
         "--ecosystem",
-        choices=("all", "oci", "maven", "pypi"),
         default="all",
-        help="Filter output to a specific ecosystem (default: all)",
+        help="Comma-separated component types to scan/filter: oci,maven,pypi or all (default: all)",
     )
     parser.add_argument(
-        "--no-remediate",
+        "--components",
+        default="",
+        help="Comma-separated component names/substrings to filter (e.g. requests,spring-boot-starter-web)",
+    )
+    parser.add_argument(
+        "--remediate",
         action="store_true",
-        help="Skip POST /catalog/remediate CVE rescan/auto-upgrade before listing",
+        help="Trigger POST /catalog/remediate CVE rescan/auto-upgrade before listing (opt-in; hourly background rescan already runs on the server)",
     )
     parser.add_argument("--ca-bundle", default="", help="Path to custom CA certificate bundle")
     parser.add_argument("--insecure", action="store_true", help="Skip TLS certificate verification")
@@ -343,7 +459,8 @@ def main() -> int:
             insecure=args.insecure,
             token=args.token,
             ecosystem=args.ecosystem,
-            remediate=not args.no_remediate,
+            components_filter=args.components,
+            remediate=args.remediate,
         )
     except Exception as exc:
         print(f"[ERROR] Could not reach frontend at {args.url}: {exc}")
