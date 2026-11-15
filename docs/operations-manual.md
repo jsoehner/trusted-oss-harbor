@@ -353,6 +353,6 @@ FROM ${HARBOR_REGISTRY}/chainguard-cache/chainguard/jre:latest
 
 ### 4.5 GitHub Actions CI/CD & pfSense GitHub-Only mTLS Edge
 
-1. Configure **pfSense** (WAN GitHub-only IP allowlist `github_actions_cidrs` + ACME TLS + HAProxy mTLS forwarding to `<TRUENAS_LAN_IP>:8080`) using [`config/pfsense/haproxy-mtls-guide.md`](../config/pfsense/haproxy-mtls-guide.md).
+1. Configure **pfSense** (WAN GitHub-only IP allowlist `github_actions_cidrs` + ACME TLS + HAProxy mTLS forwarding to `<TRUENAS_LAN_IP>:8080`) using [`docs/pfsense-haproxy-mtls-guide.md`](pfsense-haproxy-mtls-guide.md).
 2. Store `OSS_MTLS_CLIENT_CERT` and `OSS_MTLS_CLIENT_KEY` as GitHub Actions secrets, and set repository variable `TRUSTED_OSS_CACHE_URL` (e.g., `https://oss.yourdomain.com`) only on repositories that should use your trusted cache.
 3. Use [`client-templates/github-actions-trusted-oss.yml`](../client-templates/github-actions-trusted-oss.yml) in your `.github/workflows/*.yml` pipelines: when `vars.TRUSTED_OSS_CACHE_URL` is unset, builds default to public upstream registries; when set, mTLS credentials are configured and Maven + `pip`/`uv` route through your Trusted OSS gateway.

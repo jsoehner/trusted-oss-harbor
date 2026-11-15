@@ -11,7 +11,7 @@
 
 ## Decision
 
-1. **pfSense Two-Layer GitHub-Only Gate (`config/pfsense/haproxy-mtls-guide.md`)**:
+1. **pfSense Two-Layer GitHub-Only Gate (`docs/pfsense-haproxy-mtls-guide.md`)**:
    - **Layer 1 (WAN Firewall)**: Permit TCP `:443` **only** from the `github_actions_cidrs` URL Table alias refreshed via `config/pfsense/update-github-cidrs.sh`.
    - **Layer 2 (HAProxy mTLS)**: Terminate ACME TLS on `WAN address:443`, require a valid client certificate signed by `Trusted-OSS-GitHub-Client-CA` (`has_client_cert`), and proxy `/maven/`, `/pypi/`, `/v2/`, `/keys/`, `/audit/`, `/catalog/`, and `/healthz` to `<TRUENAS_LAN_IP>:8080`.
 2. **Public-by-Default, Single-Variable Opt-In (`scripts/configure_trusted_cache.py`)**:
