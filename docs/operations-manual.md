@@ -1,6 +1,6 @@
-# Trusted OSS Supply Chain Platform — Operations Manual (`v1.3.0`)
+# Trusted OSS Supply Chain Platform — Operations Manual (`v1.4.0`)
 
-This manual documents every operational capability of `trusted-oss-harbor` (`v1.3.0`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack and the single-container **TrueNAS / NAS Appliance** image (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.3.0`), and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, and GitHub Actions projects.
+This manual documents every operational capability of `trusted-oss-harbor` (`v1.4.0`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack and the single-container **TrueNAS / NAS Appliance** image (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.4.0`), and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, and GitHub Actions projects.
 
 ---
 
@@ -266,7 +266,7 @@ Alternative HTTPS port `443` transports (recommended when **MFA is enabled** or 
      GRAPH_TENANT_ID=common
      GRAPH_REFRESH_TOKEN=<refresh_token_from_msgraph_token.json>
      ```
-  5. Or enable it in the single-container **TrueNAS / NAS Appliance** (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.3.0` or `:latest`, where `/data` is your persistent volume):
+  5. Or enable it in the single-container **TrueNAS / NAS Appliance** (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.4.0` or `:latest`, where `/data` is your persistent volume):
      ```yaml
      environment:
        - DIGEST_ENABLED=true
@@ -290,6 +290,24 @@ Schedule a daily cron job on the host (e.g., 07:30 every day, using the cached G
 ---
 
 ## 4. Integrating Existing Software Projects
+
+### 4.0 Public-by-Default & Single-Variable Opt-In (`scripts/configure_trusted_cache.py`)
+
+Every repository defaults to **public upstream repositories** (Maven Central, PyPI, `cgr.dev`) when `TRUSTED_OSS_CACHE_URL` is unset. When you download or onboard a repository and want to route it to your Trusted OSS Cache (or switch it back to public), run:
+
+```bash
+# Interactive prompt (defaults to public repos; enter your Trusted Cache URL to opt in)
+python3 scripts/configure_trusted_cache.py --repo /path/to/repo --interactive
+
+# Non-interactive switch (updates .mvn/settings.xml, .mvn/maven.config, uv.toml, .env)
+python3 scripts/configure_trusted_cache.py --repo /path/to/repo --url https://oss.yourdomain.com
+
+# Also set the GitHub Actions variable TRUSTED_OSS_CACHE_URL on the remote repo
+python3 scripts/configure_trusted_cache.py --repo /path/to/repo --github-repo owner/repo --url https://oss.yourdomain.com
+
+# Revert back to public upstream repositories
+python3 scripts/configure_trusted_cache.py --repo /path/to/repo --public
+```
 
 ### 4.1 Java / Maven Projects
 
@@ -333,6 +351,8 @@ Point Dockerfiles to the Harbor Chainguard proxy cache (see [`containers/chaingu
 FROM ${HARBOR_REGISTRY}/chainguard-cache/chainguard/jre:latest
 ```
 
-### 4.5 GitHub Actions CI/CD Integration
+### 4.5 GitHub Actions CI/CD & pfSense GitHub-Only mTLS Edge
 
-Use [`client-templates/github-actions-trusted-oss.yml`](../client-templates/github-actions-trusted-oss.yml) in your `.github/workflows/*.yml` pipelines to configure mTLS credentials, import `/keys/trusted-oss-pubkey.asc`, and route Maven builds exclusively through your Trusted OSS gateway.
+1. Configure **pfSense** (WAN GitHub-only IP allowlist `github_actions_cidrs` + ACME TLS + HAProxy mTLS forwarding to `<TRUENAS_LAN_IP>:8080`) using [`config/pfsense/haproxy-mtls-guide.md`](../config/pfsense/haproxy-mtls-guide.md).
+2. Store `OSS_MTLS_CLIENT_CERT` and `OSS_MTLS_CLIENT_KEY` as GitHub Actions secrets, and set repository variable `TRUSTED_OSS_CACHE_URL` (e.g., `https://oss.yourdomain.com`) only on repositories that should use your trusted cache.
+3. Use [`client-templates/github-actions-trusted-oss.yml`](../client-templates/github-actions-trusted-oss.yml) in your `.github/workflows/*.yml` pipelines: when `vars.TRUSTED_OSS_CACHE_URL` is unset, builds default to public upstream registries; when set, mTLS credentials are configured and Maven + `pip`/`uv` route through your Trusted OSS gateway.

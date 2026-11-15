@@ -422,7 +422,7 @@ def test_job_bus_async_remediation_and_frontend_role(tmp_path, monkeypatch):
         hz = client.get("/healthz")
         assert hz.status_code == 200
         hz_body = hz.json()
-        assert hz_body["version"] == "1.3.0"
+        assert hz_body["version"] == "1.4.0"
         assert hz_body["role"] == "frontend"
         assert hz_body["bus_backend"] == "memory"
 
@@ -721,7 +721,7 @@ def test_lifespan_with_digest_enabled_starts_cleanly(tmp_path, monkeypatch):
     with TestClient(app) as client:
         resp = client.get("/healthz")
         assert resp.status_code == 200
-        assert resp.json()["version"] == "1.3.0"
+        assert resp.json()["version"] == "1.4.0"
 
 
 def test_keep_clean_versions_and_90_day_unused_ttl_gc_and_retention_digest(tmp_path):
@@ -870,4 +870,48 @@ def test_prime_cache_identifies_cached_vs_missing_components(monkeypatch, capsys
     queued_names = {item["component"] for item in payload["to_fetch"]}
     assert cached_names == {"com.example:cached-lib", "fastapi"}
     assert queued_names == {"com.example:missing-lib", "httpx", "cgr.dev/chainguard/wolfi-base"}
+
+
+def test_configure_trusted_cache_switches_between_public_and_trusted_url(tmp_path) -> None:
+    import importlib.util
+
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "configure_trusted_cache.py"
+    spec = importlib.util.spec_from_file_location("configure_trusted_cache", script_path)
+    assert spec and spec.loader
+    cfg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cfg)
+
+    repo = tmp_path / "sample-repo"
+    repo.mkdir()
+    (repo / "pom.xml").write_text("<project/>", encoding="utf-8")
+    (repo / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    (repo / "Dockerfile").write_text("FROM cgr.dev/chainguard/wolfi-base:latest\n", encoding="utf-8")
+
+    # 1. Default / --public leaves public upstream repos untouched
+    res_pub_init = cfg.configure_repository(repo, cache_url="")
+    assert res_pub_init["target"] == "public"
+    assert not (repo / ".mvn" / "settings.xml").exists()
+    assert not (repo / "uv.toml").exists()
+
+    # 2. Switch all ecosystems to Trusted OSS Cache via single URL
+    res_trusted = cfg.configure_repository(repo, cache_url="https://oss.example.com/", mode="virtual")
+    assert res_trusted["target"] == "trusted_cache"
+    assert "https://oss.example.com/maven/virtual" in (repo / ".mvn" / "settings.xml").read_text(encoding="utf-8")
+    assert (repo / ".mvn" / "maven.config").read_text(encoding="utf-8").strip() == "-s .mvn/settings.xml"
+    assert "https://oss.example.com/pypi/virtual/simple" in (repo / "uv.toml").read_text(encoding="utf-8")
+    env_text = (repo / ".env").read_text(encoding="utf-8")
+    assert "TRUSTED_OSS_CACHE_URL=https://oss.example.com" in env_text
+    assert "PIP_INDEX_URL=https://oss.example.com/pypi/virtual/simple" in env_text
+    assert "BASE_IMAGE=oss.example.com/v2/virtual/chainguard/wolfi-base:latest" in env_text
+
+    # 3. Revert back to public upstream repositories
+    res_reverted = cfg.configure_repository(repo, cache_url="")
+    assert res_reverted["target"] == "public"
+    assert not (repo / ".mvn" / "settings.xml").exists()
+    assert not (repo / ".mvn" / "maven.config").exists()
+    assert not (repo / "uv.toml").exists()
+    reverted_env = (repo / ".env").read_text(encoding="utf-8")
+    assert "TRUSTED_OSS_CACHE_URL=" not in reverted_env
+    assert "PIP_INDEX_URL=" not in reverted_env
+    assert "BASE_IMAGE=cgr.dev/chainguard/wolfi-base:latest" in reverted_env
 

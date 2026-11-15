@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-15
+
+### Added
+- **pfSense GitHub-Only mTLS Setup Guide (`config/pfsense/haproxy-mtls-guide.md`)**: Detailed step-by-step instructions to expose `trusted-oss-gatekeeper:8080` via pfSense HAProxy with ACME TLS, `Trusted-OSS-GitHub-Client-CA` mTLS (`has_client_cert`), and WAN firewall rules restricted exclusively to `github_actions_cidrs`.
+- **Opt-In Per-Repo Cache Switcher (`scripts/configure_trusted_cache.py`)**: Repositories default to public upstream registries (Maven Central, PyPI, `cgr.dev`) when `TRUSTED_OSS_CACHE_URL` is unset. Running `scripts/configure_trusted_cache.py --interactive` or `--url <URL>` configures `.mvn/settings.xml`, `.mvn/maven.config`, `uv.toml`, `.env`, and optional GitHub Actions variable `TRUSTED_OSS_CACHE_URL` in one step; `--public` reverts back to public repos.
+- **Documentation & ADRs**: Recorded [ADR 0007](docs/adr/0007-pfsense-github-mtls-and-opt-in-cache-routing.md) and updated `docs/operations-manual.md`, `README.md`, and `.env.example`.
+
+### Changed
+- **Conditional GitHub Actions mTLS Trigger (`client-templates/github-actions-trusted-oss.yml`)**: Activates mTLS and Maven/PyPI cache routing only when `vars.TRUSTED_OSS_CACHE_URL` (or legacy `vars.HARBOR_DOMAIN`) is set; otherwise exits cleanly and uses public upstream repos.
+- **Parameterized `Dockerfile` Base Image**: Added `ARG BASE_IMAGE=cgr.dev/chainguard/wolfi-base:latest` so builds default to public `cgr.dev` and can be redirected with a single build-arg.
+
 ## [1.3.0] - 2026-11-15
 
 ### Added

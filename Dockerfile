@@ -6,7 +6,8 @@
 #   3. Trusted OSS Gatekeeper (FastAPI on port 8000, Python 3.13)
 #   4. Dual Cryptographic Signer (RSA-3072 GPG + NIST FIPS 204 ML-DSA-65 PQC)
 # ==============================================================================
-FROM cgr.dev/chainguard/wolfi-base:latest AS builder
+ARG BASE_IMAGE=cgr.dev/chainguard/wolfi-base:latest
+FROM ${BASE_IMAGE} AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -25,9 +26,9 @@ RUN python3 -m venv /opt/venv && \
 # ------------------------------------------------------------------------------
 # Minimal Zero-CVE Runtime Stage (No pip, compilers, or build tooling)
 # ------------------------------------------------------------------------------
-FROM cgr.dev/chainguard/wolfi-base:latest
+FROM ${BASE_IMAGE}
 
-ARG APP_VERSION=1.3.0
+ARG APP_VERSION=1.4.0
 
 LABEL org.opencontainers.image.title="Trusted OSS Harbor NAS Appliance" \
       org.opencontainers.image.description="Zero-CVE Chainguard/Wolfi all-in-one Trusted OSS Supply Chain Gatekeeper, ClamAV Antivirus, and PQC Signer" \
