@@ -1,6 +1,6 @@
 # pfSense `2.9.0-RELEASE` Edge Security Guide: GitHub-Only mTLS Access to `trusted-oss-gatekeeper`
 
-- **Guide Version:** `2.0` (relocated alongside [`operations-manual.md`](operations-manual.md) with step-by-step WebGUI illustrations)
+- **Guide Version:** `2.1` (relocated alongside [`operations-manual.md`](operations-manual.md) with step-by-step WebGUI illustrations)
 - **Target Firewall Platform:** pfSense `2.9.0-RELEASE (amd64)` (built `Fri Aug 28 13:53:00 EDT 2026`, `FreeBSD 16.0-CURRENT`)
 - **Required pfSense Packages:** `acme`, `haproxy`, `cron` (**System $\rightarrow$ Package Manager**)
 
@@ -31,17 +31,50 @@ TrueNAS Appliance Container (`trusted-oss-gatekeeper` on `<TRUENAS_LAN_IP>:8080`
 
 ## Step 1: Generate & Import the mTLS Client CA (`System → Cert. Manager → CAs`)
 
-1. Run the helper script on your Linux workstation to generate `ca.crt`, `client.crt`, and `client.key`:
+1. Run the helper script on your Linux workstation (creates `./mtls-pki/` with `ca.crt`, `client.crt`, `client.key`, and `client.p12`):
    ```bash
    ./scripts/generate_mtls_keys.sh
    ```
-2. In pfSense WebGUI, navigate to **System $\rightarrow$ Cert. Manager $\rightarrow$ CAs $\rightarrow$ + Add**:
+   Expected output:
+   ```text
+   [INFO] Generating CA private key and certificate...
+   [INFO] Generating Client private key and CSR...
+   [INFO] Signing Client certificate with CA...
+   Certificate request self-signature ok
+   subject=C=CA, ST=Ontario, L=Local, O=JSI Group, OU=GitHubActions, CN=github-actions-runner-client
+   [INFO] Creating PKCS#12 bundle for Java/Maven...
+   ================================================================================
+   ✅ mTLS PKI Generation Complete in: ./mtls-pki
+   ================================================================================
+   1. pfSense Import File (Upload this as Internal CA in pfSense Cert Manager):
+      -> ./mtls-pki/ca.crt
+
+   2. GitHub Action Repository Secret (OSS_MTLS_CLIENT_CERT):
+      -> ./mtls-pki/client.crt
+
+   3. GitHub Action Repository Secret (OSS_MTLS_CLIENT_KEY):
+      -> ./mtls-pki/client.key
+
+   4. PKCS#12 Bundle (Password: 'changeit') for Java / Maven:
+      -> ./mtls-pki/client.p12
+   ================================================================================
+   ```
+2. Print `./mtls-pki/ca.crt` and copy the entire `-----BEGIN CERTIFICATE----- ... -----END CERTIFICATE-----` block:
+   ```bash
+   cat ./mtls-pki/ca.crt
+   ```
+3. In pfSense WebGUI, navigate to **System $\rightarrow$ Certificates $\rightarrow$ Authorities $\rightarrow$ + Add**:
    - **Descriptive name**: `Trusted-OSS-GitHub-Client-CA`
    - **Method**: `Import an existing Certificate Authority`
-   - **Certificate data**: Paste the full PEM contents of `ca.crt`
+   - **Trust Store**: leave unchecked
+   - **Randomize Serial**: leave unchecked
+   - **Existing Certificate Authority $\rightarrow$ Certificate data**: Paste the contents of `./mtls-pki/ca.crt`
+   - **Certificate Private Key (optional)**: leave blank
    - Click **Save**.
 
 ![Step 1 — System Cert. Manager Import CA](images/pfsense-01-cert-manager-ca.png)
+
+4. Save `./mtls-pki/client.crt` and `./mtls-pki/client.key` as GitHub Organization or Repository **Secrets** (`OSS_MTLS_CLIENT_CERT` and `OSS_MTLS_CLIENT_KEY`) in Step 5, and keep `./mtls-pki/ca.key` offline/private.
 
 *(Alternative)* Create the CA and Client Certificate directly inside pfSense **System $\rightarrow$ Cert. Manager**, then export `client.crt` and `client.key` as PEM for your GitHub Actions secrets (`OSS_MTLS_CLIENT_CERT`, `OSS_MTLS_CLIENT_KEY`).
 
@@ -61,9 +94,9 @@ TrueNAS Appliance Container (`trusted-oss-gatekeeper` on `<TRUENAS_LAN_IP>:8080`
    ```
 4. In pfSense WebGUI, navigate to **Firewall $\rightarrow$ Aliases $\rightarrow$ URLs $\rightarrow$ + Add**:
    - **Name**: `github_actions_cidrs`
-   - **Type**: `URL Table (IPs)`
-   - **URL Table (IPs)**: URL serving `github_actions_cidrs.txt`
-   - **Update Frequency**: `1` day
+   - **Type**: `URL Table (IPs)` *(do not use `URL (IPs)`, which is capped at `< 3,000` entries; `github_actions_cidrs.txt` has 8,350+ CIDRs)*
+   - **URL Table (IPs)**: `https://raw.githubusercontent.com/jsoehner/trusted-oss-harbor/main/config/pfsense/github_actions_cidrs.txt` *(or your internal HTTP URL serving `github_actions_cidrs.txt`)*
+   - **Update Frequency** (dropdown after `/`): `1` day
    - Click **Save** and **Apply Changes**.
 
 ![Step 2.1 — Firewall Aliases URL Table](images/pfsense-02-aliases-github-cidrs.png)
