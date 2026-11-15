@@ -65,7 +65,7 @@ async def run_engine() -> None:
         digest_task = asyncio.create_task(
             run_daily_digest_loop(
                 oss_data_root=settings.oss_data_root,
-                admin_token=settings.admin_token,
+                admin_token=settings.gatekeeper_admin_token,
                 stop_event=stop_event,
                 default_frontend_url="http://oss-frontend:8000",
                 logger=logger,

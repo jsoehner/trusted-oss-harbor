@@ -386,7 +386,7 @@ async def run_daily_digest_loop(
 
         if now - last_sent >= interval:
             try:
-                headers = {"Authorization": f"Bearer {admin_token}"}
+                headers = {"X-Gatekeeper-Token": admin_token}
                 async with httpx.AsyncClient(timeout=15.0) as client:
                     h_resp = await client.get(f"{frontend_url}/healthz", headers=headers)
                     v_resp = await client.get(

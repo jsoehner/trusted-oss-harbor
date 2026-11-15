@@ -422,7 +422,7 @@ def test_job_bus_async_remediation_and_frontend_role(tmp_path, monkeypatch):
         hz = client.get("/healthz")
         assert hz.status_code == 200
         hz_body = hz.json()
-        assert hz_body["version"] == "1.1.1"
+        assert hz_body["version"] == "1.1.2"
         assert hz_body["role"] == "frontend"
         assert hz_body["bus_backend"] == "memory"
 
@@ -693,3 +693,32 @@ def test_component_history_deduplicates_multi_file_maven_versions(tmp_path):
     assert len(history) == 1
     assert len(history[0]["versions"]) == 1
     assert history[0]["versions"][0]["version"] == "3.1"
+
+
+def test_lifespan_with_digest_enabled_starts_cleanly(tmp_path, monkeypatch):
+    """Verify FastAPI lifespan starts and shuts down cleanly when DIGEST_ENABLED=true."""
+    from fastapi.testclient import TestClient
+
+    from app.config import Settings
+    from app.main import app
+
+    monkeypatch.setenv("DIGEST_ENABLED", "true")
+    monkeypatch.setenv("DIGEST_TO", "ops@example.com")
+
+    settings = Settings(
+        oss_data_root=tmp_path,
+        gatekeeper_admin_token="test-admin-token",
+        clamav_required=False,
+        pqc_signing_enabled=False,
+        cve_scanner_mode="osv",
+        cve_rescan_interval_seconds=0,
+        gatekeeper_role="all",
+    )
+    app.state.settings = settings
+    if hasattr(app.state, "job_bus"):
+        delattr(app.state, "job_bus")
+
+    with TestClient(app) as client:
+        resp = client.get("/healthz")
+        assert resp.status_code == 200
+        assert resp.json()["version"] == "1.1.2"

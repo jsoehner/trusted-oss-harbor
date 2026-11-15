@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-11-15
-- **Version:** 1.1.1
+- **Version:** 1.1.2
 
 ## Context and Problem Statement
 
@@ -30,9 +30,9 @@ We implement outbound notification delivery in `gatekeeper/app/notifications.py`
    - **Twilio SMS (`HTTPS 443`)**: `send_twilio_sms` supports direct E.164 SMS delivery.
 3. **Docker `oss-engine` & Single-Container NAS Appliance Integration**:
    - `docker-compose.yml` passes `DIGEST_ENABLED`, `DIGEST_INTERVAL_SECONDS`, `DIGEST_TO`, `DIGEST_SMS_TO`, `GRAPH_CLIENT_ID`, `GRAPH_TENANT_ID`, `GRAPH_REFRESH_TOKEN`, `GRAPH_ACCESS_TOKEN`, and `GRAPH_TOKEN_FILE` to `oss-engine` (`default_frontend_url=http://oss-frontend:8000`).
-   - For single-container NAS appliance deployments (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.1.1`, `GATEKEEPER_ROLE=all`), `gatekeeper/app/main.py` lifespan starts `run_daily_digest_loop` (`default_frontend_url=http://127.0.0.1:8000`) when `DIGEST_ENABLED=true`.
+   - For single-container NAS appliance deployments (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.1.2`, `GATEKEEPER_ROLE=all`), `gatekeeper/app/main.py` lifespan starts `run_daily_digest_loop` (`default_frontend_url=http://127.0.0.1:8000`) when `DIGEST_ENABLED=true`.
    - `run_daily_digest_loop` records `last_digest_sent.txt` and rotates `msgraph_token.json` on the persistent `/data/audit` volume so container restarts do not duplicate daily digests.
-   - `.github/workflows/publish-nas-appliance.yml` reads `VERSION` and publishes explicit version tags (`1.1.1` and `v1.1.1`) alongside `latest` on GHCR so NAS operators can track and pin published releases.
+   - `.github/workflows/publish-nas-appliance.yml` reads `VERSION` and publishes explicit version tags (`1.1.2` and `v1.1.2`) alongside `latest` on GHCR so NAS operators can track and pin published releases.
 
 ## Consequences
 

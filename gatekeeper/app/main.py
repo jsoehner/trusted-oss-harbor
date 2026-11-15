@@ -307,7 +307,7 @@ async def lifespan(app: FastAPI):
             digest_task = asyncio.create_task(
                 run_daily_digest_loop(
                     oss_data_root=settings.oss_data_root,
-                    admin_token=settings.admin_token,
+                    admin_token=settings.gatekeeper_admin_token,
                     stop_event=stop_event,
                     default_frontend_url="http://127.0.0.1:8000",
                 )
@@ -342,7 +342,7 @@ app = FastAPI(
         "Harbor Chainguard OCI proxy cache, ClamAV antivirus inspection, Trivy/NVD vulnerability gating, "
         "GPG/Cosign signing, and NIST FIPS 204 ML-DSA-65 Post-Quantum Cryptography dual-signing."
     ),
-    version="1.1.1",
+    version="1.1.2",
     lifespan=lifespan,
 )
 

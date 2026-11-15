@@ -1,6 +1,6 @@
-# Trusted OSS Supply Chain Platform — Operations Manual (`v1.1.1`)
+# Trusted OSS Supply Chain Platform — Operations Manual (`v1.1.2`)
 
-This manual documents every operational capability of `trusted-oss-harbor` (`v1.1.1`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack and the single-container **TrueNAS / NAS Appliance** image (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.1.1`), and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, and GitHub Actions projects.
+This manual documents every operational capability of `trusted-oss-harbor` (`v1.1.2`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack and the single-container **TrueNAS / NAS Appliance** image (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.1.2`), and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, and GitHub Actions projects.
 
 ---
 
@@ -251,7 +251,7 @@ Alternative HTTPS port `443` transports (recommended when **MFA is enabled** or 
      GRAPH_TENANT_ID=common
      GRAPH_REFRESH_TOKEN=<refresh_token_from_msgraph_token.json>
      ```
-  5. Or enable it in the single-container **TrueNAS / NAS Appliance** (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.1.1` or `:latest`, where `/data` is your persistent volume):
+  5. Or enable it in the single-container **TrueNAS / NAS Appliance** (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.1.2` or `:latest`, where `/data` is your persistent volume):
      ```yaml
      environment:
        - DIGEST_ENABLED=true
