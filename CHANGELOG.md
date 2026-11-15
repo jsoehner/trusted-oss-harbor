@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-15
+
+### Added
+- **Incremental Local Cache Primer (`scripts/prime_cache.py`)**: Scans local project workspaces (`discover_local_projects`) for Maven, PyPI, Chainguard, and OCI dependencies, compares them against Gatekeeper's `/catalog/vulnerabilities` inventory, prints **Already Cached** vs. **Will Be Queued & Fetched** tables (or `--json`), and queues only missing components via `POST /catalog/warm` (supporting `--dry-run`, `--wait`, and `--roots`).
+- **Docker Image Version Tagging**: Added `ARG APP_VERSION` and `org.opencontainers.image.version` OCI label to `Dockerfile` and wired `APP_VERSION` build-arg in `.github/workflows/publish-nas-appliance.yml` alongside `:1.3.0`, `:v1.3.0`, and `:latest` GHCR tags.
+- **Documentation & Tests**: Updated `docs/operations-manual.md` (Section 3.2) with `scripts/prime_cache.py` usage and added `test_prime_cache_identifies_cached_vs_missing_components` to `gatekeeper/tests/test_virtual_and_warmup.py`.
+
+## [1.2.0] - 2026-11-15
+
+### Changed
+- **90-Day Inactivity-TTL Retention & Capacity Runway Digest**: Replaced fixed `N-2` version eviction with `GC_RETENTION_VERSIONS=0`, `GC_MAX_UNUSED_DAYS=90`, and `GC_WARN_UNUSED_DAYS=75`, added `audit/last_accessed.json` tracking and `GET /catalog/retention`, and recorded [ADR 0006](docs/adr/0006-inactivity-ttl-cache-retention-and-runway-digest.md).
+
+### Fixed
+- **Microsoft Graph OAuth2 Token Refresh (`fe451c5`)**: Prefer rotated `msgraph_token.json` and sanitize OAuth inputs in `resolve_msgraph_access_token` to eliminate `AADSTS90013` errors on TrueNAS daily digest runs.
+
 ## [1.0.0] - 2026-11-14
 
 ### Added

@@ -27,8 +27,11 @@ RUN python3 -m venv /opt/venv && \
 # ------------------------------------------------------------------------------
 FROM cgr.dev/chainguard/wolfi-base:latest
 
+ARG APP_VERSION=1.3.0
+
 LABEL org.opencontainers.image.title="Trusted OSS Harbor NAS Appliance" \
       org.opencontainers.image.description="Zero-CVE Chainguard/Wolfi all-in-one Trusted OSS Supply Chain Gatekeeper, ClamAV Antivirus, and PQC Signer" \
+      org.opencontainers.image.version="${APP_VERSION}" \
       org.opencontainers.image.source="https://github.com/jsoehner/trusted-oss-harbor" \
       org.opencontainers.image.licenses="Apache-2.0"
 

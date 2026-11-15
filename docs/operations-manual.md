@@ -1,6 +1,6 @@
-# Trusted OSS Supply Chain Platform — Operations Manual (`v1.2.0`)
+# Trusted OSS Supply Chain Platform — Operations Manual (`v1.3.0`)
 
-This manual documents every operational capability of `trusted-oss-harbor` (`v1.2.0`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack and the single-container **TrueNAS / NAS Appliance** image (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.2.0`), and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, and GitHub Actions projects.
+This manual documents every operational capability of `trusted-oss-harbor` (`v1.3.0`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack and the single-container **TrueNAS / NAS Appliance** image (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.3.0`), and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, and GitHub Actions projects.
 
 ---
 
@@ -180,6 +180,21 @@ GATEKEEPER_ADMIN_TOKEN="<token>" \
   --gatekeeper-url http://oss.jsigroup.local:8080
 ```
 
+#### Incremental Cache Primer (`scripts/prime_cache.py`)
+
+When you add a new project with new dependencies, run `scripts/prime_cache.py` to compare all discovered components in your workspace against Gatekeeper's `/catalog/vulnerabilities` inventory, report **Already Cached** vs. **Will Be Queued & Fetched**, and queue only the missing items via `POST /catalog/warm`:
+
+```bash
+# Preview what is already cached vs. what will be queued & fetched
+python3 scripts/prime_cache.py --url http://oss.jsigroup.local:8080 --dry-run
+
+# Queue missing components (and wait for the warmup job to finish)
+GATEKEEPER_ADMIN_TOKEN="<token>" \
+  python3 scripts/prime_cache.py --url http://oss.jsigroup.local:8080 --wait
+```
+
+Use `--roots /path/to/new-project` to scope discovery to a specific directory, or `--json` for machine-readable output.
+
 ### 3.3 Storage & Scanner Cache Inspection
 
 Inspect the backing storage directory (`/home/jsoehner/trusted-oss-data` or TrueNAS iSCSI mount), GPG/ML-DSA keys, NVD/ClamAV/Trivy caches, and quarantine count:
@@ -251,7 +266,7 @@ Alternative HTTPS port `443` transports (recommended when **MFA is enabled** or 
      GRAPH_TENANT_ID=common
      GRAPH_REFRESH_TOKEN=<refresh_token_from_msgraph_token.json>
      ```
-  5. Or enable it in the single-container **TrueNAS / NAS Appliance** (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.2.0` or `:latest`, where `/data` is your persistent volume):
+  5. Or enable it in the single-container **TrueNAS / NAS Appliance** (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.3.0` or `:latest`, where `/data` is your persistent volume):
      ```yaml
      environment:
        - DIGEST_ENABLED=true

@@ -346,7 +346,7 @@ app = FastAPI(
         "Harbor Chainguard OCI proxy cache, ClamAV antivirus inspection, Trivy/NVD vulnerability gating, "
         "GPG/Cosign signing, and NIST FIPS 204 ML-DSA-65 Post-Quantum Cryptography dual-signing."
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 

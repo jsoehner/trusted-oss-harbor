@@ -422,7 +422,7 @@ def test_job_bus_async_remediation_and_frontend_role(tmp_path, monkeypatch):
         hz = client.get("/healthz")
         assert hz.status_code == 200
         hz_body = hz.json()
-        assert hz_body["version"] == "1.2.0"
+        assert hz_body["version"] == "1.3.0"
         assert hz_body["role"] == "frontend"
         assert hz_body["bus_backend"] == "memory"
 
@@ -721,7 +721,7 @@ def test_lifespan_with_digest_enabled_starts_cleanly(tmp_path, monkeypatch):
     with TestClient(app) as client:
         resp = client.get("/healthz")
         assert resp.status_code == 200
-        assert resp.json()["version"] == "1.2.0"
+        assert resp.json()["version"] == "1.3.0"
 
 
 def test_keep_clean_versions_and_90_day_unused_ttl_gc_and_retention_digest(tmp_path):
@@ -818,3 +818,56 @@ def test_keep_clean_versions_and_90_day_unused_ttl_gc_and_retention_digest(tmp_p
     assert "90-Day Inactivity Space Recovery:" in body
     assert "[EXPIRING SOON] maven:com.example:keepme@1.1.0" in body
     assert "[REMOVED] gc" not in body and "com.example:keepme@1.0.0" in body
+
+
+def test_prime_cache_identifies_cached_vs_missing_components(monkeypatch, capsys) -> None:
+    import importlib.util
+    import sys
+
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "prime_cache.py"
+    spec = importlib.util.spec_from_file_location("prime_cache", script_path)
+    assert spec and spec.loader
+    prime_cache = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(prime_cache)
+
+    fake_discovery = {
+        "source_projects": [{"name": "demo-app", "root": "/tmp/demo-app"}],
+        "spring_boot_maven_components": [
+            {"groupId": "com.example", "artifactId": "cached-lib", "version": "1.0.0", "projects": ["demo-app"]},
+            {"groupId": "com.example", "artifactId": "missing-lib", "version": "2.0.0", "projects": ["demo-app"]},
+        ],
+        "pypi_components": [
+            {"name": "fastapi", "spec": "==0.115.0", "pinned_version": "0.115.0", "projects": ["demo-app"]},
+            {"name": "httpx", "spec": ">=0.27.0", "pinned_version": None, "projects": ["demo-app"]},
+        ],
+        "chainguard_containers": [
+            {"registry": "cgr.dev", "repository": "chainguard/wolfi-base", "reference": "latest", "projects": ["demo-app"]},
+        ],
+        "oci_containers": [],
+    }
+    fake_vuln_catalog = {
+        "components": [
+            {"ecosystem": "maven", "component": "com.example:cached-lib", "version": "1.0.0", "vulnerability_status": "CLEAN"},
+            {"ecosystem": "pypi", "component": "fastapi", "version": "0.115.0", "vulnerability_status": "CLEAN"},
+        ]
+    }
+
+    exact, latest = prime_cache._build_cached_index(fake_vuln_catalog)
+    assert ("maven", "com.example:cached-lib", "1.0.0") in exact
+    assert latest[("pypi", "fastapi")][0] == "0.115.0"
+
+    monkeypatch.setattr(prime_cache, "discover_local_projects", lambda *a, **kw: fake_discovery)
+    monkeypatch.setattr(prime_cache, "_http_json", lambda url, **kw: (200, fake_vuln_catalog))
+    monkeypatch.setattr(sys, "argv", ["prime_cache.py", "--url", "http://localhost:8080", "--dry-run", "--json"])
+
+    rc = prime_cache.main()
+    assert rc == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["already_cached_count"] == 2
+    assert payload["to_fetch_count"] == 3
+    cached_names = {item["component"] for item in payload["already_cached"]}
+    queued_names = {item["component"] for item in payload["to_fetch"]}
+    assert cached_names == {"com.example:cached-lib", "fastapi"}
+    assert queued_names == {"com.example:missing-lib", "httpx", "cgr.dev/chainguard/wolfi-base"}
+
