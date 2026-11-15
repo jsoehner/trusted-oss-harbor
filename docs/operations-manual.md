@@ -1,6 +1,6 @@
-# Trusted OSS Supply Chain Platform — Operations Manual (`v1.1.0`)
+# Trusted OSS Supply Chain Platform — Operations Manual (`v1.1.1`)
 
-This manual documents every operational capability of `trusted-oss-harbor` (`v1.1.0`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack, and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, and GitHub Actions projects.
+This manual documents every operational capability of `trusted-oss-harbor` (`v1.1.1`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack and the single-container **TrueNAS / NAS Appliance** image (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.1.1`), and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, and GitHub Actions projects.
 
 ---
 
@@ -250,6 +250,18 @@ Alternative HTTPS port `443` transports (recommended when **MFA is enabled** or 
      GRAPH_CLIENT_ID=<your-app-client-id>
      GRAPH_TENANT_ID=common
      GRAPH_REFRESH_TOKEN=<refresh_token_from_msgraph_token.json>
+     ```
+  5. Or enable it in the single-container **TrueNAS / NAS Appliance** (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.1.1` or `:latest`, where `/data` is your persistent volume):
+     ```yaml
+     environment:
+       - DIGEST_ENABLED=true
+       - DIGEST_INTERVAL_SECONDS=86400
+       - DIGEST_TO=ops@example.com
+       - DIGEST_SMS_TO=5551234567@vtext.com
+       - GRAPH_CLIENT_ID=<your-app-client-id>
+       - GRAPH_TENANT_ID=<your-tenant-id-or-common>
+       - GRAPH_REFRESH_TOKEN=<refresh_token_from_msgraph_token.json>
+       - GRAPH_TOKEN_FILE=/data/audit/msgraph_token.json
      ```
 - **Microsoft Graph (direct token)**: pass `--graph-token "$GRAPH_ACCESS_TOKEN"` and `--to "ops@example.com"`.
 - **Twilio SMS**: pass `--twilio-sid`, `--twilio-token`, `--twilio-from`, and `--twilio-to "+15551234567"`.

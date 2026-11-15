@@ -422,7 +422,7 @@ def test_job_bus_async_remediation_and_frontend_role(tmp_path, monkeypatch):
         hz = client.get("/healthz")
         assert hz.status_code == 200
         hz_body = hz.json()
-        assert hz_body["version"] == "1.1.0"
+        assert hz_body["version"] == "1.1.1"
         assert hz_body["role"] == "frontend"
         assert hz_body["bus_backend"] == "memory"
 
