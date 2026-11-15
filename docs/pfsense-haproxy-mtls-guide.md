@@ -1,6 +1,6 @@
 # pfSense `2.9.0-RELEASE` Edge Security Guide: GitHub-Only mTLS Access to `trusted-oss-gatekeeper`
 
-- **Guide Version:** `2.1` (relocated alongside [`operations-manual.md`](operations-manual.md) with step-by-step WebGUI illustrations)
+- **Guide Version:** `2.2` (relocated alongside [`operations-manual.md`](operations-manual.md) with step-by-step WebGUI illustrations)
 - **Target Firewall Platform:** pfSense `2.9.0-RELEASE (amd64)` (built `Fri Aug 28 13:53:00 EDT 2026`, `FreeBSD 16.0-CURRENT`)
 - **Required pfSense Packages:** `acme`, `haproxy`, `cron` (**System $\rightarrow$ Package Manager**)
 
@@ -121,14 +121,35 @@ Navigate to **Firewall $\rightarrow$ Rules $\rightarrow$ WAN $\rightarrow$ + Add
 
 ## Step 3: Issue the ACME Let's Encrypt Server Certificate (`Services → ACME`)
 
-1. Install the **acme** package (**System $\rightarrow$ Package Manager $\rightarrow$ Available Packages**).
-2. Navigate to **Services $\rightarrow$ ACME $\rightarrow$ Certificates $\rightarrow$ + Add**:
-   - **Name**: `oss-trusted-cache-acme`
-   - **Domain SAN list**: `oss.yourdomain.com` (your public FQDN / DDNS hostname pointing to pfSense WAN)
-   - **Method**: `DNS-Cloudflare` (or your DNS provider's DNS-01 API — requires no inbound port 80)
-   - Click **Save**, then click **Issue/Renew**.
+Install the **acme** package (**System $\rightarrow$ Package Manager $\rightarrow$ Available Packages**) if not already installed.
 
-![Step 3 — ACME Let's Encrypt Server Certificate](images/pfsense-04-acme-cert.png)
+### 3.1 Create & Register a Let's Encrypt Account Key (`Services → ACME → Account Keys`)
+1. Navigate to **Services $\rightarrow$ ACME $\rightarrow$ Account Keys $\rightarrow$ + Add**:
+   - **Name**: `Lets Encrypt` (or `letsencrypt-prod`)
+   - **Description**: `Let's Encrypt Production v2`
+   - **E-Mail Address**: Your operations email for expiry notices
+   - **ACME Server**: `Let's Encrypt Production (Applies rate limits to certificate requests)` *(use `Staging` while testing if desired, then switch to `Production`)*
+2. Click **Create new account key**, then **Register ACME account key**, and click **Save**.
+
+![Step 3.1 — ACME Account Key](images/pfsense-04a-acme-account-key.png)
+
+### 3.2 Create & Issue the Server Certificate (`Services → ACME → Certificates`)
+1. Navigate to **Services $\rightarrow$ ACME $\rightarrow$ Certificates $\rightarrow$ + Add**:
+   - **Name**: `oss-trusted-cache-acme`
+   - **Status**: `Active`
+   - **Private Key**: `2048-bit RSA` (or `ECDSA prime256v1`)
+
+![Step 3.2a — ACME Certificate General](images/pfsense-04-acme-cert.png)
+
+2. Scroll down to **ACME Server / Certificate Authority** and **Validation**:
+   - **ACME Account Key**: Select your **`Lets Encrypt`** production account key *(do not use an internal CA if GitHub-hosted runners will connect over WAN)*
+   - **SAN list $\rightarrow$ Status**: `Enabled`
+   - **SAN**: Your public FQDN / DDNS hostname pointing to pfSense WAN (e.g., `oss.yourdomain.com`)
+   - **Validation Method**: Select your DNS provider's DNS-01 method (e.g., `DNS-Cloudflare`, `DNS-Route53`, `DNS-GoDaddy`, etc. — requires no inbound port 80) and enter its API credentials
+   - *(Optional)* Under **Post-Renew Actions**, add `/usr/local/etc/rc.d/haproxy.sh restart` so HAProxy reloads renewed certs automatically
+3. Click **Save**, then on the **Certificates** list click **Issue/Renew** and verify `Issued Certificate Dates` appears.
+
+![Step 3.2b — ACME Certificate Account Key and SAN Validation](images/pfsense-04b-acme-cert-san.png)
 
 ---
 
