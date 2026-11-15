@@ -375,6 +375,13 @@ def refresh_msgraph_access_token(
     return payload
 
 
+def _clean_oauth_value(val: str, prefix: str = "") -> str:
+    cleaned = val.strip().strip('"').strip("'").strip()
+    if prefix and cleaned.startswith(prefix):
+        cleaned = cleaned[len(prefix) :].strip().strip('"').strip("'").strip()
+    return cleaned
+
+
 def resolve_msgraph_access_token(
     *,
     access_token: str = "",
@@ -385,15 +392,24 @@ def resolve_msgraph_access_token(
     timeout: float = 20.0,
 ) -> str:
     """Resolve a usable Microsoft Graph access token, refreshing and rotating cache if needed."""
-    if access_token:
-        return access_token
+    cleaned_access = _clean_oauth_value(access_token, "GRAPH_ACCESS_TOKEN=")
+    if cleaned_access:
+        return cleaned_access
 
     cached = load_msgraph_token_cache(token_file)
-    eff_client_id = client_id or str(cached.get("client_id", ""))
-    eff_tenant_id = (
-        tenant_id if tenant_id != "common" else str(cached.get("tenant_id", "common"))
+    eff_client_id = _clean_oauth_value(client_id, "GRAPH_CLIENT_ID=") or _clean_oauth_value(
+        str(cached.get("client_id", ""))
     )
-    eff_refresh = refresh_token or str(cached.get("refresh_token", ""))
+    cleaned_tenant = _clean_oauth_value(tenant_id, "GRAPH_TENANT_ID=") or "common"
+    eff_tenant_id = (
+        cleaned_tenant
+        if cleaned_tenant != "common"
+        else (_clean_oauth_value(str(cached.get("tenant_id", "common"))) or "common")
+    )
+    # Prefer the persisted rotated refresh token in token_file over a static env var
+    eff_refresh = _clean_oauth_value(str(cached.get("refresh_token", ""))) or _clean_oauth_value(
+        refresh_token, "GRAPH_REFRESH_TOKEN="
+    )
 
     if not eff_refresh:
         return ""
