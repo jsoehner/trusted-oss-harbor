@@ -4,6 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import json
 import logging
+import os
 from pathlib import Path
 import secrets
 import sys
@@ -296,9 +297,21 @@ async def lifespan(app: FastAPI):
     stop_event = asyncio.Event()
     rescan_task: asyncio.Task[Any] | None = None
     worker_task: asyncio.Task[Any] | None = None
+    digest_task: asyncio.Task[Any] | None = None
     if settings.gatekeeper_role != "frontend":
         if settings.cve_rescan_interval_seconds > 0:
             rescan_task = asyncio.create_task(_hourly_cve_rescan_loop(app))
+        if os.getenv("DIGEST_ENABLED", "false").lower() in {"1", "true", "yes"}:
+            from app.notifications import run_daily_digest_loop
+
+            digest_task = asyncio.create_task(
+                run_daily_digest_loop(
+                    oss_data_root=settings.oss_data_root,
+                    admin_token=settings.admin_token,
+                    stop_event=stop_event,
+                    default_frontend_url="http://127.0.0.1:8000",
+                )
+            )
         worker_task = asyncio.create_task(
             bus.run_worker(
                 lambda job: handle_engine_job(job, settings, app),
@@ -311,7 +324,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         stop_event.set()
-        for task in (rescan_task, worker_task):
+        for task in (rescan_task, digest_task, worker_task):
             if task is not None:
                 task.cancel()
                 try:

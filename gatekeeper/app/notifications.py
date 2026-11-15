@@ -7,8 +7,10 @@ and carrier Email-to-SMS gateways.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
+import logging
 import os
 import smtplib
 import ssl
@@ -341,3 +343,106 @@ def resolve_msgraph_access_token(
         merged["refresh_token"] = eff_refresh
     save_msgraph_token_cache(token_file, merged)
     return str(merged["access_token"])
+
+
+async def run_daily_digest_loop(
+    *,
+    oss_data_root: Path,
+    admin_token: str,
+    stop_event: asyncio.Event,
+    default_frontend_url: str = "http://127.0.0.1:8000",
+    logger: logging.Logger | None = None,
+) -> None:
+    """Periodically send a daily Microsoft Graph email / Email-to-SMS digest."""
+    log = logger or logging.getLogger("gatekeeper.notifications")
+    interval = max(300, int(os.getenv("DIGEST_INTERVAL_SECONDS", "86400")))
+    frontend_url = os.getenv("DIGEST_FRONTEND_URL", default_frontend_url).rstrip("/")
+    token_file = Path(
+        os.getenv("GRAPH_TOKEN_FILE", str(oss_data_root / "audit" / "msgraph_token.json"))
+    )
+    stamp_file = oss_data_root / "audit" / "last_digest_sent.txt"
+    email_to = [x.strip() for x in os.getenv("DIGEST_TO", "").split(",") if x.strip()]
+    sms_to = [x.strip() for x in os.getenv("DIGEST_SMS_TO", "").split(",") if x.strip()]
+
+    if not (email_to or sms_to):
+        log.warning("[DIGEST] DIGEST_ENABLED=true but DIGEST_TO and DIGEST_SMS_TO are empty")
+        return
+
+    # Brief startup delay so local FastAPI/uvicorn is listening before first check
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=5.0)
+        return
+    except asyncio.TimeoutError:
+        pass
+
+    while not stop_event.is_set():
+        now = time.time()
+        last_sent = 0.0
+        if stamp_file.exists():
+            try:
+                last_sent = float(stamp_file.read_text(encoding="utf-8").strip())
+            except ValueError:
+                last_sent = 0.0
+
+        if now - last_sent >= interval:
+            try:
+                headers = {"Authorization": f"Bearer {admin_token}"}
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    h_resp = await client.get(f"{frontend_url}/healthz", headers=headers)
+                    v_resp = await client.get(
+                        f"{frontend_url}/catalog/vulnerabilities", headers=headers
+                    )
+                    a_resp = await client.get(
+                        f"{frontend_url}/audit/activity?limit=200", headers=headers
+                    )
+                    h_resp.raise_for_status()
+                    v_resp.raise_for_status()
+                    a_resp.raise_for_status()
+
+                subject, body_text, sms_text = build_daily_digest(
+                    health=h_resp.json(),
+                    vuln_data=v_resp.json(),
+                    activity_events=a_resp.json().get("events", []),
+                    hours=max(1, interval // 3600),
+                )
+                graph_token = await asyncio.to_thread(
+                    resolve_msgraph_access_token,
+                    access_token=os.getenv("GRAPH_ACCESS_TOKEN", ""),
+                    refresh_token=os.getenv("GRAPH_REFRESH_TOKEN", ""),
+                    client_id=os.getenv("GRAPH_CLIENT_ID", ""),
+                    tenant_id=os.getenv("GRAPH_TENANT_ID", "common"),
+                    token_file=token_file,
+                )
+                if not graph_token:
+                    log.warning("[DIGEST] Daily digest skipped: no Graph token available")
+                else:
+                    if email_to:
+                        await asyncio.to_thread(
+                            send_graph_mail,
+                            access_token=graph_token,
+                            recipients=email_to,
+                            subject=subject,
+                            body=body_text,
+                        )
+                    if sms_to:
+                        await asyncio.to_thread(
+                            send_graph_mail,
+                            access_token=graph_token,
+                            recipients=sms_to,
+                            subject="OSS Harbor Digest",
+                            body=sms_text,
+                        )
+                    stamp_file.parent.mkdir(parents=True, exist_ok=True)
+                    stamp_file.write_text(str(now), encoding="utf-8")
+                    log.info(
+                        "[DIGEST] Daily digest sent via Graph (email=%d sms=%d)",
+                        len(email_to),
+                        len(sms_to),
+                    )
+            except Exception as exc:
+                log.warning("[DIGEST] Daily digest error: %s", exc)
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=min(3600, interval))
+        except asyncio.TimeoutError:
+            pass
