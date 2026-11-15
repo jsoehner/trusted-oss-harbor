@@ -1,6 +1,6 @@
 # pfSense `2.9.0-RELEASE` Edge Security Guide: GitHub-Only mTLS Access to `trusted-oss-gatekeeper`
 
-- **Guide Version:** `2.2` (relocated alongside [`operations-manual.md`](operations-manual.md) with step-by-step WebGUI illustrations)
+- **Guide Version:** `2.3` (relocated alongside [`operations-manual.md`](operations-manual.md) with step-by-step WebGUI illustrations)
 - **Target Firewall Platform:** pfSense `2.9.0-RELEASE (amd64)` (built `Fri Aug 28 13:53:00 EDT 2026`, `FreeBSD 16.0-CURRENT`)
 - **Required pfSense Packages:** `acme`, `haproxy`, `cron` (**System $\rightarrow$ Package Manager**)
 
@@ -133,23 +133,41 @@ Install the **acme** package (**System $\rightarrow$ Package Manager $\rightarro
 
 ![Step 3.1 — ACME Account Key](images/pfsense-04a-acme-account-key.png)
 
-### 3.2 Create & Issue the Server Certificate (`Services → ACME → Certificates`)
+### 3.2 Create a Scoped Cloudflare API Token (for DNS-01 Validation)
+If your domain's DNS is hosted on Cloudflare, create a least-privilege API Token (do **not** use the Global API Key):
+1. Sign in to **Cloudflare Dashboard** (`https://dash.cloudflare.com/profile/api-tokens`) and click **+ Create Token**.
+2. Choose **Use template** next to **`Edit zone DNS`**.
+3. Configure **Permissions**:
+   - `Zone` $\rightarrow$ `DNS` $\rightarrow$ `Edit`
+   - `Zone` $\rightarrow$ `Zone` $\rightarrow$ `Read` *(required so `acme.sh` can resolve the zone)*
+4. Configure **Zone Resources**:
+   - `Include` $\rightarrow$ `Specific zone` $\rightarrow$ `<yourdomain.com>`
+5. Click **Continue to summary** $\rightarrow$ **Create Token**, and copy the generated **API Token** (shown only once).
+6. Open your domain's **Overview** page in Cloudflare and copy the **Zone ID** (and **Account ID** if issuing for multiple zones) from the right-hand **API** sidebar.
+
+### 3.3 Create & Issue the Server Certificate (`Services → ACME → Certificates`)
 1. Navigate to **Services $\rightarrow$ ACME $\rightarrow$ Certificates $\rightarrow$ + Add**:
    - **Name**: `oss-trusted-cache-acme`
    - **Status**: `Active`
    - **Private Key**: `2048-bit RSA` (or `ECDSA prime256v1`)
 
-![Step 3.2a — ACME Certificate General](images/pfsense-04-acme-cert.png)
+![Step 3.3a — ACME Certificate General](images/pfsense-04-acme-cert.png)
 
 2. Scroll down to **ACME Server / Certificate Authority** and **Validation**:
    - **ACME Account Key**: Select your **`Lets Encrypt`** production account key *(do not use an internal CA if GitHub-hosted runners will connect over WAN)*
    - **SAN list $\rightarrow$ Status**: `Enabled`
    - **SAN**: Your public FQDN / DDNS hostname pointing to pfSense WAN (e.g., `oss.yourdomain.com`)
-   - **Validation Method**: Select your DNS provider's DNS-01 method (e.g., `DNS-Cloudflare`, `DNS-Route53`, `DNS-GoDaddy`, etc. — requires no inbound port 80) and enter its API credentials
+   - **Validation Method**: Select **`DNS-Cloudflare`** (or your DNS provider's DNS-01 method — requires no inbound port 80)
+   - Fill in the **Token Auth** fields (leave **Global Key** and **Global Email** blank):
+     - **Token**: Paste your Cloudflare **API Token** from Step 3.2
+     - **Token Zone ID**: Paste your Cloudflare **Zone ID** (for single-zone certificates)
+     - **Token Account ID**: Paste your Cloudflare **Account ID** (only needed for multi-zone certificates)
    - *(Optional)* Under **Post-Renew Actions**, add `/usr/local/etc/rc.d/haproxy.sh restart` so HAProxy reloads renewed certs automatically
 3. Click **Save**, then on the **Certificates** list click **Issue/Renew** and verify `Issued Certificate Dates` appears.
 
-![Step 3.2b — ACME Certificate Account Key and SAN Validation](images/pfsense-04b-acme-cert-san.png)
+![Step 3.3b — ACME Certificate Account Key and SAN Validation](images/pfsense-04b-acme-cert-san.png)
+
+![Step 3.3c — ACME DNS-Cloudflare Token Auth Fields](images/pfsense-04c-acme-dns-cloudflare.png)
 
 ---
 
