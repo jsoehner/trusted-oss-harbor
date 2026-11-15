@@ -50,11 +50,13 @@ from app.virtual_repo import (
     select_preferred_distribution,
 )
 from app.remediation import (
+    build_cache_retention_report,
     fetch_upstream_maven_versions,
     gc_old_component_versions,
     load_latest_tags,
     load_quarantined_components,
     quarantine_artifact_with_sidecars,
+    record_component_access,
     update_latest_tag,
     version_sort_key,
 )
@@ -180,16 +182,17 @@ async def _hourly_cve_rescan_loop(app: FastAPI) -> None:
                 event="HOURLY_GC",
                 ecosystem="all",
                 details=(
-                    f"removed_versions={gc_summary['removed_count']} "
-                    f"files_removed={gc_summary['files_removed_total']} keep={gc_summary['keep_versions']}"
+                    f"policy={gc_summary['policy']} removed_versions={gc_summary['removed_count']} "
+                    f"files_removed={gc_summary['files_removed_total']} ttl_days={gc_summary['max_unused_days']}"
                 ),
             )
             if gc_summary["removed_count"]:
                 logger.info(
-                    "[CACHE] HOURLY_GC removed_versions=%d files_removed=%d keep=%d",
+                    "[CACHE] HOURLY_GC policy=%s removed_versions=%d files_removed=%d ttl_days=%d",
+                    gc_summary["policy"],
                     gc_summary["removed_count"],
                     gc_summary["files_removed_total"],
-                    gc_summary["keep_versions"],
+                    gc_summary["max_unused_days"],
                 )
         except asyncio.CancelledError:
             raise
@@ -281,6 +284,7 @@ async def handle_engine_job(
         return gc_old_component_versions(
             settings=settings,
             keep_versions=payload.get("keep_versions"),
+            max_unused_days=payload.get("max_unused_days"),
             ecosystems=_parse_ecosystem_filter(payload.get("ecosystem")),
             comp_filters=_parse_component_filter(payload.get("components")),
             dry_run=bool(payload.get("dry_run", False)),
@@ -342,7 +346,7 @@ app = FastAPI(
         "Harbor Chainguard OCI proxy cache, ClamAV antivirus inspection, Trivy/NVD vulnerability gating, "
         "GPG/Cosign signing, and NIST FIPS 204 ML-DSA-65 Post-Quantum Cryptography dual-signing."
     ),
-    version="1.1.2",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -1967,6 +1971,14 @@ async def remediate_catalog_endpoint(
     return res
 
 
+@app.get("/catalog/retention")
+async def get_catalog_retention_endpoint(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, Any]:
+    """Return disk runway, cache growth rate, and components approaching/past the unused TTL."""
+    return build_cache_retention_report(settings)
+
+
 @app.post("/catalog/gc")
 async def gc_catalog_endpoint(
     request: Request,
@@ -1974,11 +1986,12 @@ async def gc_catalog_endpoint(
     ecosystem: str | None = None,
     components: str | None = None,
     keep_versions: int | None = None,
+    max_unused_days: int | None = None,
     dry_run: bool = False,
     wait: bool | None = None,
     x_gatekeeper_token: Annotated[str | None, Header()] = None,
 ) -> Any:
-    """Garbage-collect cached versions that are N-2 or older (2+ versions older than latest)."""
+    """Garbage-collect cached versions unused for > max_unused_days (default 90d), or optional keep_versions."""
     require_admin_token(x_gatekeeper_token, settings)
     should_enqueue = wait is False or (wait is None and settings.gatekeeper_role == "frontend")
     if should_enqueue:
@@ -1989,6 +2002,7 @@ async def gc_catalog_endpoint(
                 "ecosystem": ecosystem,
                 "components": components,
                 "keep_versions": keep_versions,
+                "max_unused_days": max_unused_days,
                 "dry_run": dry_run,
             },
         )
@@ -1997,6 +2011,7 @@ async def gc_catalog_endpoint(
     gc_res = gc_old_component_versions(
         settings=settings,
         keep_versions=keep_versions,
+        max_unused_days=max_unused_days,
         ecosystems=_parse_ecosystem_filter(ecosystem),
         comp_filters=_parse_component_filter(components),
         dry_run=dry_run,
@@ -2007,8 +2022,8 @@ async def gc_catalog_endpoint(
         event="MANUAL_GC",
         ecosystem=ecosystem or "all",
         details=(
-            f"removed_versions={gc_res['removed_count']} files_removed={gc_res['files_removed_total']} "
-            f"keep={gc_res['keep_versions']} dry_run={dry_run}"
+            f"policy={gc_res['policy']} removed_versions={gc_res['removed_count']} "
+            f"files_removed={gc_res['files_removed_total']} ttl_days={gc_res['max_unused_days']} dry_run={dry_run}"
         ),
     )
     return gc_res
@@ -2192,6 +2207,7 @@ async def _serve_maven_artifact(
             detail="Integrity violation: artifact lacks a valid Trusted OSS GPG signature",
         )
 
+    record_component_access(settings, "maven", artifact_path)
     return FileResponse(requested_file, headers={"X-Cache-Status": cache_status})
 
 
@@ -2300,6 +2316,9 @@ async def _serve_pypi_package_file(
             detail="Integrity violation: Python package lacks a valid Trusted OSS GPG signature",
         )
 
+    record_component_access(
+        settings, "pypi", requested_file.relative_to(settings.trusted_pypi_dir).as_posix()
+    )
     return FileResponse(requested_file, headers={"X-Cache-Status": cache_status})
 
 

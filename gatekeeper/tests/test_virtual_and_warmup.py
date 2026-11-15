@@ -422,7 +422,7 @@ def test_job_bus_async_remediation_and_frontend_role(tmp_path, monkeypatch):
         hz = client.get("/healthz")
         assert hz.status_code == 200
         hz_body = hz.json()
-        assert hz_body["version"] == "1.1.2"
+        assert hz_body["version"] == "1.2.0"
         assert hz_body["role"] == "frontend"
         assert hz_body["bus_backend"] == "memory"
 
@@ -721,4 +721,100 @@ def test_lifespan_with_digest_enabled_starts_cleanly(tmp_path, monkeypatch):
     with TestClient(app) as client:
         resp = client.get("/healthz")
         assert resp.status_code == 200
-        assert resp.json()["version"] == "1.1.2"
+        assert resp.json()["version"] == "1.2.0"
+
+
+def test_keep_clean_versions_and_90_day_unused_ttl_gc_and_retention_digest(tmp_path):
+    """Keep all clean versions until vulnerable or unused > 90 days; report runway in digest."""
+    import time
+    from datetime import datetime, timezone
+    from fastapi.testclient import TestClient
+
+    from app.config import Settings
+    from app.main import app, initialize_storage_and_keys
+    from app.notifications import build_daily_digest
+    from app.remediation import record_component_access
+
+    settings = Settings(
+        oss_data_root=tmp_path,
+        gatekeeper_admin_token="test-admin-token",
+        clamav_required=False,
+        pqc_signing_enabled=False,
+        cve_scanner_mode="osv",
+        cve_rescan_interval_seconds=0,
+        gc_retention_versions=0,
+        gc_max_unused_days=90,
+        gc_warn_unused_days=75,
+        gatekeeper_role="all",
+    )
+    app.state.settings = settings
+    initialize_storage_and_keys(settings)
+
+    now = time.time()
+    versions = {
+        "1.0.0": now - (95 * 86400),  # > 90d unused -> removed
+        "1.1.0": now - (80 * 86400),  # 75-90d unused -> expiring_soon
+        "1.2.0": now - (5 * 86400),   # active -> kept
+        "1.3.0": now - (1 * 86400),   # active -> kept
+    }
+    for ver, ts in versions.items():
+        rel = f"com/example/keepme/{ver}/keepme-{ver}.jar"
+        p = settings.trusted_maven_dir / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"clean-jar-" + ver.encode())
+        record_component_access(settings, "maven", rel, timestamp=ts)
+
+    with TestClient(app) as client:
+        ret_resp = client.get("/catalog/retention")
+        assert ret_resp.status_code == 200
+        ret_body = ret_resp.json()
+        assert ret_body["max_unused_days"] == 90
+        assert [x["version"] for x in ret_body["expired"]] == ["1.0.0"]
+        assert [x["version"] for x in ret_body["expiring_soon"]] == ["1.1.0"]
+
+        gc_resp = client.post(
+            "/catalog/gc?wait=true",
+            headers={"X-Gatekeeper-Token": "test-admin-token"},
+        )
+        assert gc_resp.status_code == 200
+        gc_body = gc_resp.json()
+        assert gc_body["policy"] == "unused_ttl"
+        assert gc_body["removed_count"] == 1
+        assert gc_body["removed"][0]["version"] == "1.0.0"
+
+    assert not (settings.trusted_maven_dir / "com/example/keepme/1.0.0/keepme-1.0.0.jar").exists()
+    for kept_ver in ("1.1.0", "1.2.0", "1.3.0"):
+        assert (settings.trusted_maven_dir / f"com/example/keepme/{kept_ver}/keepme-{kept_ver}.jar").exists()
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    _, body, _ = build_daily_digest(
+        health={"status": "ok", "role": "all", "cvss_fail_threshold": 7.0},
+        vuln_data={"summary": {"total": 3, "clean": 3, "unscanned": 0, "quarantined": 0}, "quarantined": []},
+        activity_events=[
+            {
+                "timestamp": now_iso,
+                "source": "scheduler",
+                "event": "QUARANTINED",
+                "ecosystem": "maven",
+                "component": "org.example/bad",
+                "version": "1.0.0",
+                "details": "replaced_by=1.0.1",
+            },
+            {
+                "timestamp": now_iso,
+                "source": "gc",
+                "event": "GC_UNUSED_REMOVED",
+                "ecosystem": "maven",
+                "component": "com.example:keepme",
+                "version": "1.0.0",
+                "details": "unused_days=95.0 ttl=90d",
+            },
+        ],
+        retention_data=ret_body,
+        hours=24,
+    )
+    assert "Cache Capacity & Runway:" in body
+    assert "Replaced / Upgraded Vulnerable Components" in body
+    assert "90-Day Inactivity Space Recovery:" in body
+    assert "[EXPIRING SOON] maven:com.example:keepme@1.1.0" in body
+    assert "[REMOVED] gc" not in body and "com.example:keepme@1.0.0" in body

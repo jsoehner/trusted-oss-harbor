@@ -63,7 +63,13 @@ class Settings(BaseSettings):
         default=3600, alias="CVE_RESCAN_INTERVAL_SECONDS"
     )
     gc_retention_versions: int = Field(
-        default=2, alias="GC_RETENTION_VERSIONS"
+        default=0, alias="GC_RETENTION_VERSIONS"
+    )
+    gc_max_unused_days: int = Field(
+        default=90, alias="GC_MAX_UNUSED_DAYS"
+    )
+    gc_warn_unused_days: int = Field(
+        default=75, alias="GC_WARN_UNUSED_DAYS"
     )
     gatekeeper_role: str = Field(default="all", alias="GATEKEEPER_ROLE")
     bus_url: str = Field(default="", alias="BUS_URL")

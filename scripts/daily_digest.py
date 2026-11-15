@@ -222,6 +222,12 @@ def main() -> int:
         activity_data = _fetch_json(
             f"{base}/audit/activity?limit={args.limit}", token=args.token
         )
+        try:
+            retention_data: dict[str, Any] | None = _fetch_json(
+                f"{base}/catalog/retention", token=args.token
+            )
+        except Exception:
+            retention_data = None
     except urllib.error.HTTPError as exc:
         print(f"ERROR: Gateway returned HTTP {exc.code}: {exc.reason}", file=sys.stderr)
         return 1
@@ -234,6 +240,7 @@ def main() -> int:
         health=health,
         vuln_data=vuln_data,
         activity_events=events,
+        retention_data=retention_data,
         hours=args.hours,
     )
 

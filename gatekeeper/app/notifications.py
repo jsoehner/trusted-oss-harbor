@@ -27,11 +27,21 @@ DEFAULT_TOKEN_CACHE_PATH = (
 )
 
 
+def _fmt_bytes(num: int | float) -> str:
+    val = float(max(0, num))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if val < 1024.0 or unit == "TB":
+            return f"{val:.1f} {unit}"
+        val /= 1024.0
+    return f"{val:.1f} TB"
+
+
 def build_daily_digest(
     *,
     health: dict[str, Any],
     vuln_data: dict[str, Any],
     activity_events: list[dict[str, Any]],
+    retention_data: dict[str, Any] | None = None,
     hours: int = 24,
 ) -> tuple[str, str, str]:
     """Build (subject, body_text, sms_text) for the daily supply chain summary."""
@@ -76,6 +86,71 @@ def build_daily_digest(
     ]
     if event_counts:
         lines.append("Event Breakdown   : " + ", ".join(f"{k}={v}" for k, v in sorted(event_counts.items())))
+
+    if retention_data:
+        ttl_days = int(retention_data.get("max_unused_days", 90))
+        disk_used = int(retention_data.get("disk_used_bytes", 0))
+        disk_total = int(retention_data.get("disk_total_bytes", 0))
+        disk_free = int(retention_data.get("disk_free_bytes", 0))
+        disk_pct = float(retention_data.get("disk_used_pct", 0.0))
+        cache_bytes = int(retention_data.get("cache_bytes", 0))
+        daily_growth = int(retention_data.get("daily_growth_bytes", 0))
+        est_days = retention_data.get("estimated_days_remaining")
+        runway_str = (
+            f"~{est_days} days at {_fmt_bytes(daily_growth)}/day"
+            if est_days is not None
+            else "steady (0 B/day net growth)"
+        )
+        lines.append("")
+        lines.append("Cache Capacity & Runway:")
+        lines.append(
+            f"  - Retention Policy : Keep clean until vulnerable or >{ttl_days}d unused"
+        )
+        lines.append(
+            f"  - Disk Usage       : {_fmt_bytes(disk_used)} / {_fmt_bytes(disk_total)} ({disk_pct:.1f}% used, {_fmt_bytes(disk_free)} free)"
+        )
+        lines.append(
+            f"  - Trusted Cache    : {_fmt_bytes(cache_bytes)} | Estimated Runway: {runway_str}"
+        )
+
+    replaced_events = [
+        ev
+        for ev in recent_events
+        if str(ev.get("event", "")) in {"QUARANTINED", "LATEST_TAG_UPDATED", "AUTO_REMEDIATE", "COMPONENT_REPLACED"}
+    ]
+    if replaced_events:
+        lines.append("")
+        lines.append(f"Replaced / Upgraded Vulnerable Components (last {hours}h):")
+        for ev in replaced_events[:15]:
+            lines.append(
+                f"  - {ev.get('ecosystem')}:{ev.get('component')}@{ev.get('version')} "
+                f"[{ev.get('event')}] {ev.get('details') or ''}"
+            )
+
+    unused_removed = [
+        ev
+        for ev in recent_events
+        if str(ev.get("event", "")) in {"GC_UNUSED_REMOVED", "GC_REMOVED"}
+    ]
+    expiring_soon = (retention_data or {}).get("expiring_soon") or []
+    expired_pending = (retention_data or {}).get("expired") or []
+    if unused_removed or expiring_soon or expired_pending:
+        lines.append("")
+        lines.append("90-Day Inactivity Space Recovery:")
+        for ev in unused_removed[:15]:
+            lines.append(
+                f"  - [REMOVED] {ev.get('ecosystem')}:{ev.get('component')}@{ev.get('version')} ({ev.get('details') or ''})"
+            )
+        for item in expired_pending[:15]:
+            lines.append(
+                f"  - [DUE FOR REMOVAL] {item.get('ecosystem')}:{item.get('component')}@{item.get('version')} "
+                f"(unused={item.get('unused_days')}d, size={_fmt_bytes(item.get('size_bytes', 0))})"
+            )
+        for item in expiring_soon[:15]:
+            lines.append(
+                f"  - [EXPIRING SOON] {item.get('ecosystem')}:{item.get('component')}@{item.get('version')} "
+                f"(unused={item.get('unused_days')}d, removes in {item.get('days_until_removal')}d, size={_fmt_bytes(item.get('size_bytes', 0))})"
+            )
 
     if quarantined:
         seen_q: set[tuple[str, str, str]] = set()
@@ -395,14 +470,19 @@ async def run_daily_digest_loop(
                     a_resp = await client.get(
                         f"{frontend_url}/audit/activity?limit=200", headers=headers
                     )
+                    r_resp = await client.get(
+                        f"{frontend_url}/catalog/retention", headers=headers
+                    )
                     h_resp.raise_for_status()
                     v_resp.raise_for_status()
                     a_resp.raise_for_status()
+                    retention_data = r_resp.json() if r_resp.status_code == 200 else None
 
                 subject, body_text, sms_text = build_daily_digest(
                     health=h_resp.json(),
                     vuln_data=v_resp.json(),
                     activity_events=a_resp.json().get("events", []),
+                    retention_data=retention_data,
                     hours=max(1, interval // 3600),
                 )
                 graph_token = await asyncio.to_thread(

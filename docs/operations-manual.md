@@ -1,6 +1,6 @@
-# Trusted OSS Supply Chain Platform — Operations Manual (`v1.1.2`)
+# Trusted OSS Supply Chain Platform — Operations Manual (`v1.2.0`)
 
-This manual documents every operational capability of `trusted-oss-harbor` (`v1.1.2`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack and the single-container **TrueNAS / NAS Appliance** image (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.1.2`), and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, and GitHub Actions projects.
+This manual documents every operational capability of `trusted-oss-harbor` (`v1.2.0`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack and the single-container **TrueNAS / NAS Appliance** image (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.2.0`), and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, and GitHub Actions projects.
 
 ---
 
@@ -201,7 +201,7 @@ PYTHONPATH=gatekeeper uv run --python 3.11 --with-requirements gatekeeper/requir
 
 ### 3.5 Daily Email & SMS Notifications (Outlook Port 587 / Graph 443 / SMS)
 
-When outbound port `25` is blocked and no local SMTP relay is available, `scripts/daily_digest.py` can send a daily summary of gateway health, vulnerability counts, and the last 24 hours of `/audit/activity` events using authenticated **Outlook / Microsoft 365 SMTP `STARTTLS` on port `587`**, **Microsoft Graph API over HTTPS port `443`**, **carrier Email-to-SMS** (via Outlook port 587), or **Twilio SMS over HTTPS port `443`**.
+`scripts/daily_digest.py` and the in-container `run_daily_digest_loop` summarize gateway health, vulnerability counts, **cache capacity & disk runway** (`GET /catalog/retention`), **replaced vulnerable components**, **90-day inactivity space recovery** (`GC_MAX_UNUSED_DAYS=90`, warning at `GC_WARN_UNUSED_DAYS=75`), and the last 24 hours of `/audit/activity` events. Clean cached components are retained until they become vulnerable or remain unaccessed for over 90 days.
 
 Preview the digest locally without sending:
 
@@ -251,7 +251,7 @@ Alternative HTTPS port `443` transports (recommended when **MFA is enabled** or 
      GRAPH_TENANT_ID=common
      GRAPH_REFRESH_TOKEN=<refresh_token_from_msgraph_token.json>
      ```
-  5. Or enable it in the single-container **TrueNAS / NAS Appliance** (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.1.2` or `:latest`, where `/data` is your persistent volume):
+  5. Or enable it in the single-container **TrueNAS / NAS Appliance** (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.2.0` or `:latest`, where `/data` is your persistent volume):
      ```yaml
      environment:
        - DIGEST_ENABLED=true
