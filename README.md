@@ -6,6 +6,8 @@ Self-hosted, containerized **Trusted Open-Source Software (OSS) Supply Chain Pla
 
 ## Architecture Overview
 
+![Trusted OSS Harbor End-to-End Architecture Infographic](docs/images/trusted-oss-architecture-infographic.png)
+
 ```mermaid
 flowchart LR
     Client["Developer / CI Client"] -->|":8080 /maven/virtual, /pypi/virtual, /v2/virtual, /jobs"| Gateway["Nginx Gateway (Wolfi)"]
