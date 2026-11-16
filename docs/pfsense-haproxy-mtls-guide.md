@@ -1,6 +1,6 @@
 # pfSense `2.9.0-RELEASE` Edge Security Guide: GitHub-Only mTLS Access to `trusted-oss-gatekeeper`
 
-- **Guide Version:** `2.3` (relocated alongside [`operations-manual.md`](operations-manual.md) with step-by-step WebGUI illustrations)
+- **Guide Version:** `2.4` (relocated alongside [`operations-manual.md`](operations-manual.md) with step-by-step WebGUI illustrations)
 - **Target Firewall Platform:** pfSense `2.9.0-RELEASE (amd64)` (built `Fri Aug 28 13:53:00 EDT 2026`, `FreeBSD 16.0-CURRENT`)
 - **Required pfSense Packages:** `acme`, `haproxy`, `cron` (**System $\rightarrow$ Package Manager**)
 
@@ -115,7 +115,10 @@ Navigate to **Firewall $\rightarrow$ Rules $\rightarrow$ WAN $\rightarrow$ + Add
 
 ![Step 2.2 — WAN Firewall Rule GitHub Only](images/pfsense-03-wan-rule-github-only.png)
 
-> **Important:** Ensure there is **no** `Any` source rule on WAN port `443`. All non-GitHub IPs are dropped by pfSense's default WAN deny rule. For local LAN workstation access (e.g., `scripts/prime_cache.py` or local `mvn`/`uv`), connect directly to `http://<TRUENAS_LAN_IP>:8080` or `http://oss.jsigroup.local:8080` over your LAN/VPN.
+> **Important:**
+> - Ensure there is **no** `Any` source rule on WAN port `443`. All non-GitHub IPs are dropped by pfSense's default WAN deny rule.
+> - **Upstream ISP Router / Double-NAT (e.g., Bell Giga Hub):** If pfSense's WAN IP is behind an ISP router (such as `192.168.2.15` behind `192.168.2.1`), forward TCP `443` on the ISP router to pfSense's **active** WAN IP/MAC (remove or avoid stale device entries), or enable DMZ / IP Passthrough.
+> - For local LAN workstation access (e.g., `scripts/prime_cache.py` or local `mvn`/`uv`), connect directly to `http://<TRUENAS_LAN_IP>:8080` or `http://oss.jsigroup.local:8080` over your LAN/VPN.
 
 ---
 
@@ -133,8 +136,10 @@ Install the **acme** package (**System $\rightarrow$ Package Manager $\rightarro
 
 ![Step 3.1 — ACME Account Key](images/pfsense-04a-acme-account-key.png)
 
-### 3.2 Create a Scoped Cloudflare API Token (for DNS-01 Validation)
-If your domain's DNS is hosted on Cloudflare, create a least-privilege API Token (do **not** use the Global API Key):
+### 3.2 DNS Provider Setup (Cloudflare Free Plan or Free DuckDNS)
+
+#### Option A: Scoped Cloudflare API Token (Recommended for Custom Domains)
+If your domain's DNS is hosted on Cloudflare (Free plan is $0/month), create a least-privilege API Token (do **not** use the Global API Key):
 1. Sign in to **Cloudflare Dashboard** (`https://dash.cloudflare.com/profile/api-tokens`) and click **+ Create Token**.
 2. Choose **Use template** next to **`Edit zone DNS`**.
 3. Configure **Permissions**:
@@ -144,6 +149,18 @@ If your domain's DNS is hosted on Cloudflare, create a least-privilege API Token
    - `Include` $\rightarrow$ `Specific zone` $\rightarrow$ `<yourdomain.com>`
 5. Click **Continue to summary** $\rightarrow$ **Create Token**, and copy the generated **API Token** (shown only once).
 6. Open your domain's **Overview** page in Cloudflare and copy the **Zone ID** (and **Account ID** if issuing for multiple zones) from the right-hand **API** sidebar.
+
+*(If you also use an existing DDNS hostname like `yourname.ddns.net`, create a `CNAME` `oss.yourdomain.com -> yourname.ddns.net` in Cloudflare set to **DNS only / grey cloud** — never proxied/orange-cloud, which would strip mTLS.)*
+
+#### Option B: Free DuckDNS (`<yourname>.duckdns.org`, No Custom Domain Required)
+1. Create a free subdomain and copy your **token** at `https://www.duckdns.org/`.
+2. In pfSense **Services $\rightarrow$ Dynamic DNS $\rightarrow$ + Add**:
+   - **Service Type**: `Custom`
+   - **Interface to monitor**: `WAN`
+   - **Update URL**: `https://www.duckdns.org/update?domains=<your-subdomain>&token=<YOUR_DUCKDNS_TOKEN>&ip=%IP%`
+   - **Result Match**: `OK`
+   - Click **Save & Force Update**.
+3. In Step 3.3 below, choose **Validation Method**: **`DNS-DuckDNS`** and paste your DuckDNS **API Token**.
 
 ### 3.3 Create & Issue the Server Certificate (`Services → ACME → Certificates`)
 1. Navigate to **Services $\rightarrow$ ACME $\rightarrow$ Certificates $\rightarrow$ + Add**:
@@ -172,6 +189,8 @@ If your domain's DNS is hosted on Cloudflare, create a least-privilege API Token
 ---
 
 ## Step 4: Configure HAProxy (`Services → HAProxy`)
+
+> **Prerequisite — Free Port `443` from pfSense WebConfigurator:** By default, pfSense's own WebGUI (`nginx`) binds `*:443`, which prevents HAProxy from binding `WAN:443`. Go to **System $\rightarrow$ Advanced $\rightarrow$ Admin Access**, change **TCP port** from `443` to `8443` (or switch **Protocol** to `HTTP`), and click **Save** before starting HAProxy.
 
 Install the **haproxy** package and enable it under **Services $\rightarrow$ HAProxy $\rightarrow$ Settings**.
 

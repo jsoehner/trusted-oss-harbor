@@ -6,6 +6,7 @@
 *.pfx
 config/harbor/harbor.yml
 keys/
+mtls-pki/
 
 # Local Storage / Runtime Data
 data/
