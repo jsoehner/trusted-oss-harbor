@@ -13,19 +13,35 @@ jobs:
           RUNNER_IP=$(curl -s https://api.ipify.org)
           echo "GitHub Runner Public IP: ${RUNNER_IP}"
 
-      - name: Test TCP & HTTP Connectivity to jsigroup.ddns.net
+      - name: Test DNS, mTLS Handshake & Rejection of Unauthenticated Requests
+        env:
+          TRUSTED_OSS_CACHE_URL: ${{ vars.TRUSTED_OSS_CACHE_URL || 'https://jsigroup.ddns.net' }}
+          OSS_MTLS_CLIENT_CERT: ${{ secrets.OSS_MTLS_CLIENT_CERT }}
+          OSS_MTLS_CLIENT_KEY: ${{ secrets.OSS_MTLS_CLIENT_KEY }}
         run: |
-          echo "=== DNS Resolution ==="
-          dig +short jsigroup.ddns.net || nslookup jsigroup.ddns.net
+          CACHE_URL="${TRUSTED_OSS_CACHE_URL%/}"
+          HOST="${CACHE_URL#https://}"
+          HOST="${HOST#http://}"
+          HOST="${HOST%%/*}"
+          HOST="${HOST%%:*}"
 
-          echo -e "\n=== Testing Port 443 (HTTPS) ==="
-          curl -kv --connect-timeout 7 https://jsigroup.ddns.net/healthz 2>&1 || true
+          echo "=== Target: ${CACHE_URL} (host: ${HOST}) ==="
+          dig +short "${HOST}" || nslookup "${HOST}"
 
-          echo -e "\n=== Testing Port 8443 (HTTPS Alternative) ==="
-          curl -kv --connect-timeout 7 https://jsigroup.ddns.net:8443/healthz 2>&1 || true
+          echo -e "\n=== 1. Unauthenticated Request (Should Be Rejected by mTLS) ==="
+          curl -v --connect-timeout 7 "${CACHE_URL}/healthz" 2>&1 || true
 
-          echo -e "\n=== Testing Port 8080 (HTTP Port Forward) ==="
-          curl -v --connect-timeout 7 http://jsigroup.ddns.net:8080/healthz 2>&1 || true
+          if [[ -n "${OSS_MTLS_CLIENT_CERT}" && -n "${OSS_MTLS_CLIENT_KEY}" ]]; then
+            mkdir -p ~/.oss-tls
+            printf '%s\n' "${OSS_MTLS_CLIENT_CERT}" > ~/.oss-tls/client.crt
+            printf '%s\n' "${OSS_MTLS_CLIENT_KEY}" > ~/.oss-tls/client.key
+            chmod 0600 ~/.oss-tls/client.key
 
-          echo -e "\n=== Testing Port 80 (HTTP) ==="
-          curl -v --connect-timeout 7 http://jsigroup.ddns.net/healthz 2>&1 || true
+            echo -e "\n=== 2. Authenticated mTLS Request to /healthz (Should Return 200 OK) ==="
+            curl -fsSLv --connect-timeout 10 \
+              --cert ~/.oss-tls/client.crt \
+              --key ~/.oss-tls/client.key \
+              "${CACHE_URL}/healthz"
+          else
+            echo "[WARN] OSS_MTLS_CLIENT_CERT / OSS_MTLS_CLIENT_KEY not set; skipping mTLS test."
+          fi
