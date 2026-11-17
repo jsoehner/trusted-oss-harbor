@@ -9,3 +9,4 @@
 | [0005](0005-daily-digest-oauth2-notifications.md) | Standalone and Engine-Scheduled Daily Digest Notifications via Microsoft Graph OAuth2 | Accepted | 2026-11-15 |
 | [0006](0006-inactivity-ttl-cache-retention-and-runway-digest.md) | Inactivity-TTL Cache Retention (90-Day) and Capacity Runway Digest | Accepted | 2026-11-15 |
 | [0007](0007-pfsense-github-mtls-and-opt-in-cache-routing.md) | pfSense GitHub-Only mTLS Ingress and Opt-In Per-Repo Cache Routing | Accepted | 2026-11-15 |
+| [0008](0008-digest-artifact-telemetry-and-scheduled-lan-priming.md) | Daily Digest Artifact Activity Telemetry and Scheduled LAN Cache Priming | Accepted | 2026-11-17 |

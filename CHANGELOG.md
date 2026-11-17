@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Daily Digest Artifact Activity Telemetry**: Emits `ARTIFACT_REQUESTED` (`HIT`/`MISS`), `NEW_ARTIFACT_ADDED`, and `NEW_VERSION_ADDED` events in `gatekeeper/app/main.py` and reports `Requested`, `New Artifacts`, and `New Versions` in `build_daily_digest` (`gatekeeper/app/notifications.py`).
+- **Scheduled LAN Cache Primer (`scripts/install_prime_timer.sh`)**: Installs `trusted-oss-prime.timer` (`systemd --user`, daily at `06:00`) to run `scripts/prime_cache.py` against `http://oss.jsigroup.local:8080`.
+- **Architecture Infographics & ADR-0008**: Added `docs/images/trusted-oss-dataflow-hardware-infographic.png` and `docs/images/trusted-oss-architecture-infographic.png` to `README.md`, and recorded [ADR 0008](docs/adr/0008-digest-artifact-telemetry-and-scheduled-lan-priming.md).
+
 ## [1.4.0] - 2026-11-15
 
 ### Added
