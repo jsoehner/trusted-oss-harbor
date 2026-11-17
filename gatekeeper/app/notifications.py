@@ -71,10 +71,23 @@ def build_daily_digest(
         name = str(ev.get("event", "UNKNOWN"))
         event_counts[name] = event_counts.get(name, 0) + 1
 
+    requested_events = [
+        ev for ev in recent_events if str(ev.get("event", "")) == "ARTIFACT_REQUESTED"
+    ]
+    req_hits = sum(1 for ev in requested_events if "cache=HIT" in str(ev.get("details", "")))
+    req_misses = len(requested_events) - req_hits
+    new_artifact_events = [
+        ev for ev in recent_events if str(ev.get("event", "")) == "NEW_ARTIFACT_ADDED"
+    ]
+    new_version_events = [
+        ev for ev in recent_events if str(ev.get("event", "")) == "NEW_VERSION_ADDED"
+    ]
+
     date_str = now.strftime("%Y-%m-%d")
     subject = (
         f"[Trusted-OSS] Daily Digest {date_str}: "
-        f"CLEAN={clean} UNSCANNED={unscanned} QUARANTINED={q_count}"
+        f"CLEAN={clean} UNSCANNED={unscanned} QUARANTINED={q_count} "
+        f"REQ={len(requested_events)} NEW={len(new_artifact_events)} NEW_VER={len(new_version_events)}"
     )
 
     lines = [
@@ -82,10 +95,27 @@ def build_daily_digest(
         f"Status: {health.get('status', 'unknown')} | Role: {health.get('role', 'all')} | CVSS Threshold: >= {threshold}",
         "",
         f"Cached Components : Total={total} | CLEAN={clean} | UNSCANNED={unscanned} | QUARANTINED={q_count}",
+        (
+            f"Artifact Activity (last {hours}h): "
+            f"Requested={len(requested_events)} (hits={req_hits}, misses={req_misses}) | "
+            f"New Artifacts={len(new_artifact_events)} | New Versions={len(new_version_events)}"
+        ),
         f"Events (last {hours}h) : {len(recent_events)}",
     ]
     if event_counts:
         lines.append("Event Breakdown   : " + ", ".join(f"{k}={v}" for k, v in sorted(event_counts.items())))
+
+    if new_artifact_events or new_version_events:
+        lines.append("")
+        lines.append(f"New Artifacts & Versions Added (last {hours}h):")
+        for ev in new_artifact_events[:10]:
+            lines.append(
+                f"  - [NEW ARTIFACT] {ev.get('ecosystem')}:{ev.get('component')}@{ev.get('version')}"
+            )
+        for ev in new_version_events[:10]:
+            lines.append(
+                f"  - [NEW VERSION]  {ev.get('ecosystem')}:{ev.get('component')}@{ev.get('version')}"
+            )
 
     if retention_data:
         ttl_days = int(retention_data.get("max_unused_days", 90))
@@ -192,7 +222,8 @@ def build_daily_digest(
 
     sms_text = (
         f"Trusted-OSS {date_str}: Total={total} CLEAN={clean} UNSCANNED={unscanned} "
-        f"QUAR={q_count} Events({hours}h)={len(recent_events)}"
+        f"QUAR={q_count} Events({hours}h)={len(recent_events)} "
+        f"REQ={len(requested_events)} NEW={len(new_artifact_events)}+{len(new_version_events)}v"
     )
     return subject, "\n".join(lines), sms_text[:160]
 

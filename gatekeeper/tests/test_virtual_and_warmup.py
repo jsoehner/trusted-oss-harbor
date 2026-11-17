@@ -915,3 +915,40 @@ def test_configure_trusted_cache_switches_between_public_and_trusted_url(tmp_pat
     assert "PIP_INDEX_URL=" not in reverted_env
     assert "BASE_IMAGE=cgr.dev/chainguard/wolfi-base:latest" in reverted_env
 
+
+def test_digest_reports_requested_new_artifacts_and_new_versions(tmp_path) -> None:
+    from datetime import datetime, timezone
+    from app.main import _has_existing_component_versions, _record_artifact_requested
+    from app.notifications import build_daily_digest
+    from app.activity import read_activity_events
+
+    settings = Settings(oss_data_root=tmp_path)
+    first_whl = settings.trusted_pypi_dir / "demo-pkg" / "demo_pkg-1.0.0-py3-none-any.whl"
+    first_whl.parent.mkdir(parents=True, exist_ok=True)
+    assert _has_existing_component_versions(first_whl, "pypi") is False
+    first_whl.write_bytes(b"whl-v1")
+
+    second_whl = settings.trusted_pypi_dir / "demo-pkg" / "demo_pkg-1.1.0-py3-none-any.whl"
+    assert _has_existing_component_versions(second_whl, "pypi") is True
+
+    _record_artifact_requested(settings, "pypi", "demo-pkg/demo_pkg-1.0.0-py3-none-any.whl", "HIT")
+    _record_artifact_requested(settings, "pypi", "demo-pkg/demo_pkg-1.1.0-py3-none-any.whl", "MISS")
+    events = read_activity_events(settings.activity_log_path)
+    assert len(events) == 2
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sample_events = events + [
+        {"timestamp": now_iso, "event": "NEW_ARTIFACT_ADDED", "ecosystem": "pypi", "component": "demo-pkg", "version": "1.0.0"},
+        {"timestamp": now_iso, "event": "NEW_VERSION_ADDED", "ecosystem": "pypi", "component": "demo-pkg", "version": "1.1.0"},
+    ]
+    subject, body, sms = build_daily_digest(
+        health={"status": "ok", "role": "all", "cvss_fail_threshold": 7.0},
+        vuln_data={"summary": {"total": 2, "clean": 2, "unscanned": 0, "quarantined": 0}, "quarantined": []},
+        activity_events=sample_events,
+    )
+    assert "REQ=2 NEW=1 NEW_VER=1" in subject
+    assert "Artifact Activity (last 24h): Requested=2 (hits=1, misses=1) | New Artifacts=1 | New Versions=1" in body
+    assert "[NEW ARTIFACT] pypi:demo-pkg@1.0.0" in body
+    assert "[NEW VERSION]  pypi:demo-pkg@1.1.0" in body
+    assert "REQ=2 NEW=1+1v" in sms
+

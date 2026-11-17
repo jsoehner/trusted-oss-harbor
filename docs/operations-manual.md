@@ -195,6 +195,14 @@ GATEKEEPER_ADMIN_TOKEN="<token>" \
 
 Use `--roots /path/to/new-project` to scope discovery to a specific directory, or `--json` for machine-readable output.
 
+To schedule this automatically every day against your LAN server (`http://oss.jsigroup.local:8080`), install the systemd user timer:
+
+```bash
+./scripts/install_prime_timer.sh http://oss.jsigroup.local:8080
+```
+
+This creates `~/.config/systemd/user/trusted-oss-prime.service` and `trusted-oss-prime.timer` (running daily at `06:00` local time, reading `GATEKEEPER_ADMIN_TOKEN` from `~/.config/trusted-oss-harbor/prime.env`).
+
 ### 3.3 Storage & Scanner Cache Inspection
 
 Inspect the backing storage directory (`/home/jsoehner/trusted-oss-data` or TrueNAS iSCSI mount), GPG/ML-DSA keys, NVD/ClamAV/Trivy caches, and quarantine count:

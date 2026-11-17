@@ -439,6 +439,54 @@ def _save_dynamic_catalog(settings: Settings, catalog: dict[str, Any]) -> str:
     return ""
 
 
+def _has_existing_component_versions(dest_file: Path, ecosystem: str) -> bool:
+    """Return True if another version of this component already exists in trusted storage."""
+    eco = ecosystem.lower()
+    if eco == "maven":
+        artifact_dir = dest_file.parent.parent
+        current_ver_dir = dest_file.parent.name
+        if not artifact_dir.exists():
+            return False
+        return any(p.is_dir() and p.name != current_ver_dir for p in artifact_dir.iterdir())
+    if eco == "pypi":
+        pkg_dir = dest_file.parent
+        if not pkg_dir.exists():
+            return False
+        return any(
+            p.is_file()
+            and p.name != dest_file.name
+            and p.suffix.lower() in {".whl", ".gz", ".zip", ".tgz"}
+            for p in pkg_dir.iterdir()
+        )
+    if eco == "oci":
+        manifests_dir = dest_file.parent
+        if not manifests_dir.exists():
+            return False
+        return any(
+            p.is_file()
+            and p.name != dest_file.name
+            and not p.name.endswith((".asc", ".mldsa65"))
+            for p in manifests_dir.iterdir()
+        )
+    return False
+
+
+def _record_artifact_requested(
+    settings: Settings, ecosystem: str, artifact_rel_path: str, cache_status: str
+) -> None:
+    """Record an ARTIFACT_REQUESTED activity event for daily digest reporting."""
+    pkg_name, pkg_version = extract_package_coordinates(ecosystem, artifact_rel_path)
+    append_activity_event(
+        settings.activity_log_path,
+        source="virtual_proxy",
+        event="ARTIFACT_REQUESTED",
+        ecosystem=ecosystem,
+        component=pkg_name or artifact_rel_path,
+        version=pkg_version or "unknown",
+        details=f"cache={cache_status} artifact={artifact_rel_path}",
+    )
+
+
 async def quarantine_scan_sign_and_promote(
     staged_file: Path,
     dest_file: Path,
@@ -500,6 +548,7 @@ async def quarantine_scan_sign_and_promote(
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     digests = compute_digests(staged_file)
+    has_existing_component = _has_existing_component_versions(dest_file, ecosystem)
     atomic_promote_artifact(
         staged_file=staged_file,
         sig_file=sig_file,
@@ -511,6 +560,16 @@ async def quarantine_scan_sign_and_promote(
     sig_file.unlink(missing_ok=True)
     if pqc_sig_file:
         pqc_sig_file.unlink(missing_ok=True)
+
+    append_activity_event(
+        settings.activity_log_path,
+        source="gatekeeper",
+        event="NEW_VERSION_ADDED" if has_existing_component else "NEW_ARTIFACT_ADDED",
+        ecosystem=ecosystem,
+        component=pkg_name or artifact_rel_path,
+        version=pkg_version or "unknown",
+        details=f"artifact={artifact_rel_path} sha256={digests.sha256[:12]}",
+    )
 
     record = append_provenance_record(
         provenance_log_path=settings.provenance_log_path,
@@ -576,6 +635,7 @@ async def ensure_maven_artifact_cached(
     base_file = resolve_safe_relative_path(settings.trusted_maven_dir, base_rel_path)
     if base_file.exists():
         logger.info("[CACHE] HIT ecosystem=maven artifact=%s", base_rel_path)
+        _record_artifact_requested(settings, "maven", base_rel_path, "HIT")
         return base_file, "HIT"
 
     if not settings.auto_promote_clean_artifacts:
@@ -621,6 +681,7 @@ async def ensure_maven_artifact_cached(
             artifact_rel_path=base_rel_path,
             settings=settings,
         )
+        _record_artifact_requested(settings, "maven", base_rel_path, "MISS")
         return base_file, "MISS"
 
 
@@ -635,6 +696,7 @@ async def ensure_pypi_artifact_cached(
     base_file = resolve_safe_relative_path(settings.trusted_pypi_dir, base_rel_path)
     if base_file.exists():
         logger.info("[CACHE] HIT ecosystem=pypi artifact=%s", base_rel_path)
+        _record_artifact_requested(settings, "pypi", base_rel_path, "HIT")
         return base_file, "HIT"
 
     if not settings.auto_promote_clean_artifacts:
@@ -698,6 +760,7 @@ async def ensure_pypi_artifact_cached(
             artifact_rel_path=base_rel_path,
             settings=settings,
         )
+        _record_artifact_requested(settings, "pypi", base_rel_path, "MISS")
         return base_file, "MISS"
 
 
@@ -719,6 +782,7 @@ async def ensure_oci_manifest_cached(
     base_file = resolve_safe_relative_path(cache_root, rel_manifest_path)
     if base_file.exists():
         logger.info("[CACHE] HIT ecosystem=oci namespace=%s artifact=%s", cache_namespace, rel_manifest_path)
+        _record_artifact_requested(settings, "oci", rel_manifest_path, "HIT")
         return base_file, "HIT"
 
     if not settings.auto_promote_clean_artifacts:
@@ -745,6 +809,7 @@ async def ensure_oci_manifest_cached(
             artifact_rel_path=f"{cache_namespace}/{rel_manifest_path}",
             settings=settings,
         )
+        _record_artifact_requested(settings, "oci", rel_manifest_path, "MISS")
         return base_file, "MISS"
 
 
