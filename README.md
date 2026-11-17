@@ -6,6 +6,8 @@ Self-hosted, containerized **Trusted Open-Source Software (OSS) Supply Chain Pla
 
 ## Architecture Overview
 
+![Trusted OSS Harbor Hardware & Data Flow Architecture](docs/images/trusted-oss-dataflow-hardware-infographic.png)
+
 ![Trusted OSS Harbor End-to-End Architecture Infographic](docs/images/trusted-oss-architecture-infographic.png)
 
 ```mermaid
