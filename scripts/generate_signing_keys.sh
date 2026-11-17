@@ -20,13 +20,13 @@ OSS_DATA_ROOT="${CALLER_OSS_DATA_ROOT:-${OSS_DATA_ROOT:-/home/jsoehner/trusted-o
 GNUPGHOME="${OSS_DATA_ROOT}/keys/gnupg"
 PUBLIC_KEYS_DIR="${OSS_DATA_ROOT}/keys/public"
 GPG_KEY_NAME="${GPG_KEY_NAME:-Trusted OSS Supply Chain Authority}"
-GPG_KEY_EMAIL="${GPG_KEY_EMAIL:-oss-signing@example.com}"
+GPG_KEY_EMAIL="${GPG_KEY_EMAIL:-oss-signing@the-techy.com}"
 
 mkdir -p "${GNUPGHOME}" "${PUBLIC_KEYS_DIR}" "${OSS_DATA_ROOT}/keys/cosign"
 chmod 0700 "${GNUPGHOME}" "${OSS_DATA_ROOT}/keys/cosign"
 export GNUPGHOME
 
-if ! gpg --batch --list-secret-keys --with-colons | grep -q "^sec:"; then
+if ! gpg --batch --list-secret-keys --with-colons "${GPG_KEY_EMAIL}" 2>/dev/null | grep -q "^sec:"; then
   echo "[INFO] Generating RSA-3072 GPG Signing Key for ${GPG_KEY_NAME} <${GPG_KEY_EMAIL}>..."
   gpg --batch --generate-key <<EOF
 %no-protection

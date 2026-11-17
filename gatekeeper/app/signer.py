@@ -125,7 +125,7 @@ def ensure_gpg_signing_key(
     gnupghome: Path,
     public_keys_dir: Path,
     key_name: str = "Trusted OSS Supply Chain Authority",
-    key_email: str = "oss-signing@example.com",
+    key_email: str = "oss-signing@the-techy.com",
 ) -> Path:
     """Ensure a GPG signing key exists in gnupghome and export trusted-oss-pubkey.asc."""
     gnupghome.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -135,7 +135,7 @@ def ensure_gpg_signing_key(
 
     env = {**os.environ, "GNUPGHOME": str(gnupghome)}
     list_proc = subprocess.run(
-        ["gpg", "--batch", "--list-secret-keys", "--with-colons"],
+        ["gpg", "--batch", "--list-secret-keys", "--with-colons", key_email],
         env=env,
         capture_output=True,
         text=True,
@@ -180,6 +180,7 @@ def sign_artifact_detached_gpg(
     artifact_path: Path,
     gnupghome: Path,
     passphrase: str = "",
+    key_id: str = "",
 ) -> Path:
     """Create a detached ASCII-armored GPG signature (.asc) and verify it before returning."""
     sig_path = artifact_path.with_name(f"{artifact_path.name}.asc")
@@ -193,9 +194,10 @@ def sign_artifact_detached_gpg(
         "--yes",
         "--armor",
         "--detach-sign",
-        "--output",
-        str(sig_path),
     ]
+    if key_id:
+        cmd.extend(["--local-user", key_id])
+    cmd.extend(["--output", str(sig_path)])
     if passphrase:
         cmd.extend(["--pinentry-mode", "loopback", "--passphrase", passphrase])
     cmd.append(str(artifact_path))

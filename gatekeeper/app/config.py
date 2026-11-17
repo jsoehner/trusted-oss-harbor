@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     gnupghome: Path = Field(
         default=Path("/home/jsoehner/trusted-oss-data/keys/gnupg"), alias="GNUPGHOME"
     )
+    gpg_key_name: str = Field(
+        default="Trusted OSS Supply Chain Authority", alias="GPG_KEY_NAME"
+    )
+    gpg_key_email: str = Field(
+        default="oss-signing@the-techy.com", alias="GPG_KEY_EMAIL"
+    )
     gpg_key_id: str = Field(default="", alias="GPG_KEY_ID")
     gpg_passphrase: str = Field(default="", alias="GPG_PASSPHRASE")
     cosign_private_key_path: Path = Field(

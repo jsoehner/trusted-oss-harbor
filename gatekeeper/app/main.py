@@ -111,6 +111,8 @@ def initialize_storage_and_keys(settings: Settings) -> Path:
     return ensure_gpg_signing_key(
         gnupghome=settings.gnupghome,
         public_keys_dir=settings.public_keys_dir,
+        key_name=settings.gpg_key_name,
+        key_email=settings.gpg_key_email,
     )
 
 
@@ -479,6 +481,7 @@ async def quarantine_scan_sign_and_promote(
             artifact_path=staged_file,
             gnupghome=settings.gnupghome,
             passphrase=settings.gpg_passphrase,
+            key_id=settings.gpg_key_id or settings.gpg_key_email,
         )
     except SigningError as exc:
         staged_file.unlink(missing_ok=True)

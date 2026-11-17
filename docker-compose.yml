@@ -70,6 +70,10 @@ services:
       UPSTREAM_MAVEN_URL: ${UPSTREAM_MAVEN_URL:-https://repo.maven.apache.org/maven2}
       UPSTREAM_PYPI_SIMPLE_URL: ${UPSTREAM_PYPI_SIMPLE_URL:-https://pypi.org/simple}
       GNUPGHOME: /data/trusted-oss/keys/gnupg
+      GPG_KEY_NAME: ${GPG_KEY_NAME:-Trusted OSS Supply Chain Authority}
+      GPG_KEY_EMAIL: ${GPG_KEY_EMAIL:-oss-signing@the-techy.com}
+      GPG_KEY_ID: ${GPG_KEY_ID:-}
+      GPG_PASSPHRASE: ${GPG_PASSPHRASE:-}
       COSIGN_PRIVATE_KEY_PATH: /data/trusted-oss/keys/cosign/cosign.key
       COSIGN_PUBLIC_KEY_PATH: /data/trusted-oss/keys/cosign/cosign.pub
       COSIGN_PASSWORD: ${COSIGN_PASSWORD:-}
@@ -122,6 +126,10 @@ services:
       UPSTREAM_MAVEN_URL: ${UPSTREAM_MAVEN_URL:-https://repo.maven.apache.org/maven2}
       UPSTREAM_PYPI_SIMPLE_URL: ${UPSTREAM_PYPI_SIMPLE_URL:-https://pypi.org/simple}
       GNUPGHOME: /data/trusted-oss/keys/gnupg
+      GPG_KEY_NAME: ${GPG_KEY_NAME:-Trusted OSS Supply Chain Authority}
+      GPG_KEY_EMAIL: ${GPG_KEY_EMAIL:-oss-signing@the-techy.com}
+      GPG_KEY_ID: ${GPG_KEY_ID:-}
+      GPG_PASSPHRASE: ${GPG_PASSPHRASE:-}
       COSIGN_PRIVATE_KEY_PATH: /data/trusted-oss/keys/cosign/cosign.key
       COSIGN_PUBLIC_KEY_PATH: /data/trusted-oss/keys/cosign/cosign.pub
       COSIGN_PASSWORD: ${COSIGN_PASSWORD:-}
