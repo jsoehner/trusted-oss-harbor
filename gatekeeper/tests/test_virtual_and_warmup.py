@@ -422,7 +422,8 @@ def test_job_bus_async_remediation_and_frontend_role(tmp_path, monkeypatch):
         hz = client.get("/healthz")
         assert hz.status_code == 200
         hz_body = hz.json()
-        assert hz_body["version"] == "1.4.0"
+        expected_version = (Path(__file__).resolve().parents[2] / "VERSION").read_text(encoding="utf-8").strip()
+        assert hz_body["version"] == app.version == expected_version
         assert hz_body["role"] == "frontend"
         assert hz_body["bus_backend"] == "memory"
 
@@ -721,7 +722,8 @@ def test_lifespan_with_digest_enabled_starts_cleanly(tmp_path, monkeypatch):
     with TestClient(app) as client:
         resp = client.get("/healthz")
         assert resp.status_code == 200
-        assert resp.json()["version"] == "1.4.0"
+        expected_version = (Path(__file__).resolve().parents[2] / "VERSION").read_text(encoding="utf-8").strip()
+        assert resp.json()["version"] == app.version == expected_version
 
 
 def test_keep_clean_versions_and_90_day_unused_ttl_gc_and_retention_digest(tmp_path):
