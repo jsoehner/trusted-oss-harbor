@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import html
 import json
 import logging
 import os
@@ -228,6 +229,176 @@ def build_daily_digest(
     return subject, "\n".join(lines), sms_text[:160]
 
 
+def render_daily_digest_html(
+    *,
+    subject: str,
+    body_text: str,
+    health: dict[str, Any],
+    vuln_data: dict[str, Any],
+    activity_events: list[dict[str, Any]],
+    retention_data: dict[str, Any] | None = None,
+    hours: int = 24,
+) -> str:
+    """Render an Outlook/M365/Gmail-compatible inline-CSS HTML email for the daily digest."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    summary = vuln_data.get("summary") or {}
+    quarantined = vuln_data.get("quarantined") or []
+    clean = int(summary.get("clean", 0))
+    unscanned = int(summary.get("unscanned", 0))
+    q_count = int(summary.get("quarantined", len(quarantined)))
+    total = int(summary.get("total", clean + unscanned + q_count))
+    status_str = str(health.get("status", "unknown"))
+    role_str = str(health.get("role", "all"))
+
+    if q_count > 0 or status_str.lower() not in ("ok", "healthy"):
+        badge_bg, badge_fg, badge_label, accent = "#d97706", "#ffffff", "ATTENTION", "#d97706"
+    else:
+        badge_bg, badge_fg, badge_label, accent = "#059669", "#ffffff", "ALL HEALTHY", "#059669"
+
+    sections_html: list[str] = []
+    if retention_data:
+        disk_used = _fmt_bytes(int(retention_data.get("disk_used_bytes", 0)))
+        disk_total = _fmt_bytes(int(retention_data.get("disk_total_bytes", 0)))
+        disk_free = _fmt_bytes(int(retention_data.get("disk_free_bytes", 0)))
+        disk_pct = float(retention_data.get("disk_used_pct", 0.0))
+        cache_size = _fmt_bytes(int(retention_data.get("cache_bytes", 0)))
+        est_days = retention_data.get("estimated_days_remaining")
+        runway = f"~{est_days} days" if est_days is not None else "steady (0 B/day growth)"
+        sections_html.append(
+            '<div style="margin-top:16px;">'
+            '<div style="font-size:12px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;color:#475569;margin-bottom:8px;">Cache Capacity &amp; Runway</div>'
+            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;border-collapse:separate;">'
+            f'<tr style="background:#ffffff;"><td style="padding:9px 14px;border-bottom:1px solid #e2e8f0;font-size:12px;font-weight:700;color:#475569;width:160px;">Disk Usage</td>'
+            f'<td style="padding:9px 14px;border-bottom:1px solid #e2e8f0;font-size:13px;color:#1e293b;">{html.escape(disk_used)} / {html.escape(disk_total)} ({disk_pct:.1f}% used, {html.escape(disk_free)} free)</td></tr>'
+            f'<tr style="background:#f8fafc;"><td style="padding:9px 14px;font-size:12px;font-weight:700;color:#475569;">Trusted Cache</td>'
+            f'<td style="padding:9px 14px;font-size:13px;color:#1e293b;">{html.escape(cache_size)} &nbsp;|&nbsp; Estimated Runway: {html.escape(runway)}</td></tr>'
+            "</table></div>"
+        )
+
+    if quarantined:
+        q_rows: list[str] = []
+        seen: set[tuple[str, str, str]] = set()
+        for q in quarantined:
+            key = (str(q.get("ecosystem", "")), str(q.get("component", "")), str(q.get("version", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            cves = ", ".join(q.get("cve_ids") or []) or "none"
+            bg = "#ffffff" if len(q_rows) % 2 == 0 else "#f8fafc"
+            q_rows.append(
+                f'<tr style="background:{bg};">'
+                f'<td style="padding:9px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;color:#991b1b;font-weight:700;">{html.escape(key[0])}:{html.escape(key[1])}@{html.escape(key[2])}</td>'
+                f'<td style="padding:9px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;color:#1e293b;">CVSS {float(q.get("max_cvss", 0.0)):.1f} &bull; {html.escape(cves)}</td>'
+                f"</tr>"
+            )
+            if len(q_rows) >= 15:
+                break
+        sections_html.append(
+            '<div style="margin-top:16px;">'
+            '<div style="font-size:12px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;color:#991b1b;margin-bottom:8px;">Quarantined (Vulnerable) Components</div>'
+            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #fecaca;border-radius:8px;overflow:hidden;border-collapse:separate;">'
+            + "".join(q_rows)
+            + "</table></div>"
+        )
+
+    if activity_events:
+        ev_rows: list[str] = []
+        for idx, ev in enumerate(activity_events[:20]):
+            bg = "#ffffff" if idx % 2 == 0 else "#f8fafc"
+            ev_name = html.escape(str(ev.get("event", "EVENT")))
+            ts = html.escape(str(ev.get("timestamp", ""))[:19])
+            target = f"{ev.get('ecosystem') or '-'}:{ev.get('component') or '-'}@{ev.get('version') or '-'}"
+            details = html.escape(str(ev.get("details") or ""))
+            ev_rows.append(
+                f'<tr style="background:{bg};">'
+                f'<td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;font-size:11px;color:#64748b;white-space:nowrap;">{ts}</td>'
+                f'<td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;"><span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700;background:#e0f2fe;color:#075985;">{ev_name}</span></td>'
+                f'<td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;color:#1e293b;">{html.escape(target)} {details}</td>'
+                f"</tr>"
+            )
+        sections_html.append(
+            '<div style="margin-top:16px;">'
+            f'<div style="font-size:12px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;color:#475569;margin-bottom:8px;">Recent Activity (Last {hours}h)</div>'
+            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;border-collapse:separate;">'
+            + "".join(ev_rows)
+            + "</table></div>"
+        )
+    else:
+        sections_html.append(
+            '<div style="margin-top:16px;padding:12px 14px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;color:#475569;">'
+            f"No scheduled or engine events recorded in the last {hours}h."
+            "</div>"
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<body style="margin:0;padding:24px;background-color:#eef2f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#0f172a;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:740px;margin:0 auto;background:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #cbd5e1;box-shadow:0 4px 16px rgba(15,23,42,0.08);">
+    <tr>
+      <td style="background:#0f172a;padding:22px 26px;border-bottom:4px solid {accent};">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+          <tr>
+            <td>
+              <div style="font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:#38bdf8;">Trusted OSS Harbor &bull; Supply Chain Gatekeeper</div>
+              <div style="font-size:20px;font-weight:700;color:#ffffff;margin-top:4px;">Daily Supply Chain Digest</div>
+              <div style="font-size:12px;color:#94a3b8;margin-top:4px;">Status: {html.escape(status_str)} &nbsp;|&nbsp; Role: {html.escape(role_str)} &nbsp;|&nbsp; Generated: {now_utc}</div>
+            </td>
+            <td align="right" valign="middle">
+              <span style="display:inline-block;padding:6px 14px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:0.6px;background:{badge_bg};color:{badge_fg};">{badge_label}</span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding:20px 26px 8px 26px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+          <tr>
+            <td width="25%" style="padding-right:6px;">
+              <div style="background:#f8fafc;border:1px solid #cbd5e1;border-radius:8px;padding:12px 10px;text-align:center;">
+                <div style="font-size:22px;font-weight:800;color:#0f172a;">{total}</div>
+                <div style="font-size:10px;font-weight:700;letter-spacing:0.6px;text-transform:uppercase;color:#475569;">Total</div>
+              </div>
+            </td>
+            <td width="25%" style="padding:0 4px;">
+              <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px 10px;text-align:center;">
+                <div style="font-size:22px;font-weight:800;color:#15803d;">{clean}</div>
+                <div style="font-size:10px;font-weight:700;letter-spacing:0.6px;text-transform:uppercase;color:#166534;">Clean</div>
+              </div>
+            </td>
+            <td width="25%" style="padding:0 4px;">
+              <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:12px 10px;text-align:center;">
+                <div style="font-size:22px;font-weight:800;color:#b45309;">{unscanned}</div>
+                <div style="font-size:10px;font-weight:700;letter-spacing:0.6px;text-transform:uppercase;color:#92400e;">Unscanned</div>
+              </div>
+            </td>
+            <td width="25%" style="padding-left:6px;">
+              <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:12px 10px;text-align:center;">
+                <div style="font-size:22px;font-weight:800;color:#b91c1c;">{q_count}</div>
+                <div style="font-size:10px;font-weight:700;letter-spacing:0.6px;text-transform:uppercase;color:#991b1b;">Quarantined</div>
+              </div>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding:8px 26px 22px 26px;">
+        {''.join(sections_html)}
+      </td>
+    </tr>
+    <tr>
+      <td style="background:#f8fafc;padding:14px 26px;border-top:1px solid #e2e8f0;font-size:11px;color:#64748b;">
+        <strong>Subject:</strong> {html.escape(subject)}<br>
+        Automated digest delivered via Microsoft Graph / SMTP STARTTLS &bull; JSIGROUP Standardized HTML Notification Format
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
+
 def send_smtp_starttls(
     *,
     smtp_host: str,
@@ -238,6 +409,7 @@ def send_smtp_starttls(
     recipients: list[str],
     subject: str,
     body: str,
+    html_body: str = "",
     timeout: float = 20.0,
 ) -> None:
     """Send email (or Email-to-SMS) via authenticated SMTP STARTTLS (e.g. Outlook port 587)."""
@@ -246,6 +418,8 @@ def send_smtp_starttls(
     msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
     msg.set_content(body)
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
 
     context = ssl.create_default_context()
     with smtplib.SMTP(smtp_host, smtp_port, timeout=timeout) as server:
@@ -262,13 +436,14 @@ def send_graph_mail(
     recipients: list[str],
     subject: str,
     body: str,
+    content_type: str = "Text",
     timeout: float = 20.0,
 ) -> None:
     """Send email via Microsoft Graph API over HTTPS port 443 (no SMTP required)."""
     payload = {
         "message": {
             "subject": subject,
-            "body": {"contentType": "Text", "content": body},
+            "body": {"contentType": content_type, "content": body},
             "toRecipients": [{"emailAddress": {"address": r}} for r in recipients],
         },
         "saveToSentItems": True,
@@ -525,12 +700,25 @@ async def run_daily_digest_loop(
                     a_resp.raise_for_status()
                     retention_data = r_resp.json() if r_resp.status_code == 200 else None
 
+                health_data = h_resp.json()
+                vuln_data = v_resp.json()
+                act_events = a_resp.json().get("events", [])
+                lookback_h = max(1, interval // 3600)
                 subject, body_text, sms_text = build_daily_digest(
-                    health=h_resp.json(),
-                    vuln_data=v_resp.json(),
-                    activity_events=a_resp.json().get("events", []),
+                    health=health_data,
+                    vuln_data=vuln_data,
+                    activity_events=act_events,
                     retention_data=retention_data,
-                    hours=max(1, interval // 3600),
+                    hours=lookback_h,
+                )
+                body_html = render_daily_digest_html(
+                    subject=subject,
+                    body_text=body_text,
+                    health=health_data,
+                    vuln_data=vuln_data,
+                    activity_events=act_events,
+                    retention_data=retention_data,
+                    hours=lookback_h,
                 )
                 graph_token = await asyncio.to_thread(
                     resolve_msgraph_access_token,
@@ -549,7 +737,8 @@ async def run_daily_digest_loop(
                             access_token=graph_token,
                             recipients=email_to,
                             subject=subject,
-                            body=body_text,
+                            body=body_html,
+                            content_type="HTML",
                         )
                     if sms_to:
                         await asyncio.to_thread(

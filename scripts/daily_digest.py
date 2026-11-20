@@ -30,6 +30,7 @@ from app.notifications import (  # noqa: E402
     DEFAULT_TOKEN_CACHE_PATH,
     build_daily_digest,
     poll_msgraph_device_token,
+    render_daily_digest_html,
     request_msgraph_device_code,
     resolve_msgraph_access_token,
     save_msgraph_token_cache,
@@ -243,12 +244,22 @@ def main() -> int:
         retention_data=retention_data,
         hours=args.hours,
     )
+    body_html = render_daily_digest_html(
+        subject=subject,
+        body_text=body_text,
+        health=health,
+        vuln_data=vuln_data,
+        activity_events=events,
+        retention_data=retention_data,
+        hours=args.hours,
+    )
 
     if args.dry_run:
         print(f"Subject: {subject}")
         print("=" * 72)
         print(body_text)
         print("=" * 72)
+        print(f"HTML rendered ({len(body_html)} bytes)")
         print(f"SMS ({len(sms_text)} chars): {sms_text}")
         return 0
 
@@ -273,9 +284,10 @@ def main() -> int:
                 access_token=graph_access_token,
                 recipients=email_recipients,
                 subject=subject,
-                body=body_text,
+                body=body_html,
+                content_type="HTML",
             )
-            print(f"Sent Microsoft Graph email (HTTPS 443) to {', '.join(email_recipients)}")
+            print(f"Sent Microsoft Graph HTML email (HTTPS 443) to {', '.join(email_recipients)}")
             sent_any = True
         if sms_gateway_recipients:
             send_graph_mail(
@@ -283,6 +295,7 @@ def main() -> int:
                 recipients=sms_gateway_recipients,
                 subject="OSS Harbor Digest",
                 body=sms_text,
+                content_type="Text",
             )
             print(
                 f"Sent Microsoft Graph Email-to-SMS (HTTPS 443) to "
@@ -301,6 +314,7 @@ def main() -> int:
                 recipients=email_recipients,
                 subject=subject,
                 body=body_text,
+                html_body=body_html,
             )
             print(
                 f"Sent SMTP STARTTLS email via {args.smtp_host}:{args.smtp_port} "
