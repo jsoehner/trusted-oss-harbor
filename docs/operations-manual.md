@@ -1,23 +1,26 @@
-# Trusted OSS Supply Chain Platform — Operations Manual (`v1.4.0`)
+# Trusted OSS Supply Chain Platform — Operations Manual (`v1.6.0`)
 
-This manual documents every operational capability of `trusted-oss-harbor` (`v1.4.0`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack and the single-container **TrueNAS / NAS Appliance** image (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.4.0`), and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, and GitHub Actions projects.
+This manual documents every operational capability of `trusted-oss-harbor` (`v1.6.0`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack and the single-container **TrueNAS / NAS Appliance** image (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.6.0`), and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, BOM consumers (`jsi-bom-actions`), and GitHub Actions projects.
 
 ---
 
 ## 1. Architecture & Components
 
-`trusted-oss-harbor` separates **HTTP request serving** from **heavy scanning and remediation** so package managers and inventory queries stay fast even on resource-constrained NAS hosts (such as TrueNAS SCALE).
+`trusted-oss-harbor` separates **HTTP request serving** from **heavy scanning, CycloneDX 1.6 SBOM/CBOM generation, and remediation** so package managers and inventory queries stay fast even on resource-constrained NAS hosts (such as TrueNAS SCALE running on native ZFS dataset `Pool1/trusted-oss-data`).
+
+![Trusted OSS Harbor Security Capabilities & Pluggable Service Map](images/trusted-oss-security-capabilities-map.png)
 
 ```mermaid
 flowchart LR
-    Dev["Developer / CI / Package Manager"] -->|":8080"| GW["oss-gateway (Nginx)"]
+    Dev["Developer / CI / Package Manager / jsi-bom-actions"] -->|":443 mTLS / :8080 LAN"| GW["oss-gateway (Nginx on Wolfi)"]
     GW --> FE["oss-frontend (FastAPI, GATEKEEPER_ROLE=frontend)"]
-    FE -->|"Cache HIT"| Store[("/data/trusted-oss (Trusted + Quarantine + Keys)")]
-    FE -->|"202 Accepted (XADD job)"| Bus["oss-bus (Valkey Streams)"]
+    FE -->|"Cache HIT / BOM Batch / OCI 1.1 Referrers"| Store[("TrueNAS Native ZFS /data (Trusted + BOMs + Quarantine + Keys)")]
+    FE -->|"202 Accepted (XADD warm / remediate / backfill_boms)"| Bus["oss-bus (Valkey Streams)"]
     Bus -->|"XREADGROUP (ENGINE_MAX_CONCURRENCY=2)"| Eng["oss-engine (python -m app.worker)"]
-    Eng --> Clam["oss-clamav (:3310)"]
+    Eng --> Clam["oss-clamav (:3310 INSTREAM)"]
     Eng --> Up["Upstream (Maven Central / PyPI / cgr.dev) + OSV/Trivy"]
-    Eng --> Store
+    Eng --> BOM["CycloneDX 1.6 SBOM/CBOM + GPG/ML-DSA-65 Signer"]
+    BOM --> Store
 ```
 
 | Service / Component | Role | Key Environment / Config |

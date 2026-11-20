@@ -12,50 +12,58 @@ Self-hosted, containerized **Trusted Open-Source Software (OSS) Supply Chain Pla
 
 ![Trusted OSS Harbor End-to-End Architecture Infographic](docs/images/trusted-oss-architecture-infographic.png)
 
+![Trusted OSS Harbor Security Capabilities & Pluggable Service Map](docs/images/trusted-oss-security-capabilities-map.png)
+
 ```mermaid
 flowchart LR
-    Client["Developer / CI Client"] -->|":8080 /maven/virtual, /pypi/virtual, /v2/virtual, /jobs"| Gateway["Nginx Gateway (Wolfi)"]
-    Gateway --> Frontend["oss-frontend (FastAPI, GATEKEEPER_ROLE=frontend)"]
-    Frontend -->|"Cache HIT"| Store["Trusted Store (.asc + .mldsa65)"]
-    Frontend -->|"Enqueue remediate / warm (202 Accepted)"| Bus["oss-bus (Valkey Streams)"]
+    Client["Developer / CI Client / LAN Primer (06:00)"] -->|":443 mTLS (WAN) / :8080 (LAN)"| Edge["pfSense WAN Allowlist + HAProxy mTLS"]
+    Edge --> Gateway["Nginx Gateway (Wolfi, rate-limited)"]
+    Gateway -->|"/maven, /pypi, /v2, /bom, /jobs"| Frontend["oss-frontend (FastAPI, GATEKEEPER_ROLE=frontend)"]
+    Frontend -->|"Cache HIT + BOM / OCI 1.1 Referrers"| Store["TrueNAS Native ZFS Trusted Store (.asc + .mldsa65 + .cdx.json)"]
+    Frontend -->|"Enqueue warm / remediate / backfill_boms (202)"| Bus["oss-bus (Valkey Streams / InMemoryJobBus)"]
     Bus -->|"XREADGROUP (bounded concurrency)"| Engine["oss-engine (python -m app.worker)"]
     Engine -->|"Upstream Pull / Auto-Upgrade"| Upstream["Maven Central / PyPI / cgr.dev"]
-    Upstream --> Quarantine["Quarantine Staging"]
-    Quarantine --> ClamAV["ClamAV 1.5 (:3310)"]
-    ClamAV --> CVE["OSV / Trivy Gate (CVSS >= 7.0)"]
-    CVE -->|"Clean"| Signer["GPG RSA-3072 + ML-DSA-65"]
+    Upstream --> Quarantine["Quarantine + Archive/DoS Guard (250 MB)"]
+    Quarantine --> ClamAV["ClamAV 1.5 (:3310 INSTREAM)"]
+    ClamAV --> CVE["OSV / Trivy / NVD Gate (CVSS >= 7.0)"]
+    CVE -->|"Clean"| BOM["CycloneDX 1.6 SBOM/CBOM Generator (VERIFIED_INERT)"]
+    BOM --> Signer["Dual Signer (GPG RSA-3072 + ML-DSA-65 + SHA-384)"]
     CVE -->|"Infected or High/Crit CVE"| Reject["Quarantined / HTTP 451"]
-    Signer --> Store
-    Frontend & Engine -->|"stdout [CACHE] / [ENGINE] events"| Logs["TrueNAS App Logs / docker logs"]
-    Store --> VulnAPI["GET /catalog/vulnerabilities"]
+    Signer -->|"Atomic Promote + HMAC-SHA384 Provenance"| Store
+    Frontend & Engine -->|"stdout [CACHE] / [ENGINE] + activity.jsonl"| Digest["Daily HTML Digest (Graph OAuth2 / SMTP / SMS)"]
+    Store --> VulnAPI["GET /catalog/vulnerabilities & POST /bom/batch"]
 ```
 
 ```mermaid
 sequenceDiagram
-    participant C as Client / catalog_frontend.py
+    participant C as Client / CI / jsi-bom-actions
+    participant Edge as pfSense HAProxy (mTLS)
     participant FE as oss-frontend (:8080)
     participant Bus as oss-bus (Valkey)
     participant Eng as oss-engine (Worker)
-    participant S as ClamAV + OSV/Trivy
-    participant K as GPG + ML-DSA-65
-    C->>FE: GET /pypi/virtual/packages/pkg/pkg-1.0.whl
+    participant S as Archive Guard + ClamAV + OSV/Trivy
+    participant K as CycloneDX 1.6 + GPG/ML-DSA-65
+    C->>Edge: GET /pypi/virtual/packages/pkg/pkg-1.0.whl (TLS 1.3 + Client Cert)
+    Edge->>FE: Forward verified route
     alt Cache HIT
         FE-->>C: 200 OK (X-Cache-Status: HIT) + log [CACHE] HIT
     else Cache MISS (single-flight asyncio.Lock)
-        FE->>S: Fetch & scan archive + ClamAV + OSV/Trivy
-        alt CVSS >= 7.0 or Malware
+        FE->>S: Stream to quarantine -> Archive Guard -> ClamAV -> OSV/Trivy
+        alt CVSS >= 7.0 or Malware or Zip-Slip
             FE-->>C: 451 Unavailable For Legal Reasons + log [CACHE] BLOCKED
         else Clean
-            FE->>K: Dual-sign (.asc + .mldsa65) & promote
+            FE->>K: Generate .sbom/.cbom.cdx.json + Dual-sign (.asc + .mldsa65) & promote
             FE-->>C: 200 OK (X-Cache-Status: MISS) + log [CACHE] PROMOTED
         end
     end
-    C->>FE: POST /catalog/remediate?ecosystem=pypi
+    C->>FE: POST /bom/batch (PURLs) or GET /v2/{ns}/{repo}/referrers/{digest}
+    FE-->>C: 200 OK (Dual-signed CycloneDX 1.6 SBOM/CBOM + detached .asc/.mldsa65)
+    C->>FE: POST /catalog/remediate or /catalog/backfill-boms
     FE->>Bus: XADD trusted_oss:jobs:stream
     FE-->>C: 202 Accepted {job_id, status: "queued"}
     Eng->>Bus: XREADGROUP (bounded ENGINE_MAX_CONCURRENCY)
-    Eng->>S: Rescan cached components & quarantine failing CVEs
-    Eng->>K: Fetch clean replacement & tag 'latest'
+    Eng->>S: Hourly rescan & quarantine failing CVEs (90d TTL GC)
+    Eng->>K: Fetch clean replacement, sign BOMs & tag 'latest'
     C->>FE: GET /jobs/{job_id} (--wait)
     FE-->>C: 200 OK {status: "completed"}
 ```
@@ -156,7 +164,7 @@ The appliance automatically:
 - Auto-downloads and updates ClamAV virus signatures with persistent caching in `/data/scanners/clamav`.
 - Serves the unified rate-limited gateway on port `8080`.
 
-- **Chainguard Wolfi Zero-CVE Base (`cgr.dev/chainguard/wolfi-base:latest`, Python 3.13)**: Multi-stage build strips `pip` and build tooling from the runtime image (317 MB vs. 467 MB Debian), bundling `clamav-1.5`, `nginx-stable`, `gpg`, `supervisor`, and `gatekeeper` (`1.4.0`).
+- **Chainguard Wolfi Zero-CVE Base (`cgr.dev/chainguard/wolfi-base:latest`, Python 3.13)**: Multi-stage build strips `pip` and build tooling from the runtime image (317 MB vs. 467 MB Debian), bundling `clamav-1.5`, `nginx-stable`, `gpg`, `supervisor`, and `gatekeeper` (`1.6.0`).
 - **Public-by-Default, Single-Variable Cache Opt-In (`scripts/configure_trusted_cache.py`)**: Cloned repositories default to public upstream registries (Maven Central, PyPI, `cgr.dev`). Run `python3 scripts/configure_trusted_cache.py --interactive` (or `--url https://oss.yourdomain.com`) to redirect Maven, `uv`/`pip`, `.env`, Docker, and GitHub Actions (`vars.TRUSTED_OSS_CACHE_URL`) to your Trusted OSS Cache, or `--public` to revert.
 - **pfSense GitHub-Only mTLS Edge ([`docs/pfsense-haproxy-mtls-guide.md`](docs/pfsense-haproxy-mtls-guide.md))**: Step-by-step illustrated guide (`pfSense 2.9.0-RELEASE`) for restricting WAN `:443` access strictly to GitHub Actions CIDRs + mTLS client certificates forwarding to `trusted-oss-gatekeeper:8080`.
 - **Operations Manual & ADRs**: See [`docs/operations-manual.md`](docs/operations-manual.md) for live command screenshots, maintenance runbooks, and project integration guides, and [`docs/adr/0004-frontend-engine-message-bus-architecture.md`](docs/adr/0004-frontend-engine-message-bus-architecture.md) for the Frontend / Engine / Valkey Bus ADR.
@@ -176,12 +184,25 @@ GATEKEEPER_ADMIN_TOKEN="<your-token>" \
 
 ---
 
-## Security Controls & Configuration
+## Security Capabilities & Pluggable Service Map
 
-- **Fail-Closed Admin Token**: `GATEKEEPER_ADMIN_TOKEN` is required for `/ingest/*` and `/catalog/warm`. Unset or placeholder values (`ChangeMe_GatekeeperToken_2026!`) are rejected with HTTP `503`.
-- **Vulnerability Scanning**: `scan_with_trivy()` runs `trivy fs` when `trivy` is installed; set `TRIVY_REQUIRED=true` to fail closed if the CLI is absent. `ALLOW_SIMULATED_CVSS` defaults to `false` so `X-Simulated-Cvss` headers are ignored in production.
-- **Resource & Archive Guards**: Uploads and upstream pull-through downloads stream to disk with a `MAX_ARTIFACT_BYTES` cap (default `262144000` / 250 MB). Archives exceeding 10,000 members, 512 MB uncompressed, or containing encrypted entries are rejected.
-- **Provenance Integrity**: `PROVENANCE_HMAC_KEY` signs `audit/provenance.jsonl` entries (auto-generated at `<OSS_DATA_ROOT>/keys/provenance.hmac.key` if unset). `/audit/provenance` supports `limit` and `offset` pagination.
+Every security control in `trusted-oss-harbor` is decoupled behind standard protocols (HTTPS/mTLS, TCP `INSTREAM`, OSV/Trivy JSON, OpenPGP/ML-DSA-65, CycloneDX 1.6, OCI 1.1 Referrers, Redis/Valkey Streams, OAuth2/SMTP) so teams can substitute existing enterprise tools or team-managed services without redesigning the supply chain flow:
+
+| Tier | Security Capability | Provided By (This Reference Stack) | Bring-Your-Own / Enterprise Team Equivalent |
+| :--- | :--- | :--- | :--- |
+| **Perimeter & Access** | **WAN IP Allowlisting** | pfSense 2.9.0 WAN rule + dynamic `github_actions_cidrs` table (`:443` only) | AWS WAF, GCP Cloud Armor, Palo Alto, Cloudflare Zero Trust |
+| **Perimeter & Access** | **TLS 1.3 + Mutual TLS (mTLS)** | pfSense HAProxy + ACME DNS-01 TLS + private `Trusted-OSS-GitHub-Client-CA` + strict path ACLs | Envoy / Istio, F5 BIG-IP, HashiCorp Vault PKI, EJBCA, AD CS |
+| **Perimeter & Access** | **API Gateway & Rate Limiting** | Nginx on Chainguard Wolfi (`limit_req_zone` on `/ingest/` & `/catalog/`) | Kong, Traefik, Apigee, AWS API Gateway |
+| **Perimeter & Access** | **Fail-Closed Admin Auth** | FastAPI `X-Gatekeeper-Token` via `secrets.compare_digest` (HTTP `503` if unset/placeholder) | Entra ID OIDC, Okta, Keycloak, SPIFFE/SPIRE |
+| **Ingestion & Scanning** | **Archive, Zip-Slip & DoS Guard** | Gatekeeper inspector (`MAX_ARTIFACT_BYTES=250 MB` HTTP `413`, 10k-member & 512 MB caps, Zip-Slip/symlink/encrypted-ZIP rejection) | JFrog Artifactory / Sonatype Nexus content policies, OPA admission |
+| **Ingestion & Scanning** | **Malware & AV Inspection** | ClamAV 1.5 (`clamd` TCP `INSTREAM :3310` + `freshclam`), fail-closed HTTP `451` | CrowdStrike, Microsoft Defender for Storage, MetaDefender, VirusTotal |
+| **Ingestion & Scanning** | **CVE Gating & Auto-Quarantine** | OSV + Trivy (`trivy fs`, `TRIVY_REQUIRED`) + NVD H2 (`CVSS >= 7.0` -> `451`, `ALLOW_SIMULATED_CVSS=false`); hourly `oss-engine` rescan auto-quarantines & tags clean `latest` | Snyk, JFrog Xray, Sonatype IQ, Wiz, Anchore Grype |
+| **Integrity & BOMs** | **Dual Classical + PQC Signing** | GPG RSA-3072 (`.asc`) + NIST FIPS 204 ML-DSA-65 (`.mldsa65`) + SHA-256/384/512; read-time & client verification | Sigstore Cosign, Thales Luna HSM, AWS KMS/CloudHSM, Notary/Notation |
+| **Integrity & BOMs** | **Signed SBOM/CBOM & OCI 1.1** | Pure-Python `app/bom_generator.py` emitting dual-signed CycloneDX 1.6 `.sbom.cdx.json`/`.cbom.cdx.json` (`VERIFIED_INERT`), `/bom/lookup`, `/bom/batch`, OCI 1.1 Referrers | Syft, cdxgen, Dependency-Track, ORAS + Harbor, GitHub Attestations |
+| **Integrity & BOMs** | **Tamper-Evident Provenance** | Append-only `audit/provenance.jsonl` signed with instance-unique `0o600` HMAC-SHA384 key (`PROVENANCE_HMAC_KEY`) + paginated `/audit/provenance` & `activity.jsonl` | Sigstore Rekor, Splunk, Datadog, Microsoft Sentinel, WORM Object Lock |
+| **Runtime & Storage** | **Zero-CVE Least-Privilege Runtime** | Chainguard Wolfi multi-stage build (no `pip`/build tools), non-root `uid 10001`, `0o700` key dirs, Valkey worker isolation | Distroless, Red Hat UBI Minimal, Kubernetes `restricted` PSS, gVisor |
+| **Runtime & Storage** | **Immutable Storage & TTL GC** | TrueNAS SCALE Native ZFS (`Pool1/trusted-oss-data`: LZ4, 500 GiB quota, daily 30d snapshots) + 90-day Inactivity-TTL GC (`audit/last_accessed.json`) | AWS S3 Object Lock + Lifecycle, Azure Immutable Blob, NetApp ONTAP, Ceph |
+| **Governance & Alerting** | **Security Digests & Telemetry** | Daily Standardized HTML Email Digest ([ADR 0009](docs/adr/0009-standardized-html-email-notifications.md)) via Microsoft Graph OAuth2 / SMTP STARTTLS (+ ≤160-char SMS) & `stdout` `[CACHE]`/`[ENGINE]` telemetry | PagerDuty, Slack, Microsoft Teams, ServiceNow, Opsgenie |
 
 
 ---
