@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-20
+
 ### Added
+- **Standardized HTML Email Digests ([ADR 0009](docs/adr/0009-standardized-html-email-notifications.md))**: Added `render_daily_digest_html()` in `gatekeeper/app/notifications.py` using the JSIGROUP Standardized HTML Notification Format (dark-slate header, status pill, `Total / Clean / Unscanned / Quarantined` KPI cards, Cache Capacity Runway, Quarantined CVEs, and Recent Activity tables with strict `html.escape()` sanitization).
+- **HTML & Multipart Transport Support**: Added `content_type="HTML"` support in `send_graph_mail()` (keeping `content_type="Text"` for ≤160-char Email-to-SMS) and `multipart/alternative` (`html_body`) support in `send_smtp_starttls()`, wired into `scripts/daily_digest.py` and `run_daily_digest_loop()`.
 - **Daily Digest Artifact Activity Telemetry**: Emits `ARTIFACT_REQUESTED` (`HIT`/`MISS`), `NEW_ARTIFACT_ADDED`, and `NEW_VERSION_ADDED` events in `gatekeeper/app/main.py` and reports `Requested`, `New Artifacts`, and `New Versions` in `build_daily_digest` (`gatekeeper/app/notifications.py`).
 - **Scheduled LAN Cache Primer (`scripts/install_prime_timer.sh`)**: Installs `trusted-oss-prime.timer` (`systemd --user`, daily at `06:00`) to run `scripts/prime_cache.py` against `http://oss.jsigroup.local:8080`.
 - **Architecture Infographics & ADR-0008**: Added `docs/images/trusted-oss-dataflow-hardware-infographic.png` and `docs/images/trusted-oss-architecture-infographic.png` to `README.md`, and recorded [ADR 0008](docs/adr/0008-digest-artifact-telemetry-and-scheduled-lan-priming.md).
