@@ -13,38 +13,52 @@ To enable immediate deployment without root-owned `/srv` partitioning while esta
 
 ```mermaid
 flowchart LR
-    subgraph Phase1["Phase 1: Active Local Host Store"]
-        HomeDir["/home/jsoehner/trusted-oss-data<br/>(Local Host Bind Mount)"]
+    subgraph Phase1["Phase 1 (Completed): Local Host Store"]
+        HomeDir["/home/jsoehner/trusted-oss-data<br/>(Retired Local Bind Mount)"]
     end
 
-    subgraph Phase2["Phase 2: TrueNAS iSCSI Block Mount (Recommended)"]
-        TrueNASZvol["TrueNAS SCALE / CORE Zvol<br/>(LZ4 + ZFS Snapshots)"]
+    subgraph Phase2A["Phase 2 (Active): TrueNAS SCALE Native ZFS Dataset"]
+        TrueNASDataset["Pool1/trusted-oss-data<br/>(/mnt/Pool1/trusted-oss-data)<br/>LZ4, atime=OFF, 500 GiB refquota<br/>Daily 30-day ZFS Snapshots"]
+        TrueNASApp["trusted-oss-gatekeeper Custom App<br/>(Bind Mount -> /data)"]
+        TrueNASDataset --> TrueNASApp
+    end
+
+    subgraph Phase2B["Phase 2 (Alt for External Linux Hosts): TrueNAS iSCSI LUN"]
+        TrueNASZvol["TrueNAS SCALE Zvol<br/>(LZ4 + ZFS Snapshots)"]
         iSCSILUN["iSCSI Target & Extent<br/>(TCP 3260 / Mutual CHAP)"]
-        LinuxInitiator["Linux open-iscsi Initiator<br/>(/mnt/truenas-iscsi-oss XFS)"]
+        LinuxInitiator["External Linux open-iscsi Initiator<br/>(/mnt/truenas-iscsi-oss XFS)"]
         TrueNASZvol --> iSCSILUN --> LinuxInitiator
     end
 
-    subgraph Phase3["Phase 3: Hybrid iSCSI Block + S3 Object Store (Optional)"]
-        BlockTier["iSCSI Block Mount<br/>(PostgreSQL, Redis, Maven/PyPI, Keys)"]
+    subgraph Phase3["Phase 3 (Optional Scale-Out): Hybrid + S3 Object Store"]
+        BlockTier["TrueNAS ZFS / iSCSI Block<br/>(PostgreSQL, Redis, Maven/PyPI, Keys)"]
         ObjectTier["TrueNAS MinIO / S3 Service<br/>(Harbor Registry OCI Blobs)"]
     end
 
-    Phase1 -->|"scripts/setup_truenas_iscsi_mount.sh --migrate"| Phase2
-    Phase2 -->|"harbor.yml storage_service.s3"| Phase3
+    Phase1 -->|"Completed"| Phase2A
+    Phase2A -.->|"External Docker/Harbor Host"| Phase2B
+    Phase2A -->|"harbor.yml storage_service.s3"| Phase3
 ```
 
 ---
 
-## Phase 1 (Active): Home Directory Persistent Store (`/home/jsoehner/trusted-oss-data`)
+## Phase 1 (Completed / Retired): Home Directory Persistent Store (`/home/jsoehner/trusted-oss-data`)
 
-- **Configuration**: `OSS_DATA_ROOT=/home/jsoehner/trusted-oss-data` in `.env`.
-- **Characteristics**:
-  - Zero privileged mount dependencies; runs immediately under the local user profile.
-  - Identical directory hierarchy (`harbor/`, `packages/`, `scanners/`, `keys/`, `audit/`) to the target TrueNAS iSCSI volume.
+- **Previous Configuration**: `OSS_DATA_ROOT=/home/jsoehner/trusted-oss-data` on the local Fedora workstation.
+- **Status**: Retired after verifying all cached Maven/PyPI artifacts, signing keys, audit logs, and ClamAV databases reside on TrueNAS `Pool1/trusted-oss-data`.
 
 ---
 
-## Phase 2 (Target Roadmap): TrueNAS iSCSI External Block Storage Mount (`/mnt/truenas-iscsi-oss`)
+## Phase 2 (Active): TrueNAS SCALE Native ZFS Dataset (`/mnt/Pool1/trusted-oss-data`)
+
+Because the `trusted-oss-gatekeeper` appliance runs directly on **TrueNAS SCALE (`192.168.100.50`)** via [`config/truenas/docker-compose.yml`](../../config/truenas/docker-compose.yml), binding a dedicated **native ZFS dataset** directly into the container avoids loopback iSCSI overhead and shutdown deadlock risks while preserving full POSIX semantics:
+- **Dataset**: `Pool1/trusted-oss-data` mounted at `/mnt/Pool1/trusted-oss-data` $\rightarrow$ `/data` (`rw`, `bind`)
+- **ZFS Properties**: `compression=LZ4`, `atime=OFF`, `recordsize=128K`, `sync=STANDARD`, `acltype=POSIX`, `refquota=500 GiB`
+- **Data Protection**: Automated daily ZFS snapshot task (`02:00`, 30-day retention, `auto-%Y-%m-%d_%H-%M`) protecting GPG/ML-DSA-65/Cosign signing keys, `audit/provenance.jsonl`, and cached OSS artifacts.
+
+---
+
+## Phase 2 (Alternative for External Linux Hosts): TrueNAS iSCSI External Block Storage Mount (`/mnt/truenas-iscsi-oss`)
 
 Why **iSCSI Block Storage** over NFS/SMB for Harbor + PostgreSQL + Gatekeeper:
 1. **POSIX Locking & Database Safety**: Harbor's embedded PostgreSQL (`harbor-db`), Redis, and the OWASP NVD H2 database (`odc.mv.db`) require strict block-level fsync and file-locking semantics that NFS frequently violates or degrades. An iSCSI Zvol formatted with `XFS` or `ext4` behaves as a native local SCSI disk (`/dev/sdX`) to the Linux kernel.

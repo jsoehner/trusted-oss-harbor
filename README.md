@@ -1,6 +1,6 @@
 # Trusted OSS Supply Chain Platform (`trusted-oss-harbor`)
 
-Self-hosted, containerized **Trusted Open-Source Software (OSS) Supply Chain Platform** combining **CNCF Harbor** (for OCI containers, Helm charts, and ORAS artifacts) with an automated **Quarantine $\rightarrow$ ClamAV Antivirus $\rightarrow$ Trivy/NVD Vulnerability Gate $\rightarrow$ GPG/Cosign Cryptographic Signer** for **Java (Maven)** and **Python (PyPI)** packages, designed to run behind a **pfSense** firewall with a persistent host mount (`/home/jsoehner/trusted-oss-data` now, with seamless migration to a **TrueNAS iSCSI** external block/object store).
+Self-hosted, containerized **Trusted Open-Source Software (OSS) Supply Chain Platform** combining **CNCF Harbor** (for OCI containers, Helm charts, and ORAS artifacts) with an automated **Quarantine $\rightarrow$ ClamAV Antivirus $\rightarrow$ Trivy/NVD Vulnerability Gate $\rightarrow$ GPG/Cosign Cryptographic Signer** for **Java (Maven)** and **Python (PyPI)** packages, designed to run behind a **pfSense** firewall backed by a **TrueNAS SCALE native ZFS dataset** (`/mnt/Pool1/trusted-oss-data`, with optional **TrueNAS iSCSI** block mount for external Linux hosts or **S3** object store).
 
 ---
 
@@ -60,7 +60,7 @@ sequenceDiagram
 
 ## Architecture Highlights
 
-1. **Persistent Storage Mount (`OSS_DATA_ROOT=/home/jsoehner/trusted-oss-data`)**:
+1. **Persistent Storage Mount (`OSS_DATA_ROOT`, live on TrueNAS `/mnt/Pool1/trusted-oss-data`)**:
    - `harbor/`: Harbor OCI blobs, PostgreSQL metadata, Redis cache, and job logs.
    - `packages/quarantine/`: Lightweight staging area for dynamically fetched upstream Maven/PyPI artifacts.
    - `packages/trusted-maven/` & `packages/trusted-pypi/`: Immutable, ClamAV-scanned, CVE-verified, and GPG-signed (`.asc`) package repositories (with `AUTO_PROMOTE_CLEAN_ARTIFACTS=true`).
@@ -74,9 +74,9 @@ sequenceDiagram
    - **Signed CycloneDX 1.6 SBOM/CBOM Attestations & Batch PURL API ([ADR 0010](docs/adr/0010-signed-artifact-cbom-attestations-and-purl-batch-api.md))**: Automatically generates and dual-signs `.sbom.cdx.json` and `.cbom.cdx.json` sidecars (including `VERIFIED_INERT` attestations) on promotion, serving them via `GET /bom/lookup?purl=...`, `POST /bom/batch`, and OCI 1.1 Referrers (`/v2/<ns>/<repo>/referrers/<digest>`) for direct assimilation by `jsoehner/jsi-bom-actions`. Existing caches can be backfilled via `POST /catalog/backfill-boms`.
 3. **pfSense Edge Security (`config/pfsense/`)**:
    - Terminates TLS + Client Certificate Authentication (**mTLS**) at **pfSense HAProxy** and restricts WAN ingress to GitHub Actions IP ranges (`config/pfsense/update-github-cidrs.sh`).
-4. **TrueNAS iSCSI Block & Object Storage Roadmap (`docs/roadmap/truenas-iscsi-storage-roadmap.md`)**:
-   - Currently operates out of `/home/jsoehner/trusted-oss-data`.
-   - Includes [`scripts/setup_truenas_iscsi_mount.sh`](scripts/setup_truenas_iscsi_mount.sh) and [`docs/roadmap/truenas-iscsi-storage-roadmap.md`](docs/roadmap/truenas-iscsi-storage-roadmap.md) to attach a **TrueNAS iSCSI Zvol LUN** at `/mnt/truenas-iscsi-oss` (or configure Harbor `storage_service.s3` against TrueNAS MinIO/S3) and migrate data with zero configuration drift.
+4. **TrueNAS ZFS, iSCSI Block & Object Storage Roadmap (`docs/roadmap/truenas-iscsi-storage-roadmap.md`)**:
+   - Production appliance runs directly on **TrueNAS SCALE** bound to native ZFS dataset `Pool1/trusted-oss-data` (`/mnt/Pool1/trusted-oss-data`, `LZ4`, `atime=OFF`, `500 GiB` `refquota`, daily 30-day ZFS snapshots).
+   - Also includes [`scripts/setup_truenas_iscsi_mount.sh`](scripts/setup_truenas_iscsi_mount.sh) and [`docs/roadmap/truenas-iscsi-storage-roadmap.md`](docs/roadmap/truenas-iscsi-storage-roadmap.md) for external Linux Docker/Harbor hosts attaching a **TrueNAS iSCSI Zvol LUN** at `/mnt/truenas-iscsi-oss` (or configuring Harbor `storage_service.s3` against TrueNAS MinIO/S3).
 5. **Chainguard Zero-CVE Containers (`jre` & `python`) + Shared Spring Boot Catalog Cache**:
    - **Harbor Chainguard Proxy Cache**: [`scripts/configure_harbor_projects.sh`](scripts/configure_harbor_projects.sh) provisions the `chainguard-cache` Proxy Cache project in Harbor backed by `https://cgr.dev`, and [`containers/chainguard-jre-python/Dockerfile`](containers/chainguard-jre-python/Dockerfile) demonstrates building a polyglot Spring Boot JRE + Python runtime from `${HARBOR_REGISTRY}/chainguard-cache/chainguard/jre:latest` and `${HARBOR_REGISTRY}/chainguard-cache/chainguard/python:latest`.
    - **Shared Spring Boot Component Collection**: [`config/catalog/trusted-seed-catalog.json`](config/catalog/trusted-seed-catalog.json) and the `POST /catalog/warm` / `GET /catalog/status` endpoints pre-warm, ClamAV-scan, and GPG-sign the core Spring Boot starters shared across `enterprise-command-center` and `spring-ai-blog-agent` (`spring-boot-starter-web`, `actuator`, `security`, `validation`, `data-jpa`, `amqp`, `test`, and `slf4j-api`).

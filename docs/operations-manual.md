@@ -205,10 +205,10 @@ This creates `~/.config/systemd/user/trusted-oss-prime.service` and `trusted-oss
 
 ### 3.3 Storage & Scanner Cache Inspection
 
-Inspect the backing storage directory (`/home/jsoehner/trusted-oss-data` or TrueNAS iSCSI mount), GPG/ML-DSA keys, NVD/ClamAV/Trivy caches, and quarantine count:
+Inspect the backing storage directory (`/mnt/Pool1/trusted-oss-data` on TrueNAS SCALE, or a local/iSCSI `OSS_DATA_ROOT`), GPG/ML-DSA keys, NVD/ClamAV/Trivy caches, and quarantine count:
 
 ```bash
-python3 scripts/catalog_storage.py --data-root /home/jsoehner/trusted-oss-data
+python3 scripts/catalog_storage.py --data-root /mnt/Pool1/trusted-oss-data
 ```
 
 ### 3.4 Running the Automated Verification Suite
