@@ -395,3 +395,14 @@ Repositories remain **public-by-default** (Maven Central, PyPI, `cgr.dev`) until
 
 5. **Verify End-to-End Connectivity**:
    - Run [`.github/workflows/probe-wan-connectivity.yml`](../.github/workflows/probe-wan-connectivity.yml) (`gh workflow run probe-wan-connectivity.yml`) and confirm `/healthz` returns `HTTP/2 200` with mTLS while unauthenticated requests without a client certificate are rejected.
+
+6. **Signed Upstream SBOM/CBOM Attestations & Backfill (`v1.6.0+`)**:
+   - Every newly promoted Maven, PyPI, or OCI artifact automatically generates dual-signed CycloneDX 1.6 `.sbom.cdx.json` and `.cbom.cdx.json` sidecars (`.asc` + `.mldsa65`), including explicit `VERIFIED_INERT` attestations when zero cryptographic primitives are present.
+   - To backfill signed SBOM/CBOM sidecars for artifacts cached prior to `v1.6.0`:
+     ```bash
+     curl -fsSL -X POST \
+       -H "X-Gatekeeper-Token: ${GATEKEEPER_ADMIN_TOKEN}" \
+       "http://oss.jsigroup.local:8080/catalog/backfill-boms?wait=true"
+     ```
+   - Downstream `jsoehner/jsi-bom-actions@v1.2.0` workflows query `POST /bom/batch` over mTLS (using `trusted-oss-url`, `trusted-oss-mtls-cert`, and `trusted-oss-mtls-key`) to eliminate third-party cryptographic blind spots.
+

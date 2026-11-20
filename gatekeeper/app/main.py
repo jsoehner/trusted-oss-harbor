@@ -17,6 +17,12 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from pydantic import BaseModel
 
 from app.activity import append_activity_event, read_activity_events
+from app.bom_generator import (
+    compute_file_sha256,
+    generate_artifact_boms,
+    parse_purl,
+    resolve_purl_to_bom_file,
+)
 from app.bus import BaseJobBus, create_job_bus
 from app.config import Settings
 from app.discovery import (
@@ -291,6 +297,11 @@ async def handle_engine_job(
             comp_filters=_parse_component_filter(payload.get("components")),
             dry_run=bool(payload.get("dry_run", False)),
         )
+    if job_type == "backfill_boms":
+        return backfill_cached_boms(
+            settings=settings,
+            force=bool(payload.get("force", False)),
+        )
     raise ValueError(f"Unsupported engine job_type: {job_type}")
 
 
@@ -348,7 +359,7 @@ app = FastAPI(
         "Harbor Chainguard OCI proxy cache, ClamAV antivirus inspection, Trivy/NVD vulnerability gating, "
         "GPG/Cosign signing, and NIST FIPS 204 ML-DSA-65 Post-Quantum Cryptography dual-signing."
     ),
-    version="1.4.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -376,6 +387,15 @@ class WarmRequest(BaseModel):
     max_projects: int = 30
     ecosystems: list[str] | None = None
     concurrency: int | None = None
+
+
+class BomBatchRequest(BaseModel):
+    """Batch PURL lookup request for signed upstream CBOM/SBOM attestations."""
+
+    purls: list[str]
+    bom_type: str = "cbom"
+    include_signatures: bool = True
+    trigger_pull_on_miss: bool = False
 
 
 def _get_artifact_lock(app_instance: FastAPI, key: str) -> asyncio.Lock:
@@ -548,6 +568,57 @@ async def quarantine_scan_sign_and_promote(
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     digests = compute_digests(staged_file)
+
+    extra_sidecars: dict[str, Path] = {}
+    staged_bom_cleanup: list[Path] = []
+    sbom_rel = ""
+    cbom_rel = ""
+    cbom_sha256 = ""
+    cbom_asset_count = 0
+    cbom_scan_status = ""
+
+    if settings.bom_generation_enabled:
+        try:
+            sbom_path, cbom_path, cbom_asset_count, cbom_scan_status = generate_artifact_boms(
+                staged_file=staged_file,
+                ecosystem=ecosystem,
+                pkg_name=pkg_name,
+                pkg_version=pkg_version,
+                artifact_rel_path=artifact_rel_path,
+                digests=digests,
+            )
+            staged_bom_cleanup.extend([sbom_path, cbom_path])
+            cbom_sha256 = compute_file_sha256(cbom_path)
+            sbom_rel = f"{artifact_rel_path}.sbom.cdx.json"
+            cbom_rel = f"{artifact_rel_path}.cbom.cdx.json"
+            extra_sidecars[".sbom.cdx.json"] = sbom_path
+            extra_sidecars[".cbom.cdx.json"] = cbom_path
+
+            for bom_suffix, bom_file in ((".sbom.cdx.json", sbom_path), (".cbom.cdx.json", cbom_path)):
+                bom_gpg = sign_artifact_detached_gpg(
+                    artifact_path=bom_file,
+                    gnupghome=settings.gnupghome,
+                    passphrase=settings.gpg_passphrase,
+                    key_id=settings.gpg_key_id or settings.gpg_key_email,
+                )
+                extra_sidecars[f"{bom_suffix}.asc"] = bom_gpg
+                staged_bom_cleanup.append(bom_gpg)
+
+                if settings.pqc_signing_enabled:
+                    bom_pqc = sign_artifact_mldsa65(
+                        artifact_path=bom_file,
+                        privkey_path=settings.mldsa_private_key_path,
+                    )
+                    extra_sidecars[f"{bom_suffix}.mldsa65"] = bom_pqc
+                    staged_bom_cleanup.append(bom_pqc)
+        except Exception as exc:
+            logger.warning(
+                "[CACHE] BOM generation/signing failed for %s (%s): %s",
+                artifact_rel_path,
+                ecosystem,
+                exc,
+            )
+
     has_existing_component = _has_existing_component_versions(dest_file, ecosystem)
     atomic_promote_artifact(
         staged_file=staged_file,
@@ -555,11 +626,14 @@ async def quarantine_scan_sign_and_promote(
         dest_file=dest_file,
         digests=digests,
         pqc_sig_file=pqc_sig_file,
+        extra_sidecars=extra_sidecars,
     )
     staged_file.unlink(missing_ok=True)
     sig_file.unlink(missing_ok=True)
     if pqc_sig_file:
         pqc_sig_file.unlink(missing_ok=True)
+    for tmp_bom in staged_bom_cleanup:
+        tmp_bom.unlink(missing_ok=True)
 
     append_activity_event(
         settings.activity_log_path,
@@ -568,7 +642,7 @@ async def quarantine_scan_sign_and_promote(
         ecosystem=ecosystem,
         component=pkg_name or artifact_rel_path,
         version=pkg_version or "unknown",
-        details=f"artifact={artifact_rel_path} sha256={digests.sha256[:12]}",
+        details=f"artifact={artifact_rel_path} sha256={digests.sha256[:12]} cbom={cbom_scan_status or 'disabled'}",
     )
 
     record = append_provenance_record(
@@ -584,6 +658,11 @@ async def quarantine_scan_sign_and_promote(
         signature_file_mldsa=f"{artifact_rel_path}.mldsa65" if settings.pqc_signing_enabled else "",
         max_cvss=verdict.max_cvss,
         cve_ids=verdict.cve_ids,
+        sbom_file=sbom_rel,
+        cbom_file=cbom_rel,
+        cbom_sha256=cbom_sha256,
+        cbom_asset_count=cbom_asset_count,
+        cbom_scan_status=cbom_scan_status,
     )
     logger.info(
         "[CACHE] PROMOTED ecosystem=%s artifact=%s version=%s clamav=%s cve_status=%s max_cvss=%.1f cves=%s sha256=%s pqc=%s",
@@ -857,7 +936,19 @@ async def get_chainguard_cached_manifest(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     base_ref = reference
-    for suffix in (".asc", ".mldsa65", ".sha256", ".sha384", ".sha512"):
+    for suffix in (
+        ".sbom.cdx.json.asc",
+        ".sbom.cdx.json.mldsa65",
+        ".sbom.cdx.json",
+        ".cbom.cdx.json.asc",
+        ".cbom.cdx.json.mldsa65",
+        ".cbom.cdx.json",
+        ".asc",
+        ".mldsa65",
+        ".sha256",
+        ".sha384",
+        ".sha512",
+    ):
         if reference.endswith(suffix):
             base_ref = reference[: -len(suffix)]
             break
@@ -929,7 +1020,19 @@ async def get_virtual_oci_manifest(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     base_ref = reference
-    for suffix in (".asc", ".mldsa65", ".sha256", ".sha384", ".sha512"):
+    for suffix in (
+        ".sbom.cdx.json.asc",
+        ".sbom.cdx.json.mldsa65",
+        ".sbom.cdx.json",
+        ".cbom.cdx.json.asc",
+        ".cbom.cdx.json.mldsa65",
+        ".cbom.cdx.json",
+        ".asc",
+        ".mldsa65",
+        ".sha256",
+        ".sha384",
+        ".sha512",
+    ):
         if reference.endswith(suffix):
             base_ref = reference[: -len(suffix)]
             break
@@ -2250,7 +2353,19 @@ async def _serve_maven_artifact(
         return FileResponse(requested_file, media_type="application/xml", headers={"X-Cache-Status": "HIT"})
 
     base_rel_path = artifact_path
-    for suffix in (".asc", ".mldsa65", ".sha256", ".sha384", ".sha512"):
+    for suffix in (
+        ".sbom.cdx.json.asc",
+        ".sbom.cdx.json.mldsa65",
+        ".sbom.cdx.json",
+        ".cbom.cdx.json.asc",
+        ".cbom.cdx.json.mldsa65",
+        ".cbom.cdx.json",
+        ".asc",
+        ".mldsa65",
+        ".sha256",
+        ".sha384",
+        ".sha512",
+    ):
         if artifact_path.endswith(suffix):
             base_rel_path = artifact_path[: -len(suffix)]
             break
@@ -2264,7 +2379,8 @@ async def _serve_maven_artifact(
 
     base_sig = base_file.with_name(f"{base_file.name}.asc")
     if requested_file.name.endswith(".mldsa65") and settings.pqc_signing_enabled:
-        if not verify_artifact_mldsa65(base_file, requested_file, settings.mldsa_public_key_path):
+        target_for_sig = requested_file.with_name(requested_file.name[: -len(".mldsa65")])
+        if not verify_artifact_mldsa65(target_for_sig, requested_file, settings.mldsa_public_key_path):
             raise HTTPException(
                 status_code=403,
                 detail="Integrity violation: artifact lacks a valid Trusted OSS ML-DSA-65 PQC signature",
@@ -2356,7 +2472,19 @@ async def _serve_pypi_package_file(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     base_filename = filename
-    for suffix in (".asc", ".mldsa65", ".sha256", ".sha384", ".sha512"):
+    for suffix in (
+        ".sbom.cdx.json.asc",
+        ".sbom.cdx.json.mldsa65",
+        ".sbom.cdx.json",
+        ".cbom.cdx.json.asc",
+        ".cbom.cdx.json.mldsa65",
+        ".cbom.cdx.json",
+        ".asc",
+        ".mldsa65",
+        ".sha256",
+        ".sha384",
+        ".sha512",
+    ):
         if filename.endswith(suffix):
             base_filename = filename[: -len(suffix)]
             break
@@ -2373,7 +2501,8 @@ async def _serve_pypi_package_file(
 
     base_sig = base_file.with_name(f"{base_file.name}.asc")
     if requested_file.name.endswith(".mldsa65") and settings.pqc_signing_enabled:
-        if not verify_artifact_mldsa65(base_file, requested_file, settings.mldsa_public_key_path):
+        target_for_sig = requested_file.with_name(requested_file.name[: -len(".mldsa65")])
+        if not verify_artifact_mldsa65(target_for_sig, requested_file, settings.mldsa_public_key_path):
             raise HTTPException(
                 status_code=403,
                 detail="Integrity violation: Python package lacks a valid Trusted OSS ML-DSA-65 PQC signature",
@@ -2515,6 +2644,7 @@ async def get_jit_status(
     return JSONResponse(content=job)
 
 
+
 @app.api_route("/pypi/virtual/simple/{package}/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 async def get_pypi_virtual_simple_index(
     package: str,
@@ -2642,3 +2772,331 @@ async def get_jit_status(
     if not job:
         raise HTTPException(status_code=404, detail="Job ID not found")
     return JSONResponse(content=job)
+
+
+# ==============================================================================
+# Signed Upstream SBOM / CBOM Attestation Lookup, Batch API, Backfill & OCI 1.1 Referrers
+# ==============================================================================
+
+
+def _read_bom_payload_with_signatures(
+    base_file: Path,
+    bom_file: Path,
+    bom_type: str,
+    include_signatures: bool = True,
+) -> dict[str, Any]:
+    """Read a BOM file along with base64 raw bytes and detached GPG / ML-DSA-65 signatures."""
+    import base64
+
+    raw_bytes = bom_file.read_bytes()
+    doc = json.loads(raw_bytes.decode("utf-8"))
+    sha256_file = base_file.with_name(f"{base_file.name}.sha256")
+    artifact_sha256 = (
+        sha256_file.read_text(encoding="utf-8").strip()
+        if sha256_file.is_file()
+        else compute_file_sha256(base_file)
+    )
+    entry: dict[str, Any] = {
+        bom_type: doc,
+        f"{bom_type}_raw_b64": base64.b64encode(raw_bytes).decode("ascii"),
+        f"{bom_type}_sha256": compute_file_sha256(bom_file),
+        "artifact_name": base_file.name,
+        "artifact_sha256": artifact_sha256,
+    }
+    if include_signatures:
+        gpg_sig = bom_file.with_name(f"{bom_file.name}.asc")
+        mldsa_sig = bom_file.with_name(f"{bom_file.name}.mldsa65")
+        entry["signature_gpg"] = gpg_sig.read_text(encoding="utf-8") if gpg_sig.is_file() else ""
+        entry["signature_mldsa65"] = mldsa_sig.read_text(encoding="utf-8") if mldsa_sig.is_file() else ""
+    return entry
+
+
+def backfill_cached_boms(settings: Settings, force: bool = False) -> dict[str, Any]:
+    """Generate and dual-sign CycloneDX 1.6 SBOM/CBOM sidecars for existing cached artifacts."""
+    scanned = 0
+    generated = 0
+    skipped = 0
+    errors: list[str] = []
+
+    targets: list[tuple[str, Path]] = [
+        ("pypi", settings.trusted_pypi_dir),
+        ("maven", settings.trusted_maven_dir),
+        ("oci-harbor", settings.harbor_oci_cache_dir),
+    ]
+    skip_suffixes = (
+        ".asc",
+        ".mldsa65",
+        ".sha256",
+        ".sha384",
+        ".sha512",
+        ".html",
+        ".json",
+        ".xml",
+    )
+
+    for ecosystem, root_dir in targets:
+        if not root_dir.is_dir():
+            continue
+        for file_path in sorted(root_dir.rglob("*")):
+            if file_path.is_symlink() or not file_path.is_file():
+                continue
+            if file_path.name.startswith(".") or file_path.name.endswith(skip_suffixes):
+                continue
+            # Only backfill promoted (GPG-signed) artifacts
+            if not file_path.with_name(f"{file_path.name}.asc").is_file():
+                continue
+            scanned += 1
+            cbom_file = file_path.with_name(f"{file_path.name}.cbom.cdx.json")
+            if cbom_file.is_file() and not force:
+                skipped += 1
+                continue
+            try:
+                rel_path = file_path.relative_to(root_dir).as_posix()
+                pkg_name, pkg_version = extract_package_coordinates(ecosystem, rel_path)
+                digests = compute_digests(file_path)
+                sbom_p, cbom_p, _, _ = generate_artifact_boms(
+                    staged_file=file_path,
+                    ecosystem=ecosystem,
+                    pkg_name=pkg_name,
+                    pkg_version=pkg_version,
+                    artifact_rel_path=rel_path,
+                    digests=digests,
+                )
+                for bom_p in (sbom_p, cbom_p):
+                    sign_artifact_detached_gpg(
+                        artifact_path=bom_p,
+                        gnupghome=settings.gnupghome,
+                        passphrase=settings.gpg_passphrase,
+                        key_id=settings.gpg_key_id or settings.gpg_key_email,
+                    )
+                    if settings.pqc_signing_enabled:
+                        sign_artifact_mldsa65(
+                            artifact_path=bom_p,
+                            privkey_path=settings.mldsa_private_key_path,
+                        )
+                generated += 1
+            except Exception as exc:
+                errors.append(f"{ecosystem}/{file_path.name}: {exc}")
+
+    return {
+        "scanned": scanned,
+        "generated": generated,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
+@app.get("/bom/lookup")
+async def lookup_bom_by_purl(
+    purl: str,
+    settings: Annotated[Settings, Depends(get_settings)],
+    bom_type: str = "cbom",
+    include_signatures: bool = True,
+) -> JSONResponse:
+    """Resolve a canonical Package URL (purl) to its signed Trusted OSS CBOM or SBOM."""
+    btype = bom_type.lower().strip()
+    if btype not in ("cbom", "sbom"):
+        raise HTTPException(status_code=400, detail="bom_type must be 'cbom' or 'sbom'")
+
+    resolved = resolve_purl_to_bom_file(
+        trusted_pypi_dir=settings.trusted_pypi_dir,
+        trusted_maven_dir=settings.trusted_maven_dir,
+        harbor_oci_cache_dir=settings.harbor_oci_cache_dir,
+        purl=purl,
+        bom_type=btype,
+    )
+    if not resolved:
+        raise HTTPException(status_code=404, detail=f"No signed {btype.upper()} cached for {purl}")
+
+    base_file, bom_file = resolved
+    payload = _read_bom_payload_with_signatures(
+        base_file=base_file,
+        bom_file=bom_file,
+        bom_type=btype,
+        include_signatures=include_signatures,
+    )
+    payload["purl"] = purl
+    return JSONResponse(content=payload)
+
+
+@app.post("/bom/batch")
+async def batch_lookup_boms(
+    req: BomBatchRequest,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> JSONResponse:
+    """Batch-resolve PURLs to signed Trusted OSS CBOM/SBOM attestations in a single round-trip."""
+    btype = req.bom_type.lower().strip()
+    if btype not in ("cbom", "sbom"):
+        raise HTTPException(status_code=400, detail="bom_type must be 'cbom' or 'sbom'")
+
+    found: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+
+    for purl in req.purls:
+        clean_purl = str(purl or "").strip()
+        if not clean_purl:
+            continue
+        resolved = resolve_purl_to_bom_file(
+            trusted_pypi_dir=settings.trusted_pypi_dir,
+            trusted_maven_dir=settings.trusted_maven_dir,
+            harbor_oci_cache_dir=settings.harbor_oci_cache_dir,
+            purl=clean_purl,
+            bom_type=btype,
+        )
+        if resolved:
+            base_file, bom_file = resolved
+            found[clean_purl] = _read_bom_payload_with_signatures(
+                base_file=base_file,
+                bom_file=bom_file,
+                bom_type=btype,
+                include_signatures=req.include_signatures,
+            )
+        else:
+            missing.append(clean_purl)
+
+    warm_enqueued = False
+    if req.trigger_pull_on_miss and missing:
+        try:
+            bus = get_job_bus(request.app, settings)
+            await bus.enqueue("warm", {"discover": False})
+            warm_enqueued = True
+        except Exception as exc:
+            logger.warning("Failed to enqueue background warm on BOM batch miss: %s", exc)
+
+    return JSONResponse(
+        content={
+            "bom_type": btype,
+            "requested_count": len(req.purls),
+            "found_count": len(found),
+            "missing_count": len(missing),
+            "warm_enqueued": warm_enqueued,
+            "found": found,
+            "missing": missing,
+        }
+    )
+
+
+@app.post("/catalog/backfill-boms")
+async def trigger_backfill_boms(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    x_gatekeeper_token: Annotated[str | None, Header()] = None,
+    force: bool = False,
+    wait: bool = True,
+) -> JSONResponse:
+    """Admin endpoint to backfill signed SBOM/CBOM sidecars for all previously cached artifacts."""
+    require_admin_token(x_gatekeeper_token, settings)
+    if not wait or settings.gatekeeper_role == "frontend":
+        bus = get_job_bus(request.app, settings)
+        job_id = await bus.enqueue("backfill_boms", {"force": force})
+        return JSONResponse(
+            status_code=202,
+            content={"job_id": job_id, "status": "queued", "job_type": "backfill_boms"},
+        )
+    summary = backfill_cached_boms(settings=settings, force=force)
+    return JSONResponse(content=summary)
+
+
+@app.get("/v2/{namespace}/{repo_path:path}/referrers/{digest}")
+async def get_oci_referrers(
+    namespace: str,
+    repo_path: str,
+    digest: str,
+    settings: Annotated[Settings, Depends(get_settings)],
+    artifactType: str | None = None,
+) -> JSONResponse:
+    """OCI Distribution Spec v1.1 Referrers API exposing attached CycloneDX CBOM/SBOM descriptors."""
+    cache_root = (
+        settings.harbor_oci_cache_dir
+        if namespace == "chainguard-cache"
+        else settings.oss_data_root / "harbor" / "registry" / namespace
+    )
+    manifests_dir = resolve_safe_relative_path(cache_root, f"{repo_path}/manifests")
+    if not manifests_dir.is_dir():
+        return JSONResponse(
+            content={"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": []},
+            headers={"Docker-Distribution-API-Version": "registry/2.0"},
+        )
+
+    target_hex = digest.split(":", 1)[1] if digest.startswith("sha256:") else digest
+    matched_base: Path | None = None
+    for candidate in manifests_dir.iterdir():
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        if candidate.name.endswith((".asc", ".mldsa65", ".sha256", ".sha384", ".sha512", ".json")):
+            continue
+        sha_file = candidate.with_name(f"{candidate.name}.sha256")
+        sha_val = sha_file.read_text(encoding="utf-8").strip() if sha_file.is_file() else ""
+        if candidate.name == digest or sha_val == target_hex:
+            matched_base = candidate
+            break
+
+    descriptors: list[dict[str, Any]] = []
+    if matched_base is not None:
+        for btype, suffix in (("cbom", ".cbom.cdx.json"), ("sbom", ".sbom.cdx.json")):
+            bom_path = matched_base.with_name(f"{matched_base.name}{suffix}")
+            if not bom_path.is_file():
+                continue
+            art_type = "application/vnd.cyclonedx+json"
+            if artifactType and artifactType != art_type:
+                continue
+            bom_sha = compute_file_sha256(bom_path)
+            descriptors.append(
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "artifactType": art_type,
+                    "size": bom_path.stat().st_size,
+                    "digest": f"sha256:{bom_sha}",
+                    "annotations": {
+                        "org.opencontainers.image.title": f"{btype}.cyclonedx.json",
+                        "io.cyclonedx.bomFormat": "CycloneDX",
+                        "io.cyclonedx.type": btype,
+                    },
+                }
+            )
+
+    headers = {"Docker-Distribution-API-Version": "registry/2.0"}
+    if artifactType:
+        headers["OCI-Filters-Applied"] = "artifactType"
+    return JSONResponse(
+        content={
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": descriptors,
+        },
+        headers=headers,
+    )
+
+
+@app.get("/v2/{namespace}/{repo_path:path}/blobs/{digest}")
+async def get_oci_referrer_blob(
+    namespace: str,
+    repo_path: str,
+    digest: str,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> FileResponse:
+    """Serve attached CycloneDX CBOM/SBOM blobs referenced by the OCI 1.1 Referrers API."""
+    cache_root = (
+        settings.harbor_oci_cache_dir
+        if namespace == "chainguard-cache"
+        else settings.oss_data_root / "harbor" / "registry" / namespace
+    )
+    manifests_dir = resolve_safe_relative_path(cache_root, f"{repo_path}/manifests")
+    target_hex = digest.split(":", 1)[1] if digest.startswith("sha256:") else digest
+    if manifests_dir.is_dir():
+        for bom_file in manifests_dir.iterdir():
+            if bom_file.is_symlink() or not bom_file.is_file():
+                continue
+            if not bom_file.name.endswith((".cbom.cdx.json", ".sbom.cdx.json")):
+                continue
+            if compute_file_sha256(bom_file) == target_hex:
+                return FileResponse(
+                    bom_file,
+                    media_type="application/vnd.cyclonedx+json",
+                    headers={
+                        "Docker-Content-Digest": f"sha256:{target_hex}",
+                        "Docker-Distribution-API-Version": "registry/2.0",
+                    },
+                )
+    raise HTTPException(status_code=404, detail=f"OCI blob not found: {digest}")

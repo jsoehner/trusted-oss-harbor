@@ -269,6 +269,11 @@ def append_provenance_record(
     hmac_key: bytes | None = None,
     max_cvss: float = 0.0,
     cve_ids: list[str] | None = None,
+    sbom_file: str = "",
+    cbom_file: str = "",
+    cbom_sha256: str = "",
+    cbom_asset_count: int = 0,
+    cbom_scan_status: str = "",
 ) -> dict[str, Any]:
     """Append an immutable provenance record to provenance.jsonl."""
     provenance_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -286,6 +291,11 @@ def append_provenance_record(
         "cve_ids": list(cve_ids or []),
         "signature_file": signature_file,
         "signature_file_mldsa": signature_file_mldsa,
+        "sbom_file": sbom_file,
+        "cbom_file": cbom_file,
+        "cbom_sha256": cbom_sha256,
+        "cbom_asset_count": cbom_asset_count,
+        "cbom_scan_status": cbom_scan_status,
         "pqc_status": "POST-QUANTUM READY" if signature_file_mldsa else "CLASSICAL",
         "attestation_hmac": hmac.new(
             resolved_key,

@@ -59,6 +59,8 @@ class Settings(BaseSettings):
     )
     allow_simulated_cvss: bool = Field(default=False, alias="ALLOW_SIMULATED_CVSS")
     pqc_signing_enabled: bool = Field(default=True, alias="PQC_SIGNING_ENABLED")
+    bom_generation_enabled: bool = Field(default=True, alias="BOM_GENERATION_ENABLED")
+    bom_scan_timeout_seconds: int = Field(default=30, alias="BOM_SCAN_TIMEOUT_SECONDS")
     virtual_repo_enabled: bool = Field(default=True, alias="VIRTUAL_REPO_ENABLED")
     cve_scanner_mode: str = Field(default="auto", alias="CVE_SCANNER_MODE")
     workspace_scan_roots: str = Field(default="", alias="WORKSPACE_SCAN_ROOTS")

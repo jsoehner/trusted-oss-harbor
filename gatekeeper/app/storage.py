@@ -78,8 +78,9 @@ def atomic_promote_artifact(
     dest_file: Path,
     digests: ArtifactDigests,
     pqc_sig_file: Path | None = None,
+    extra_sidecars: dict[str, Path] | None = None,
 ) -> None:
-    """Atomically promote a scanned & signed artifact and its .asc/.mldsa65/.sha256/.sha384/.sha512 files."""
+    """Atomically promote a scanned & signed artifact and its .asc/.mldsa65/.sha* and BOM sidecars."""
     dest_file.parent.mkdir(parents=True, exist_ok=True)
     pid = os.getpid()
     tmp_dest = dest_file.with_name(f".{dest_file.name}.tmp.{pid}")
@@ -91,10 +92,20 @@ def atomic_promote_artifact(
     if tmp_pqc and pqc_sig_file:
         shutil.copy2(pqc_sig_file, tmp_pqc)
 
+    staged_extras: list[tuple[Path, Path]] = []
+    if extra_sidecars:
+        for suffix, src_path in extra_sidecars.items():
+            if src_path and src_path.exists():
+                tmp_extra = dest_file.with_name(f".{dest_file.name}{suffix}.tmp.{pid}")
+                shutil.copy2(src_path, tmp_extra)
+                staged_extras.append((tmp_extra, dest_file.with_name(f"{dest_file.name}{suffix}")))
+
     os.replace(tmp_dest, dest_file)
     os.replace(tmp_sig, dest_file.with_name(f"{dest_file.name}.asc"))
     if tmp_pqc:
         os.replace(tmp_pqc, dest_file.with_name(f"{dest_file.name}.mldsa65"))
+    for tmp_extra, final_extra in staged_extras:
+        os.replace(tmp_extra, final_extra)
 
     dest_file.with_name(f"{dest_file.name}.sha256").write_text(
         f"{digests.sha256}\n", encoding="utf-8"
@@ -124,7 +135,7 @@ def render_pep503_simple_index(package_name: str, pkg_dir: Path) -> str:
         for entry in sorted(pkg_dir.iterdir(), key=lambda p: p.name):
             if entry.is_symlink() or not entry.is_file():
                 continue
-            if entry.name.endswith((".asc", ".mldsa65", ".sha256", ".sha384", ".sha512", ".html")):
+            if entry.name.endswith((".asc", ".mldsa65", ".sha256", ".sha384", ".sha512", ".html", ".json")):
                 continue
             asc_path = entry.with_name(f"{entry.name}.asc")
             sha256_path = entry.with_name(f"{entry.name}.sha256")

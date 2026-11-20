@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-11-20
+
+### Added
+- **Per-Artifact Dual-Signed CycloneDX 1.6 SBOM & CBOM Attestations ([ADR 0010](docs/adr/0010-signed-artifact-cbom-attestations-and-purl-batch-api.md))**:
+  - Added `gatekeeper/app/bom_generator.py` to inspect promoted Maven, PyPI, and OCI artifacts in pure Python and emit CycloneDX 1.6 `.sbom.cdx.json` and `.cbom.cdx.json` sidecars (including `VERIFIED_INERT` attestations when zero cryptographic primitives are present).
+  - Dual-signs all generated BOM sidecars with **GPG** (`.asc`) and **NIST FIPS 204 ML-DSA-65** (`.mldsa65`), atomically promotes them in `gatekeeper/app/storage.py`, excludes them from PEP 503 Simple indices, and tracks them in `provenance.jsonl` and `_ARTIFACT_SIDECARS` (CVE quarantine & GC).
+- **PURL Lookup, Batch CBOM API & Backfill**:
+  - Added `GET /bom/lookup?purl=...`, `POST /bom/batch` (single round-trip resolution with detached signatures and optional `trigger_pull_on_miss`), and `POST /catalog/backfill-boms` (admin-gated backfill for previously cached artifacts, supporting Valkey engine bus `backfill_boms` jobs).
+  - Routed `location /bom/` in `config/nginx/oss-gateway.conf` and `config/nginx/appliance-gateway.conf`.
+- **OCI 1.1 Referrers API**:
+  - Added `GET /v2/{namespace}/{repo_path}/referrers/{digest}` and `GET /v2/{namespace}/{repo_path}/blobs/{digest}` exposing attached CycloneDX CBOM/SBOM descriptors for cached OCI manifests.
+- **Tests**: Added `gatekeeper/tests/test_bom_attestations.py`.
+
 ## [1.5.0] - 2026-11-20
 
 ### Added

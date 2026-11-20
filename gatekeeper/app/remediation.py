@@ -21,7 +21,21 @@ from app.virtual_repo import extract_package_coordinates
 
 logger = logging.getLogger("gatekeeper.remediation")
 
-_ARTIFACT_SIDECARS = ("", ".asc", ".mldsa65", ".sha256", ".sha384", ".sha512", ".metadata.json")
+_ARTIFACT_SIDECARS = (
+    "",
+    ".asc",
+    ".mldsa65",
+    ".sha256",
+    ".sha384",
+    ".sha512",
+    ".metadata.json",
+    ".sbom.cdx.json",
+    ".sbom.cdx.json.asc",
+    ".sbom.cdx.json.mldsa65",
+    ".cbom.cdx.json",
+    ".cbom.cdx.json.asc",
+    ".cbom.cdx.json.mldsa65",
+)
 
 
 def version_sort_key(version: str) -> tuple[tuple[int, int, str], ...]:
