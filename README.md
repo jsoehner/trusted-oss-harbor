@@ -1,5 +1,7 @@
 # Trusted OSS Supply Chain Platform (`trusted-oss-harbor`)
 
+> **Build & Functional Verification**: Verified functional on `2026-11-20` by **Jeffs' Automated build and deploy agent** (44/44 unit & integration tests, Trusted OSS PyPI install, live browser & `curl` API checks) — see [`docs/BUILD_VERIFICATION.md`](docs/BUILD_VERIFICATION.md).
+
 Self-hosted, containerized **Trusted Open-Source Software (OSS) Supply Chain Platform** combining **CNCF Harbor** (for OCI containers, Helm charts, and ORAS artifacts) with an automated **Quarantine $\rightarrow$ ClamAV Antivirus $\rightarrow$ Trivy/NVD Vulnerability Gate $\rightarrow$ GPG/Cosign Cryptographic Signer** for **Java (Maven)** and **Python (PyPI)** packages, designed to run behind a **pfSense** firewall backed by a **TrueNAS SCALE native ZFS dataset** (`/mnt/Pool1/trusted-oss-data`, with optional **TrueNAS iSCSI** block mount for external Linux hosts or **S3** object store).
 
 ---
