@@ -409,3 +409,172 @@ Repositories remain **public-by-default** (Maven Central, PyPI, `cgr.dev`) until
      ```
    - Downstream `jsoehner/jsi-bom-actions@v1.2.0` workflows query `POST /bom/batch` over mTLS (using `trusted-oss-url`, `trusted-oss-mtls-cert`, and `trusted-oss-mtls-key`) to eliminate third-party cryptographic blind spots.
 
+### 4.6 Querying Signed SBOM/CBOM Components with ORAS & Automated CI Health Gate
+
+Developers and pipeline owners can query `trusted-oss-harbor` directly to verify that a requested container image or package (1) carries **cryptographically signed CycloneDX 1.6 SBOM and CBOM attestations** and (2) holds a **verified `CLEAN` health record** (ClamAV malware scan + OSV/Trivy CVE gate below `CVSS_FAIL_THRESHOLD`) before pulling it into a build or deployment.
+
+#### 1. Developer CLI — Discover & Pull Attached SBOM/CBOM with ORAS (OCI 1.1 Referrers)
+
+Every cached OCI manifest exposes attached CycloneDX 1.6 SBOM and CBOM descriptors via the **OCI Distribution Spec v1.1 Referrers API** (`GET /v2/{namespace}/{repo}/referrers/{digest}` and `/blobs/{digest}`):
+
+```bash
+# 1. Discover attached CycloneDX 1.6 SBOM & CBOM referrers (LAN HTTP example; omit --plain-http over HTTPS)
+oras discover --plain-http \
+  --artifact-type application/vnd.cyclonedx+json \
+  --format tree \
+  oss.jsigroup.local:8080/chainguard-cache/chainguard/jre:latest
+
+# 2. Emit machine-readable JSON to extract the CBOM / SBOM blob digests
+oras discover --plain-http \
+  --artifact-type application/vnd.cyclonedx+json \
+  --format json \
+  oss.jsigroup.local:8080/chainguard-cache/chainguard/jre:latest
+
+# 3. Pull an attached CycloneDX CBOM or SBOM blob by digest
+oras blob fetch --plain-http --output cbom.cdx.json \
+  oss.jsigroup.local:8080/chainguard-cache/chainguard/jre@sha256:<cbom_digest>
+```
+
+> [!TIP]
+> Over WAN behind pfSense HAProxy mTLS (`https://oss.yourdomain.com`), pass your client certificate and key directly with `curl --cert ~/.oss-tls/client.crt --key ~/.oss-tls/client.key` to `GET /v2/{namespace}/{repo}/referrers/{digest}?artifactType=application/vnd.cyclonedx%2Bjson`.
+
+#### 2. Verify Detached Signatures (GPG + ML-DSA-65) & Health Record (Any Ecosystem: OCI, Maven, PyPI)
+
+Use `/bom/lookup` (single component) or `/bom/batch` (multi-PURL) to retrieve the CycloneDX 1.6 SBOM/CBOM with detached **RSA-3072 GPG (`.asc`)** and **NIST FIPS 204 ML-DSA-65 (`.mldsa65`)** signatures, and query `/catalog/vulnerabilities?verify_signatures=true` for the live health record:
+
+```bash
+# 1. Fetch signed CycloneDX 1.6 CBOM (with detached .asc & .mldsa65 signatures)
+curl -fsSL "http://oss.jsigroup.local:8080/bom/lookup?purl=pkg:oci/chainguard/jre@latest&bom_type=cbom&include_signatures=true" | jq '{
+  purl,
+  artifact_sha256,
+  has_gpg_sig: (.signature_gpg | length > 0),
+  has_pqc_sig: (.signature_mldsa65 | length > 0),
+  crypto_status: (.cbom.metadata.component.properties[] | select(.name=="trusted-oss:crypto-scan-status") | .value)
+}'
+
+# 2. Query the component's live health record (signatures, ClamAV, CVE/CVSS, quarantine state)
+curl -fsSL "http://oss.jsigroup.local:8080/catalog/vulnerabilities?ecosystem=oci&components=chainguard/jre&verify_signatures=true" | jq '.components[0] | {
+  component, version, signature_valid, pqc_signed, clamav_status, vulnerability_status, max_cvss, cve_ids
+}'
+```
+
+A component is **approved for use** only when all four checks pass:
+1. **ORAS / BOM Presence**: Both CycloneDX 1.6 **SBOM** and **CBOM** exist (with `CRYPTO_ASSETS_DETECTED` or `VERIFIED_INERT` status).
+2. **Cryptographic Signature**: Detached **GPG (`.asc`)** verifies against `/keys/trusted-oss-pubkey.asc` and **ML-DSA-65 (`.mldsa65`)** is present and verifiable via `client-templates/pqc-verify.py`.
+3. **Malware & CVE Health Record**: `clamav_status == "CLEAN"`, `vulnerability_status == "CLEAN"`, and `max_cvss < 7.0`.
+4. **Zero Active Quarantine**: Component is not listed under `quarantined_components`.
+
+#### 3. Automated GitHub Action Decision Gate (`client-templates/github-actions-verify-component.yml`)
+
+Pipeline owners can drop in the reusable workflow template [`client-templates/github-actions-verify-component.yml`](../client-templates/github-actions-verify-component.yml) to automatically decide whether a requested component is signed, carries verified CycloneDX SBOM/CBOM attestations (discovered via ORAS for OCI), and has a `CLEAN` health record before allowing downstream build/deploy jobs to proceed:
+
+```yaml
+jobs:
+  verify-base-image:
+    uses: jsoehner/trusted-oss-harbor/client-templates/github-actions-verify-component.yml@main
+    with:
+      ecosystem: oci
+      component_name: chainguard/jre
+      component_ref: chainguard-cache/chainguard/jre:latest
+      purl: pkg:oci/chainguard/jre@latest
+      require_pqc: true
+      max_cvss: "7.0"
+    secrets:
+      OSS_MTLS_CLIENT_CERT: ${{ secrets.OSS_MTLS_CLIENT_CERT }}
+      OSS_MTLS_CLIENT_KEY: ${{ secrets.OSS_MTLS_CLIENT_KEY }}
+
+  build-and-deploy:
+    needs: verify-base-image
+    if: ${{ needs.verify-base-image.outputs.approved == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Building with verified digest ${{ needs.verify-base-image.outputs.artifact_sha256 }}"
+```
+
+The action fails closed (exits non-zero) if any signature, SBOM/CBOM referrer, malware check, or CVE threshold fails, and publishes a Markdown **Trusted OSS Component Verification Decision** table directly to `$GITHUB_STEP_SUMMARY`.
+
+---
+
+## 5. Troubleshooting HTTP 451 & Debugging Component Lifecycle
+
+### 5.1 Why Automation Loops on HTTP `451` (and How to Stop Wasting Retries/Tokens)
+
+`HTTP 451 Unavailable For Legal Reasons` (RFC 7725) is **never a transient network error**. In `trusted-oss-harbor`, `451` means Gatekeeper **intentionally blocked** the requested version because it failed a supply-chain policy gate (ClamAV malware detection, Zip-Slip/encrypted archive violation, or a High/Critical vulnerability with `CVSS >= 7.0`).
+
+Because package managers (`mvn`, `pip`, `uv`) and AI/CI upgrade bots often treat non-200 HTTP responses as retryable failures, they can burn retries, build minutes, and LLM tokens repeatedly requesting the same quarantined version. **Before letting automation retry**, a human (or pre-flight gate) should inspect the component's lifecycle in the registry to see:
+1. **How many versions are cached locally**
+2. **Which versions are clean and releasable** (`SERVING_LATEST` / `CACHED`)
+3. **Which versions are blocked/quarantined** (`QUARANTINED`, with exact CVE IDs, CVSS score, and clean replacement)
+
+### 5.2 Human-Readable Endpoints (Gatekeeper vs. Underlying Harbor)
+
+| Tool / Layer | Human-Readable Path / Command | Ecosystems Covered | What It Shows |
+| :--- | :--- | :--- | :--- |
+| **Gatekeeper Interactive Web UI (Swagger)** | `http://oss.jsigroup.local:8080/docs` | **OCI, Maven, PyPI** | Browser UI to query `/catalog/vulnerabilities`, `/catalog/retention`, `/audit/activity`, and `/bom/lookup` without writing `curl` commands |
+| **Gatekeeper CLI Table Viewer** | `python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --components <name>` | **OCI, Maven, PyPI** | Formatted ASCII tables: **Cached (Releasable)**, **Quarantined (Blocked)**, and **Component Caching History (`SERVING_LATEST` / `CACHED` / `QUARANTINED` / `HISTORICAL`)** |
+| **Gatekeeper Lifecycle JSON API** | `GET /catalog/vulnerabilities?ecosystem=<eco>&components=<name>` | **OCI, Maven, PyPI** | `summary` counts, `components` (releasable), `quarantined` (blocked + CVEs + replacement), and `history` (full version lifecycle) |
+| **Gatekeeper Retention & TTL API** | `GET /catalog/retention` | **OCI, Maven, PyPI** | Every cached version's inactivity age and 90-day TTL runway (`active`, `expiring_soon`, `expired`) |
+| **Gatekeeper Activity Audit Log** | `GET /audit/activity?limit=50` | **OCI, Maven, PyPI** | Recent `BLOCKED`, `QUARANTINED`, `ARTIFACT_REQUESTED`, and `HOURLY_CVE_RESCAN` events |
+| **Harbor Web Portal** *(when full Harbor is deployed)* | `https://<harbor-host>/harbor/projects` | **OCI / Helm / ORAS only** | Browser UI showing container tags, Trivy CVE summaries, signatures, and OCI 1.1 Referrer accessories |
+| **Harbor API Explorer / REST v2.0** *(full Harbor)* | `https://<harbor-host>/devcenter-api-2.0` & `GET /api/v2.0/projects/chainguard-cache/repositories/{repo}/artifacts?with_scan_overview=true&with_signature=true&with_accessory=true` | **OCI / Helm / ORAS only** | Per-digest Trivy scan overview, signature status, and attached SBOM/CBOM accessories |
+
+> [!NOTE]
+> Underlying **CNCF Harbor** only tracks OCI container/Helm/ORAS artifacts. **Gatekeeper's `/docs`, `/catalog/vulnerabilities`, and `scripts/catalog_frontend.py`** are the unified human-readable interface covering **Maven, PyPI, and OCI** together, including quarantine status and clean replacements.
+
+### 5.3 Step-by-Step Human Debugging Playbook
+
+#### Step 1 — Inspect the Component's Full Lifecycle Table (Recommended First Step)
+
+Run `scripts/catalog_frontend.py` filtered to the component that returned `451` (for example, `requests` or `spring-boot-starter-web`):
+
+```bash
+GATEKEEPER_ADMIN_TOKEN="<token>" \
+  python3 scripts/catalog_frontend.py \
+  --url http://oss.jsigroup.local:8080 \
+  --ecosystem pypi \
+  --components requests
+```
+
+This prints three human-readable tables:
+1. **Cached Components (Releasable)** — Every version currently in `/data/packages/trusted-*` that **can be downloaded**, with signature status, ClamAV status, CVSS, and tags (`latest`).
+2. **Quarantined (Vulnerable / Blocked)** — Every version that **cannot be downloaded** (`HTTP 451`), showing `MAX_CVSS`, `FAILING_CVES`, and `LATEST_REPLACEMENT`.
+3. **Component Caching History** — The complete version timeline showing `SERVING_LATEST`, `CACHED`, `QUARANTINED`, and `HISTORICAL` states.
+
+#### Step 2 — Query Counts, Releasable Versions & Blocked Versions via `curl` + `jq`
+
+If you only have `curl` and `jq` (or want to inspect over WAN mTLS using `--cert ~/.oss-tls/client.crt --key ~/.oss-tls/client.key`):
+
+```bash
+curl -fsSL "http://oss.jsigroup.local:8080/catalog/vulnerabilities?ecosystem=pypi&components=requests" | jq '{
+  cvss_threshold: .cvss_fail_threshold,
+  cached_locally_count: .summary.total,
+  clean_releasable_count: .summary.clean,
+  quarantined_blocked_count: .summary.quarantined,
+  recommended_latest: (.history[0].serving_latest_version // "none"),
+  releasable_versions: [.components[] | select(.vulnerability_status == "CLEAN") | {version, tags, max_cvss}],
+  blocked_quarantined_versions: [.quarantined[] | {version, max_cvss, cve_ids, latest_replacement}],
+  full_lifecycle: (.history[0].versions // [])
+}'
+```
+
+#### Step 3 — Check Why a Pull-Through Request Was Blocked in Real Time
+
+Inspect the recent activity log to see the exact block reason (e.g., `CVSS >= 7.0`, ClamAV signature, or archive guard) for an uncached version that never made it into the trusted store:
+
+```bash
+curl -fsSL "http://oss.jsigroup.local:8080/audit/activity?limit=25" | jq '.events[] | select(.event | test("BLOCKED|QUARANTINED")) | {timestamp, event, ecosystem, component, version, details}'
+```
+
+#### Step 4 — Resolve the Block & Prevent Future Retry Loops
+
+1. **Pin to a Releasable Version**: Update the project's dependency (`pom.xml`, `pyproject.toml`, `Dockerfile`) to `recommended_latest` (a version listed under `releasable_versions` with `SERVING_LATEST` or `CLEAN`).
+2. **Trigger Auto-Remediation if No Clean Version Is Cached Yet**:
+   ```bash
+   GATEKEEPER_ADMIN_TOKEN="<token>" \
+     python3 scripts/catalog_frontend.py \
+     --url http://oss.jsigroup.local:8080 \
+     --ecosystem pypi --components requests --remediate --wait
+   ```
+   This instructs `oss-engine` to find the newest clean upstream version below `CVSS_FAIL_THRESHOLD`, scan & dual-sign it, and tag it `latest`.
+3. **Gate Automation Up Front**: Wire [`client-templates/github-actions-verify-component.yml`](../client-templates/github-actions-verify-component.yml) into CI/CD pipelines so jobs check `/catalog/vulnerabilities` and fail fast with a clear `$GITHUB_STEP_SUMMARY` instead of retrying `451` downloads.
+

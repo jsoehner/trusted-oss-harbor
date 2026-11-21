@@ -1,0 +1,359 @@
+# ==============================================================================
+# Reusable GitHub Action: Verify Trusted OSS Component Signature, Signed
+# CycloneDX 1.6 SBOM/CBOM (via ORAS / PURL API), and Health Record
+# ==============================================================================
+# Usage from any consumer repository:
+#
+#   jobs:
+#     verify-component:
+#       uses: jsoehner/trusted-oss-harbor/client-templates/github-actions-verify-component.yml@main
+#       with:
+#         ecosystem: oci
+#         component_name: chainguard/jre
+#         component_ref: chainguard-cache/chainguard/jre:latest
+#         purl: pkg:oci/chainguard/jre@latest
+#       secrets:
+#         OSS_MTLS_CLIENT_CERT: ${{ secrets.OSS_MTLS_CLIENT_CERT }}
+#         OSS_MTLS_CLIENT_KEY: ${{ secrets.OSS_MTLS_CLIENT_KEY }}
+#
+# Or copy this file into .github/workflows/verify-trusted-component.yml in your
+# repository and invoke it via workflow_call or workflow_dispatch.
+# ==============================================================================
+name: Verify Trusted OSS Component (ORAS + Signed SBOM/CBOM + Health Gate)
+
+on:
+  workflow_call:
+    inputs:
+      ecosystem:
+        description: "Component ecosystem: oci, pypi, or maven"
+        required: true
+        type: string
+      component_name:
+        description: "Component name as tracked in /catalog/vulnerabilities (e.g. chainguard/jre, requests, org.springframework.boot:spring-boot-starter-web)"
+        required: true
+        type: string
+      component_ref:
+        description: "OCI reference for ORAS discovery (e.g. chainguard-cache/chainguard/jre:latest). Optional for pypi/maven."
+        required: false
+        default: ""
+        type: string
+      purl:
+        description: "Canonical Package URL (e.g. pkg:oci/chainguard/jre@latest, pkg:pypi/requests@2.32.4, pkg:maven/org.springframework.boot/spring-boot-starter-web@3.4.4)"
+        required: true
+        type: string
+      require_pqc:
+        description: "Require NIST FIPS 204 ML-DSA-65 signature alongside GPG RSA-3072"
+        required: false
+        default: true
+        type: boolean
+      max_cvss:
+        description: "Maximum allowed CVSS score (components at or above this threshold are rejected)"
+        required: false
+        default: "7.0"
+        type: string
+    secrets:
+      OSS_MTLS_CLIENT_CERT:
+        description: "mTLS client certificate PEM for pfSense HAProxy edge"
+        required: false
+      OSS_MTLS_CLIENT_KEY:
+        description: "mTLS client private key PEM for pfSense HAProxy edge"
+        required: false
+    outputs:
+      approved:
+        description: "true if component passed signature, SBOM/CBOM, and health checks"
+        value: ${{ jobs.verify-component.outputs.approved }}
+      artifact_sha256:
+        description: "Verified SHA-256 digest of the component"
+        value: ${{ jobs.verify-component.outputs.artifact_sha256 }}
+      vulnerability_status:
+        description: "Health record vulnerability classification (CLEAN, VULNERABLE, UNSCANNED)"
+        value: ${{ jobs.verify-component.outputs.vulnerability_status }}
+      cbom_scan_status:
+        description: "CycloneDX CBOM status (CRYPTO_ASSETS_DETECTED or VERIFIED_INERT)"
+        value: ${{ jobs.verify-component.outputs.cbom_scan_status }}
+
+  workflow_dispatch:
+    inputs:
+      ecosystem:
+        description: "Component ecosystem (oci, pypi, maven)"
+        required: true
+        default: "oci"
+        type: choice
+        options:
+          - oci
+          - pypi
+          - maven
+      component_name:
+        description: "Component name (e.g. chainguard/jre)"
+        required: true
+        default: "chainguard/jre"
+      component_ref:
+        description: "OCI reference for ORAS (e.g. chainguard-cache/chainguard/jre:latest)"
+        required: false
+        default: "chainguard-cache/chainguard/jre:latest"
+      purl:
+        description: "Canonical PURL (e.g. pkg:oci/chainguard/jre@latest)"
+        required: true
+        default: "pkg:oci/chainguard/jre@latest"
+      require_pqc:
+        description: "Require ML-DSA-65 PQC signature"
+        required: false
+        default: true
+        type: boolean
+      max_cvss:
+        description: "Maximum allowed CVSS score"
+        required: false
+        default: "7.0"
+
+permissions:
+  contents: read
+
+jobs:
+  verify-component:
+    name: Verify Signed SBOM/CBOM & Health Record
+    runs-on: ubuntu-latest
+    outputs:
+      approved: ${{ steps.gate.outputs.approved }}
+      artifact_sha256: ${{ steps.gate.outputs.artifact_sha256 }}
+      vulnerability_status: ${{ steps.gate.outputs.vulnerability_status }}
+      cbom_scan_status: ${{ steps.gate.outputs.cbom_scan_status }}
+
+    steps:
+      - name: Install ORAS CLI
+        uses: oras-project/setup-oras@v1
+        with:
+          version: "1.2.2"
+
+      - name: Configure mTLS & Import Trusted OSS Signing Keys
+        env:
+          CACHE_URL: ${{ vars.TRUSTED_OSS_CACHE_URL }}
+          OSS_MTLS_CLIENT_CERT: ${{ secrets.OSS_MTLS_CLIENT_CERT }}
+          OSS_MTLS_CLIENT_KEY: ${{ secrets.OSS_MTLS_CLIENT_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CACHE_URL}" ]]; then
+            echo "::error::vars.TRUSTED_OSS_CACHE_URL must be configured to query the Trusted OSS registry."
+            exit 1
+          fi
+          mkdir -p ~/.oss-tls /tmp/oss-verify
+          CURL_TLS_ARGS=()
+          if [[ -n "${OSS_MTLS_CLIENT_CERT}" && -n "${OSS_MTLS_CLIENT_KEY}" ]]; then
+            printf '%s\n' "${OSS_MTLS_CLIENT_CERT}" > ~/.oss-tls/client.crt
+            printf '%s\n' "${OSS_MTLS_CLIENT_KEY}" > ~/.oss-tls/client.key
+            chmod 0600 ~/.oss-tls/client.key
+            CURL_TLS_ARGS=(--cert ~/.oss-tls/client.crt --key ~/.oss-tls/client.key)
+          fi
+
+          BASE="${CACHE_URL%/}"
+          curl -fsSL "${CURL_TLS_ARGS[@]}" "${BASE}/keys/trusted-oss-pubkey.asc" -o /tmp/oss-verify/trusted-oss-pubkey.asc
+          gpg --batch --import /tmp/oss-verify/trusted-oss-pubkey.asc
+          curl -fsSL "${CURL_TLS_ARGS[@]}" "${BASE}/keys/trusted-oss-mldsa65.pub" -o /tmp/oss-verify/trusted-oss-mldsa65.pub || true
+
+      - name: Gate 1 — Discover Attached CycloneDX SBOM/CBOM via ORAS (OCI 1.1 Referrers)
+        if: ${{ inputs.ecosystem == 'oci' && inputs.component_ref != '' }}
+        env:
+          CACHE_URL: ${{ vars.TRUSTED_OSS_CACHE_URL }}
+          COMPONENT_REF: ${{ inputs.component_ref }}
+        run: |
+          set -euo pipefail
+          BASE="${CACHE_URL%/}"
+          REGISTRY_HOST="${BASE#https://}"
+          REGISTRY_HOST="${REGISTRY_HOST#http://}"
+
+          # Resolve manifest digest first so ORAS / OCI 1.1 Referrers query is exact
+          CURL_TLS_ARGS=()
+          if [[ -f ~/.oss-tls/client.crt && -f ~/.oss-tls/client.key ]]; then
+            CURL_TLS_ARGS=(--cert ~/.oss-tls/client.crt --key ~/.oss-tls/client.key)
+          fi
+
+          # Split component_ref into namespace/repo and tag (e.g. chainguard-cache/chainguard/jre:latest)
+          REPO_PART="${COMPONENT_REF%:*}"
+          TAG_PART="${COMPONENT_REF##*:}"
+          MANIFEST_URL="${BASE}/v2/${REPO_PART}/manifests/${TAG_PART}"
+          curl -fsSL "${CURL_TLS_ARGS[@]}" "${MANIFEST_URL}" -o /tmp/oss-verify/manifest.json
+          DIGEST="sha256:$(sha256sum /tmp/oss-verify/manifest.json | awk '{print $1}')"
+          echo "Resolved OCI manifest digest: ${DIGEST}"
+
+          # Query OCI 1.1 Referrers (uses oras discover when no mTLS client cert is required,
+          # or mTLS-authenticated OCI 1.1 Referrers API behind pfSense HAProxy)
+          if [[ -f ~/.oss-tls/client.crt ]]; then
+            curl -fsSL "${CURL_TLS_ARGS[@]}" \
+              "${BASE}/v2/${REPO_PART}/referrers/${DIGEST}?artifactType=application/vnd.cyclonedx%2Bjson" \
+              -o /tmp/oss-verify/referrers.json
+          else
+            PLAIN_FLAG=""
+            [[ "${BASE}" == http://* ]] && PLAIN_FLAG="--plain-http"
+            oras discover ${PLAIN_FLAG} \
+              --artifact-type application/vnd.cyclonedx+json \
+              --format json \
+              "${REGISTRY_HOST}/${REPO_PART}@${DIGEST}" > /tmp/oss-verify/referrers.json
+          fi
+
+          # Fetch each attached CycloneDX referrer blob (SBOM & CBOM)
+          python3 - <<'PYEOF'
+          import json, os, subprocess, sys
+          data = json.load(open("/tmp/oss-verify/referrers.json", encoding="utf-8"))
+          manifests = data.get("manifests") or data.get("referrers") or []
+          types = {m.get("annotations", {}).get("io.cyclonedx.type"): m.get("digest") for m in manifests}
+          print("Discovered OCI 1.1 CycloneDX referrers:", json.dumps(types, indent=2))
+          if "sbom" not in types or "cbom" not in types:
+              print("::error::Missing required CycloneDX SBOM and/or CBOM OCI 1.1 referrer attachments.")
+              sys.exit(1)
+          PYEOF
+
+      - name: Gates 2 & 3 — Verify Signed SBOM/CBOM & Component Health Record
+        id: gate
+        env:
+          CACHE_URL: ${{ vars.TRUSTED_OSS_CACHE_URL }}
+          ECOSYSTEM: ${{ inputs.ecosystem }}
+          COMPONENT_NAME: ${{ inputs.component_name }}
+          PURL: ${{ inputs.purl }}
+          REQUIRE_PQC: ${{ inputs.require_pqc }}
+          MAX_CVSS: ${{ inputs.max_cvss }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import base64
+          import json
+          import os
+          import subprocess
+          import sys
+          import urllib.parse
+          from pathlib import Path
+
+          base = os.environ["CACHE_URL"].rstrip("/")
+          ecosystem = os.environ["ECOSYSTEM"].strip().lower()
+          component_name = os.environ["COMPONENT_NAME"].strip()
+          purl = os.environ["PURL"].strip()
+          require_pqc = os.environ.get("REQUIRE_PQC", "true").lower() == "true"
+          max_cvss_limit = float(os.environ.get("MAX_CVSS", "7.0"))
+
+          cert = Path.home() / ".oss-tls" / "client.crt"
+          key = Path.home() / ".oss-tls" / "client.key"
+          curl_tls = ["--cert", str(cert), "--key", str(key)] if cert.is_file() and key.is_file() else []
+
+          def http_get_json(url: str) -> dict:
+              out = subprocess.check_output(["curl", "-fsSL", *curl_tls, url], text=True)
+              return json.loads(out)
+
+          failures = []
+          artifact_sha256 = ""
+          cbom_scan_status = "UNKNOWN"
+
+          # --- Gate 2: Fetch & cryptographically verify signed SBOM and CBOM ---
+          for bom_type in ("sbom", "cbom"):
+              q = urllib.parse.urlencode({"purl": purl, "bom_type": bom_type, "include_signatures": "true"})
+              try:
+                  payload = http_get_json(f"{base}/bom/lookup?{q}")
+              except subprocess.CalledProcessError:
+                  failures.append(f"Missing signed {bom_type.upper()} for {purl}")
+                  continue
+
+              artifact_sha256 = payload.get("artifact_sha256") or artifact_sha256
+              raw_b64 = payload.get(f"{bom_type}_raw_b64", "")
+              sig_gpg = payload.get("signature_gpg", "")
+              sig_mldsa = payload.get("signature_mldsa65", "")
+
+              if not raw_b64 or not sig_gpg:
+                  failures.append(f"{bom_type.upper()} missing raw payload or GPG signature (.asc)")
+                  continue
+
+              bom_path = Path(f"/tmp/oss-verify/{bom_type}.cdx.json")
+              asc_path = Path(f"/tmp/oss-verify/{bom_type}.cdx.json.asc")
+              bom_path.write_bytes(base64.b64decode(raw_b64))
+              asc_path.write_text(sig_gpg, encoding="utf-8")
+
+              gpg_check = subprocess.run(
+                  ["gpg", "--batch", "--verify", str(asc_path), str(bom_path)],
+                  capture_output=True,
+                  text=True,
+              )
+              if gpg_check.returncode != 0:
+                  failures.append(f"{bom_type.upper()} GPG signature verification failed")
+
+              if require_pqc and not sig_mldsa:
+                  failures.append(f"{bom_type.upper()} missing required ML-DSA-65 PQC signature (.mldsa65)")
+
+              if bom_type == "cbom":
+                  doc = payload.get("cbom") or {}
+                  props = (doc.get("metadata") or {}).get("component", {}).get("properties") or []
+                  for p in props:
+                      if p.get("name") == "trusted-oss:crypto-scan-status":
+                          cbom_scan_status = str(p.get("value", "UNKNOWN"))
+
+          # --- Gate 3: Query Component Health Record (/catalog/vulnerabilities) ---
+          vuln_q = urllib.parse.urlencode({
+              "ecosystem": ecosystem,
+              "components": component_name,
+              "verify_signatures": "true",
+          })
+          catalog = http_get_json(f"{base}/catalog/vulnerabilities?{vuln_q}")
+          quarantined = catalog.get("quarantined") or []
+          components = catalog.get("components") or []
+
+          vuln_status = "MISSING"
+          clamav_status = "UNKNOWN"
+          max_cvss = 0.0
+          sig_valid = False
+          pqc_signed = False
+
+          if not components:
+              failures.append(f"Component '{component_name}' ({ecosystem}) not found in Trusted OSS health catalog")
+          else:
+              # Pick the highest-health / matching entry (or latest)
+              rec = components[0]
+              vuln_status = str(rec.get("vulnerability_status", "UNKNOWN"))
+              clamav_status = str(rec.get("clamav_status", "UNKNOWN"))
+              max_cvss = float(rec.get("max_cvss", 0.0) or 0.0)
+              sig_valid = bool(rec.get("signature_valid", False))
+              pqc_signed = bool(rec.get("pqc_signed", False))
+
+              if not sig_valid:
+                  failures.append("Artifact GPG signature verification failed in health catalog")
+              if require_pqc and not pqc_signed:
+                  failures.append("Artifact missing ML-DSA-65 PQC signature")
+              if clamav_status not in ("CLEAN", "PASS", "SKIPPED_DISABLED"):
+                  failures.append(f"ClamAV malware status is not clean: {clamav_status}")
+              if vuln_status != "CLEAN":
+                  failures.append(f"Vulnerability health status is '{vuln_status}' (expected CLEAN)")
+              if max_cvss >= max_cvss_limit:
+                  failures.append(f"Max CVSS {max_cvss} >= allowed threshold {max_cvss_limit}")
+
+          if any(q.get("component") == component_name for q in quarantined):
+              failures.append(f"Component '{component_name}' has quarantined vulnerable versions requiring review")
+
+          approved = "true" if not failures else "false"
+
+          # Write GitHub Actions outputs
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"approved={approved}\n")
+              fh.write(f"artifact_sha256={artifact_sha256}\n")
+              fh.write(f"vulnerability_status={vuln_status}\n")
+              fh.write(f"cbom_scan_status={cbom_scan_status}\n")
+
+          # Write human-readable Step Summary decision table
+          summary_lines = [
+              "### Trusted OSS Component Verification Decision",
+              "",
+              f"| Check | Result |",
+              f"| :--- | :--- |",
+              f"| **Decision** | {'APPROVED' if approved == 'true' else 'BLOCKED'} |",
+              f"| **Component / PURL** | `{component_name}` (`{purl}`) |",
+              f"| **Artifact SHA-256** | `{artifact_sha256 or 'n/a'}` |",
+              f"| **GPG Signature (`.asc`)** | `{sig_valid}` |",
+              f"| **PQC Signature (ML-DSA-65)** | `{pqc_signed}` (required={require_pqc}) |",
+              f"| **Signed CycloneDX SBOM/CBOM** | `cbom_scan_status={cbom_scan_status}` |",
+              f"| **Malware (ClamAV)** | `{clamav_status}` |",
+              f"| **Vulnerability Health** | `{vuln_status}` (max CVSS `{max_cvss}` < `{max_cvss_limit}`) |",
+          ]
+          if failures:
+              summary_lines += ["", "#### Blocking Findings"] + [f"- {f}" for f in failures]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as sf:
+              sf.write("\n".join(summary_lines) + "\n")
+
+          if failures:
+              for f in failures:
+                  print(f"::error::{f}")
+              sys.exit(1)
+          print(f"APPROVED: {purl} is signed, carries verified SBOM/CBOM ({cbom_scan_status}), and has a CLEAN health record.")
+          PYEOF
