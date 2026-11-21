@@ -28,7 +28,7 @@ RUN python3 -m venv /opt/venv && \
 # ------------------------------------------------------------------------------
 FROM ${BASE_IMAGE}
 
-ARG APP_VERSION=1.4.0
+ARG APP_VERSION=1.6.1
 
 LABEL org.opencontainers.image.title="Trusted OSS Harbor NAS Appliance" \
       org.opencontainers.image.description="Zero-CVE Chainguard/Wolfi all-in-one Trusted OSS Supply Chain Gatekeeper, ClamAV Antivirus, and PQC Signer" \
@@ -38,6 +38,7 @@ LABEL org.opencontainers.image.title="Trusted OSS Harbor NAS Appliance" \
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    APP_VERSION="${APP_VERSION}" \
     PATH="/opt/venv/bin:${PATH}" \
     OSS_DATA_ROOT=/data \
     CLAMAV_HOST=127.0.0.1 \

@@ -352,6 +352,8 @@ async def lifespan(app: FastAPI):
         app.state.job_bus = None
 
 
+APP_VERSION = os.environ.get("APP_VERSION", "").strip() or "1.6.1"
+
 app = FastAPI(
     title="Trusted OSS Supply Chain Gatekeeper",
     description=(
@@ -359,7 +361,7 @@ app = FastAPI(
         "Harbor Chainguard OCI proxy cache, ClamAV antivirus inspection, Trivy/NVD vulnerability gating, "
         "GPG/Cosign signing, and NIST FIPS 204 ML-DSA-65 Post-Quantum Cryptography dual-signing."
     ),
-    version="1.6.0",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 

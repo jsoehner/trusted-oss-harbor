@@ -44,11 +44,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Read application version
+      - name: Read & auto-bump container version per commit
         id: appver
         run: |
-          APP_VER="$(tr -d '[:space:]' < VERSION)"
-          echo "version=${APP_VER}" >> "$GITHUB_OUTPUT"
+          BASE_VER="$(tr -d '[:space:]' < VERSION)"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "${BASE_VER}"
+          LAST_BUMP_SHA="$(git log -n 1 --format=%H -- VERSION)"
+          COMMITS_SINCE_BUMP="$(git rev-list --count "${LAST_BUMP_SHA}..HEAD")"
+          CONTAINER_VER="${MAJOR}.${MINOR}.$((PATCH + COMMITS_SINCE_BUMP))"
+          echo "Base VERSION=${BASE_VER}, commits since VERSION bump=${COMMITS_SINCE_BUMP} -> Container version=${CONTAINER_VER}"
+          echo "version=${CONTAINER_VER}" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
