@@ -30,11 +30,24 @@ while [[ $# -gt 0 ]]; do
 done
 
 TMP_FILE="$(mktemp)"
-trap 'rm -f "${TMP_FILE}"' EXIT
+META_JSON="$(mktemp)"
+trap 'rm -f "${TMP_FILE}" "${META_JSON}"' EXIT
+
+CURL_ARGS=(
+  -fsSL
+  --retry 3
+  --retry-delay 2
+  -H "Accept: application/vnd.github+json"
+  -H "User-Agent: trusted-oss-harbor-cidr-sync"
+)
+AUTH_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+if [[ -n "${AUTH_TOKEN}" ]]; then
+  CURL_ARGS+=(-H "Authorization: Bearer ${AUTH_TOKEN}")
+fi
 
 echo "[INFO] Fetching GitHub Actions CIDR list from https://api.github.com/meta..."
-curl -fsSL -H "Accept: application/vnd.github+json" https://api.github.com/meta \
-  | python3 -c "import sys, json; data = json.load(sys.stdin); print('\n'.join(data.get('actions', [])))" \
+curl "${CURL_ARGS[@]}" https://api.github.com/meta -o "${META_JSON}"
+python3 -c "import sys, json; data = json.load(open(sys.argv[1], encoding='utf-8')); print('\n'.join(data.get('actions', [])))" "${META_JSON}" \
   > "${TMP_FILE}"
 
 LINE_COUNT="$(wc -l < "${TMP_FILE}" | tr -d ' ')"

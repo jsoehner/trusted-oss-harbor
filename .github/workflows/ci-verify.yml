@@ -25,4 +25,6 @@ jobs:
           python-version: "3.13"
 
       - name: Run 5-Stage Verification & Chainguard/Spring Boot Cache Harness
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/verify_e2e_pipeline.sh
