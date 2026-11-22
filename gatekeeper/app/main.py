@@ -978,7 +978,7 @@ async def healthz(
     }
 
 
-@app.get("/v2/")
+@app.api_route("/v2/", methods=["GET", "HEAD"])
 async def oci_v2_root() -> JSONResponse:
     """OCI Distribution Spec v2 conformance endpoint for Harbor Proxy Cache clients."""
     return JSONResponse(
@@ -988,7 +988,7 @@ async def oci_v2_root() -> JSONResponse:
     )
 
 
-@app.get("/v2/chainguard-cache/{repo_path:path}/manifests/{reference}")
+@app.api_route("/v2/chainguard-cache/{repo_path:path}/manifests/{reference}", methods=["GET", "HEAD"])
 async def get_chainguard_cached_manifest(
     repo_path: str,
     reference: str,
@@ -1061,7 +1061,7 @@ async def get_chainguard_cached_manifest(
     )
 
 
-@app.get("/v2/virtual/{registry_alias}/{repo_path:path}/manifests/{reference}")
+@app.api_route("/v2/virtual/{registry_alias}/{repo_path:path}/manifests/{reference}", methods=["GET", "HEAD"])
 async def get_virtual_oci_manifest(
     registry_alias: str,
     repo_path: str,
@@ -3191,7 +3191,7 @@ async def get_oci_referrers(
     )
 
 
-@app.get("/v2/{namespace}/{repo_path:path}/blobs/{digest}")
+@app.api_route("/v2/{namespace}/{repo_path:path}/blobs/{digest}", methods=["GET", "HEAD"])
 async def get_oci_referrer_blob(
     namespace: str,
     repo_path: str,

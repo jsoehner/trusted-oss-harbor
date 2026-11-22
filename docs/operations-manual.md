@@ -409,62 +409,148 @@ Repositories remain **public-by-default** (Maven Central, PyPI, `cgr.dev`) until
      ```
    - Downstream `jsoehner/jsi-bom-actions@v1.2.0` workflows query `POST /bom/batch` over mTLS (using `trusted-oss-url`, `trusted-oss-mtls-cert`, and `trusted-oss-mtls-key`) to eliminate third-party cryptographic blind spots.
 
-### 4.6 Querying Signed SBOM/CBOM Components with ORAS & Automated CI Health Gate
+### 4.6 Pulling Signed Components & Supporting Artifacts with `oras` and Validating the Proof
 
-Developers and pipeline owners can query `trusted-oss-harbor` directly to verify that a requested container image or package (1) carries **cryptographically signed CycloneDX 1.6 SBOM and CBOM attestations** and (2) holds a **verified `CLEAN` health record** (ClamAV malware scan + OSV/Trivy CVE gate below `CVSS_FAIL_THRESHOLD`) before pulling it into a build or deployment.
+Developers, security auditors, and CI/CD pipelines can use the standard CNCF **`oras`** CLI together with Gatekeeper's cryptographic key and posture APIs to:
+1. **Pull the signed OCI component manifest** and resolve its immutable `sha256` digest.
+2. **Discover and pull all supporting OCI 1.1 Referrers** (CycloneDX 1.6 **SBOM** and **CBOM** attestations).
+3. **Pull the detached cryptographic proofs** (RSA-3072 **GPG `.asc`** and NIST FIPS 204 **ML-DSA-65 `.mldsa65`** signatures) and verify them offline against Gatekeeper's public signing keys.
+4. **Confirm the live security posture** (ClamAV malware scan, OSV/Trivy CVE verdict, active advisory/quarantine status, and HMAC-signed provenance ledger) before allowing a build or deployment to proceed.
 
-#### 1. Developer CLI — Discover & Pull Attached SBOM/CBOM with ORAS (OCI 1.1 Referrers)
+#### Prerequisites
+- **Install `oras` (`v1.2+`)**:
+  - macOS / Linux Homebrew: `brew install oras`
+  - Windows Winget: `winget install ORASProject.ORAS`
+  - GitHub Actions: `uses: oras-project/setup-oras@<pinned-sha>` (see [`client-templates/github-actions-verify-component.yml`](../client-templates/github-actions-verify-component.yml))
+- **Backfill pre-`v1.6.0` cached OCI images (one-time after upgrading)**: If an OCI image was cached prior to `v1.6.0`, run `POST /catalog/backfill-boms?wait=true` once so Gatekeeper generates its dual-signed CycloneDX 1.6 SBOM/CBOM sidecars and populates OCI 1.1 Referrers:
+  ```bash
+  curl -fsSL -X POST \
+    -H "X-Gatekeeper-Token: ${GATEKEEPER_ADMIN_TOKEN}" \
+    "http://oss.jsigroup.local:8080/catalog/backfill-boms?wait=true"
+  ```
 
-Every cached OCI manifest exposes attached CycloneDX 1.6 SBOM and CBOM descriptors via the **OCI Distribution Spec v1.1 Referrers API** (`GET /v2/{namespace}/{repo}/referrers/{digest}` and `/blobs/{digest}`):
+#### Step 1 — Resolve the Immutable Digest & Pull the Signed Component Manifest with `oras`
+
+*(LAN HTTP examples below use `--plain-http`. Over WAN behind pfSense HAProxy mTLS `https://oss.yourdomain.com`, omit `--plain-http` and pass `--cert ~/.oss-tls/client.crt --key ~/.oss-tls/client.key` to `curl` or configure your mTLS client cert.)*
 
 ```bash
-# 1. Discover attached CycloneDX 1.6 SBOM & CBOM referrers (LAN HTTP example; omit --plain-http over HTTPS)
+export REGISTRY="oss.jsigroup.local:8080"
+export COMPONENT="chainguard-cache/chainguard/jre:latest"
+export PROOF_DIR="./oss-proof"
+mkdir -p "${PROOF_DIR}"
+
+# 1. Resolve the tag to its immutable OCI digest
+export MANIFEST_DIGEST=$(oras resolve --plain-http "${REGISTRY}/${COMPONENT}")
+echo "Resolved digest: ${MANIFEST_DIGEST}"
+
+# 2. Fetch the signed OCI manifest itself and verify its sha256 matches the resolved digest
+oras manifest fetch --plain-http --output "${PROOF_DIR}/manifest.json" "${REGISTRY}/${COMPONENT}"
+sha256sum "${PROOF_DIR}/manifest.json"
+```
+
+#### Step 2 — Discover & Pull All Supporting Attestation Artifacts (SBOM & CBOM) with `oras`
+
+Every cached OCI manifest exposes attached CycloneDX 1.6 SBOM and CBOM descriptors via the **OCI Distribution Spec v1.1 Referrers API** (`GET /v2/{namespace}/{repo}/referrers/{digest}` and `HEAD`/`GET /v2/{namespace}/{repo}/blobs/{digest}`):
+
+```bash
+# 1. Visual tree of all attached CycloneDX 1.6 referrers (SBOM + CBOM)
 oras discover --plain-http \
   --artifact-type application/vnd.cyclonedx+json \
   --format tree \
-  oss.jsigroup.local:8080/chainguard-cache/chainguard/jre:latest
+  "${REGISTRY}/${COMPONENT}"
 
-# 2. Emit machine-readable JSON to extract the CBOM / SBOM blob digests
+# 2. Save machine-readable Referrers index JSON
 oras discover --plain-http \
   --artifact-type application/vnd.cyclonedx+json \
   --format json \
-  oss.jsigroup.local:8080/chainguard-cache/chainguard/jre:latest
+  "${REGISTRY}/${COMPONENT}" > "${PROOF_DIR}/referrers.json"
 
-# 3. Pull an attached CycloneDX CBOM or SBOM blob by digest
-oras blob fetch --plain-http --output cbom.cdx.json \
-  oss.jsigroup.local:8080/chainguard-cache/chainguard/jre@sha256:<cbom_digest>
+# 3. Extract the CBOM and SBOM blob digests and pull both artifacts with `oras blob fetch`
+CBOM_DIGEST=$(jq -r '.referrers[] | select(.annotations["io.cyclonedx.type"]=="cbom") | .digest' "${PROOF_DIR}/referrers.json")
+SBOM_DIGEST=$(jq -r '.referrers[] | select(.annotations["io.cyclonedx.type"]=="sbom") | .digest' "${PROOF_DIR}/referrers.json")
+
+oras blob fetch --plain-http --output "${PROOF_DIR}/cbom.cdx.json" \
+  "${REGISTRY}/chainguard-cache/chainguard/jre@${CBOM_DIGEST}"
+oras blob fetch --plain-http --output "${PROOF_DIR}/sbom.cdx.json" \
+  "${REGISTRY}/chainguard-cache/chainguard/jre@${SBOM_DIGEST}"
+
+# 4. Verify blob integrity against the OCI Referrers digests
+echo "${CBOM_DIGEST#sha256:}  ${PROOF_DIR}/cbom.cdx.json" | sha256sum -c -
+echo "${SBOM_DIGEST#sha256:}  ${PROOF_DIR}/sbom.cdx.json" | sha256sum -c -
 ```
 
 > [!TIP]
-> Over WAN behind pfSense HAProxy mTLS (`https://oss.yourdomain.com`), pass your client certificate and key directly with `curl --cert ~/.oss-tls/client.crt --key ~/.oss-tls/client.key` to `GET /v2/{namespace}/{repo}/referrers/{digest}?artifactType=application/vnd.cyclonedx%2Bjson`.
+> Over WAN behind pfSense HAProxy mTLS (`https://oss.yourdomain.com`), you can also query the Referrers API directly with `curl --cert ~/.oss-tls/client.crt --key ~/.oss-tls/client.key "https://oss.yourdomain.com/v2/chainguard-cache/chainguard/jre/referrers/${MANIFEST_DIGEST}?artifactType=application/vnd.cyclonedx%2Bjson"`.
 
-#### 2. Verify Detached Signatures (GPG + ML-DSA-65) & Health Record (Any Ecosystem: OCI, Maven, PyPI)
+#### Step 3 — Pull Detached Cryptographic Signatures & Validate the Proof (GPG + NIST FIPS 204 ML-DSA-65)
 
-Use `/bom/lookup` (single component) or `/bom/batch` (multi-PURL) to retrieve the CycloneDX 1.6 SBOM/CBOM with detached **RSA-3072 GPG (`.asc`)** and **NIST FIPS 204 ML-DSA-65 (`.mldsa65`)** signatures, and query `/catalog/vulnerabilities?verify_signatures=true` for the live health record:
+Pull Gatekeeper's public signing keys and the detached `.asc` (RSA-3072 GPG) and `.mldsa65` (Post-Quantum ML-DSA-65) signatures for the manifest, SBOM, and CBOM, then verify them locally:
 
 ```bash
-# 1. Fetch signed CycloneDX 1.6 CBOM (with detached .asc & .mldsa65 signatures)
-curl -fsSL "http://oss.jsigroup.local:8080/bom/lookup?purl=pkg:oci/chainguard/jre@latest&bom_type=cbom&include_signatures=true" | jq '{
+export GATEKEEPER="http://${REGISTRY}"
+
+# 1. Fetch Trusted OSS public signing keys (GPG + ML-DSA-65)
+curl -fsSL "${GATEKEEPER}/keys/trusted-oss-pubkey.asc"  -o "${PROOF_DIR}/trusted-oss-pubkey.asc"
+curl -fsSL "${GATEKEEPER}/keys/trusted-oss-mldsa65.pub" -o "${PROOF_DIR}/trusted-oss-mldsa65.pub"
+gpg --import "${PROOF_DIR}/trusted-oss-pubkey.asc"
+
+# 2. Fetch detached GPG (.asc) and ML-DSA-65 (.mldsa65) signatures for the manifest & BOMs
+curl -fsSL "${GATEKEEPER}/v2/chainguard-cache/chainguard/jre/manifests/latest.asc"                -o "${PROOF_DIR}/manifest.json.asc"
+curl -fsSL "${GATEKEEPER}/v2/chainguard-cache/chainguard/jre/manifests/latest.mldsa65"            -o "${PROOF_DIR}/manifest.json.mldsa65"
+curl -fsSL "${GATEKEEPER}/v2/chainguard-cache/chainguard/jre/manifests/latest.cbom.cdx.json.asc"  -o "${PROOF_DIR}/cbom.cdx.json.asc"
+curl -fsSL "${GATEKEEPER}/v2/chainguard-cache/chainguard/jre/manifests/latest.cbom.cdx.json.mldsa65" -o "${PROOF_DIR}/cbom.cdx.json.mldsa65"
+curl -fsSL "${GATEKEEPER}/v2/chainguard-cache/chainguard/jre/manifests/latest.sbom.cdx.json.asc"  -o "${PROOF_DIR}/sbom.cdx.json.asc"
+curl -fsSL "${GATEKEEPER}/v2/chainguard-cache/chainguard/jre/manifests/latest.sbom.cdx.json.mldsa65" -o "${PROOF_DIR}/sbom.cdx.json.mldsa65"
+
+# 3. Verify classical RSA-3072 GPG signatures
+gpg --verify "${PROOF_DIR}/manifest.json.asc" "${PROOF_DIR}/manifest.json"
+gpg --verify "${PROOF_DIR}/cbom.cdx.json.asc" "${PROOF_DIR}/cbom.cdx.json"
+gpg --verify "${PROOF_DIR}/sbom.cdx.json.asc" "${PROOF_DIR}/sbom.cdx.json"
+
+# 4. Verify NIST FIPS 204 ML-DSA-65 post-quantum signatures
+python3 client-templates/pqc-verify.py --pubkey "${PROOF_DIR}/trusted-oss-mldsa65.pub" --artifact "${PROOF_DIR}/manifest.json" --sig "${PROOF_DIR}/manifest.json.mldsa65"
+python3 client-templates/pqc-verify.py --pubkey "${PROOF_DIR}/trusted-oss-mldsa65.pub" --artifact "${PROOF_DIR}/cbom.cdx.json" --sig "${PROOF_DIR}/cbom.cdx.json.mldsa65"
+python3 client-templates/pqc-verify.py --pubkey "${PROOF_DIR}/trusted-oss-mldsa65.pub" --artifact "${PROOF_DIR}/sbom.cdx.json" --sig "${PROOF_DIR}/sbom.cdx.json.mldsa65"
+```
+
+*(For Maven or PyPI packages—or a single-call JSON bundle of BOM + detached signatures across any ecosystem—use `/bom/lookup` or `/bom/batch`:)*
+
+```bash
+curl -fsSL "${GATEKEEPER}/bom/lookup?purl=pkg:oci/chainguard/jre@latest&bom_type=cbom&include_signatures=true" | jq '{
   purl,
   artifact_sha256,
   has_gpg_sig: (.signature_gpg | length > 0),
   has_pqc_sig: (.signature_mldsa65 | length > 0),
-  crypto_status: (.cbom.metadata.component.properties[] | select(.name=="trusted-oss:crypto-scan-status") | .value)
-}'
-
-# 2. Query the component's live health record (signatures, ClamAV, CVE/CVSS, quarantine state)
-curl -fsSL "http://oss.jsigroup.local:8080/catalog/vulnerabilities?ecosystem=oci&components=chainguard/jre&verify_signatures=true" | jq '.components[0] | {
-  component, version, signature_valid, pqc_signed, clamav_status, vulnerability_status, max_cvss, cve_ids
+  crypto_status: (.cbom.metadata.properties[] | select(.name=="trusted-oss:crypto-scan-status") | .value)
 }'
 ```
 
-A component is **approved for use** only when all four checks pass:
-1. **ORAS / BOM Presence**: Both CycloneDX 1.6 **SBOM** and **CBOM** exist (with `CRYPTO_ASSETS_DETECTED` or `VERIFIED_INERT` status).
-2. **Cryptographic Signature**: Detached **GPG (`.asc`)** verifies against `/keys/trusted-oss-pubkey.asc` and **ML-DSA-65 (`.mldsa65`)** is present and verifiable via `client-templates/pqc-verify.py`.
-3. **Malware & CVE Health Record**: `clamav_status == "CLEAN"`, `vulnerability_status == "CLEAN"`, and `max_cvss < 7.0`.
-4. **Zero Active Quarantine**: Component is not listed under `quarantined_components`.
+#### Step 4 — Inspect Live Security Posture (Malware, CVEs, Advisories & Provenance)
 
-#### 3. Automated GitHub Action Decision Gate (`client-templates/github-actions-verify-component.yml`)
+```bash
+# 1. Live component health record (signatures, ClamAV, CVE/CVSS, quarantine state)
+curl -fsSL "${GATEKEEPER}/catalog/vulnerabilities?ecosystem=oci&components=chainguard/jre&verify_signatures=true" | jq '.components[0] | {
+  component, version, signature_valid, pqc_signed, clamav_status, vulnerability_status, max_cvss, cve_ids
+}'
+
+# 2. Confirm zero active security advisories for this component
+curl -fsSL "${GATEKEEPER}/catalog/advisories?ecosystem=oci&component=chainguard/jre" | jq '{count, advisories}'
+
+# 3. Inspect cryptographic assets detected inside the pulled CBOM
+jq '{
+  purl: .metadata.component.purl,
+  crypto_scan_status: (.metadata.properties[] | select(.name=="trusted-oss:crypto-scan-status") | .value),
+  crypto_assets: [.components[]? | select(.type=="cryptographic-asset") | .name]
+}' "${PROOF_DIR}/cbom.cdx.json"
+```
+
+A component is **approved for use** only when all four checks pass:
+1. **ORAS / BOM Presence**: Both CycloneDX 1.6 **SBOM** and **CBOM** exist and match their OCI 1.1 Referrers `sha256` digests (with `CRYPTO_ASSETS_DETECTED` or `VERIFIED_INERT` status).
+2. **Dual Cryptographic Proof**: Detached **GPG (`.asc`)** verifies against `/keys/trusted-oss-pubkey.asc` and **ML-DSA-65 (`.mldsa65`)** verifies via `client-templates/pqc-verify.py` against `/keys/trusted-oss-mldsa65.pub`.
+3. **Malware & CVE Health Record**: `clamav_status == "CLEAN"`, `vulnerability_status == "CLEAN"`, and `max_cvss < 7.0`.
+4. **Zero Active Advisories / Quarantine**: Component is not listed under `/catalog/advisories` or `quarantined`.
+
+#### Step 5 — Automated GitHub Action Decision Gate (`client-templates/github-actions-verify-component.yml`)
 
 Pipeline owners can drop in the reusable workflow template [`client-templates/github-actions-verify-component.yml`](../client-templates/github-actions-verify-component.yml) to automatically decide whether a requested component is signed, carries verified CycloneDX SBOM/CBOM attestations (discovered via ORAS for OCI), and has a `CLEAN` health record before allowing downstream build/deploy jobs to proceed:
 

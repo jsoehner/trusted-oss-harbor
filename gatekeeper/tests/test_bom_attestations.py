@@ -171,3 +171,57 @@ def test_ingest_generates_dual_signed_boms_and_serves_batch_lookup(tmp_path: Pat
     assert "pkg:pypi/pqcdemo@1.2.3" in bdata["found"]
     assert "pkg:pypi/plaindemo@1.2.3" in bdata["found"]
     assert bdata["missing"] == ["pkg:pypi/not-cached@9.9.9"]
+
+
+def test_oci_v2_head_support_and_referrers_blobs(tmp_path: Path):
+    """Verify OCI Distribution Spec v1.1 HEAD/GET routes required by ORAS CLI."""
+    import hashlib
+
+    settings = Settings(
+        OSS_DATA_ROOT=tmp_path,
+        CLAMAV_REQUIRED=False,
+        CVE_SCANNER_MODE="none",
+        GATEKEEPER_ADMIN_TOKEN="test-secret-token-1234",
+        PQC_SIGNING_ENABLED=False,
+        BOM_GENERATION_ENABLED=True,
+        CVE_RESCAN_INTERVAL_SECONDS=0,
+    )
+    manifests_dir = settings.harbor_oci_cache_dir / "chainguard" / "jre" / "manifests"
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+    manifest_bytes = b'{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}'
+    manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+    (manifests_dir / "latest").write_bytes(manifest_bytes)
+    (manifests_dir / "latest.sha256").write_text(manifest_sha, encoding="utf-8")
+
+    cbom_bytes = b'{"bomFormat":"CycloneDX","specVersion":"1.6","components":[]}'
+    sbom_bytes = b'{"bomFormat":"CycloneDX","specVersion":"1.6","metadata":{}}'
+    cbom_sha = hashlib.sha256(cbom_bytes).hexdigest()
+    (manifests_dir / "latest.cbom.cdx.json").write_bytes(cbom_bytes)
+    (manifests_dir / "latest.sbom.cdx.json").write_bytes(sbom_bytes)
+
+    app.state.settings = settings
+    client = TestClient(app)
+
+    # 1. OCI /v2/ ping supports both GET and HEAD
+    assert client.get("/v2/").status_code == 200
+    head_v2 = client.head("/v2/")
+    assert head_v2.status_code == 200
+    assert head_v2.headers.get("docker-distribution-api-version") == "registry/2.0"
+
+    # 2. OCI 1.1 Referrers exposes CBOM & SBOM descriptors
+    ref_resp = client.get(f"/v2/chainguard-cache/chainguard/jre/referrers/sha256:{manifest_sha}")
+    assert ref_resp.status_code == 200
+    ref_data = ref_resp.json()
+    assert len(ref_data["manifests"]) == 2
+    assert {m["annotations"]["io.cyclonedx.type"] for m in ref_data["manifests"]} == {"cbom", "sbom"}
+
+    # 3. OCI /blobs/{digest} supports both HEAD (used by `oras blob fetch`) and GET
+    blob_url = f"/v2/chainguard-cache/chainguard/jre/blobs/sha256:{cbom_sha}"
+    head_blob = client.head(blob_url)
+    assert head_blob.status_code == 200
+    assert head_blob.headers.get("docker-content-digest") == f"sha256:{cbom_sha}"
+    assert head_blob.content == b""
+
+    get_blob = client.get(blob_url)
+    assert get_blob.status_code == 200
+    assert get_blob.content == cbom_bytes
