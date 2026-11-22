@@ -7,5 +7,5 @@ pydantic-settings>=2.16.3
 defusedxml>=0.7.1
 dilithium-py>=1.5.1
 redis>=5.2.0
-pytest>=8.3.0
+pytest>=9.2.0
 pytest-asyncio>=0.24.0
