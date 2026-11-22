@@ -66,7 +66,7 @@
 | `X.509-Certificate` | certificate | X.509 | Review key length for Grover resistance | First-Party Code (SAST/AST)<br>`gatekeeper/app/bom_generator.py:232` |
 | `TLS-1.3` | protocol | v1.3 | TLS 1.3 Transport (Enable hybrid X25519MLKEM768 via OpenSSL 3.5+) | First-Party Code (SAST/AST)<br>`scripts/catalog_frontend.py:24` |
 | `httpcore (HTTPS Session TLS 1.2 / 1.3 Client)` | protocol | 256 | Quantum-Resistant (Grover's proof) | Assimilated Upstream CBOM: Python HTTPS/TLS & Cloud SDK Transport Profile<br>`Dependency: httpcore@1.0.7` |
-| `httpx (HTTPS Session TLS 1.2 / 1.3 Client)` | protocol | 256 | Quantum-Resistant (Grover's proof) | Assimilated Upstream CBOM: Python HTTPS/TLS & Cloud SDK Transport Profile<br>`Dependency: httpx@0.27.2` |
+| `httpx (HTTPS Session TLS 1.2 / 1.3 Client)` | protocol | 256 | Quantum-Resistant (Grover's proof) | Assimilated Upstream CBOM: Python HTTPS/TLS & Cloud SDK Transport Profile<br>`Dependency: httpx@0.28.1` |
 | `redis (Database SCRAM-SHA-256 / caching_sha2_password Digest & TLS Transport)` | hash | 256 | Quantum-Resistant (Grover's proof) | Assimilated Upstream CBOM: Database Authentication & TLS Protocol Specification<br>`Dependency: redis@5.2.0` |
 
 ### ⚠️ Unassimilated Third-Party Binaries & Cryptographic Blind Spots
