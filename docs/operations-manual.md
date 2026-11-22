@@ -578,3 +578,24 @@ curl -fsSL "http://oss.jsigroup.local:8080/audit/activity?limit=25" | jq '.event
    This instructs `oss-engine` to find the newest clean upstream version below `CVSS_FAIL_THRESHOLD`, scan & dual-sign it, and tag it `latest`.
 3. **Gate Automation Up Front**: Wire [`client-templates/github-actions-verify-component.yml`](../client-templates/github-actions-verify-component.yml) into CI/CD pipelines so jobs check `/catalog/vulnerabilities` and fail fast with a clear `$GITHUB_STEP_SUMMARY` instead of retrying `451` downloads.
 
+---
+
+### 5.4 Proactive Vulnerability Advisories, RSS Subscriptions & Upgrade Alerts ([SecADR-0011](adr/0011-security-assessment-remediation-and-governance.md))
+
+Rather than waiting for a build to fail with HTTP `451`, developers and platform operators can monitor newly vulnerable components and their clean replacement versions via four channels:
+
+1. **Browser Advisory Dashboard**: Open `http://oss.jsigroup.local:8080/catalog/advisories/dashboard` for a zero-JS, CSP-safe Security Advisory Center displaying severity badges, clickable OSV.dev/NVD links, and upgrade guidance.
+2. **RSS 2.0 Feed Subscription**: Subscribe in Slack, Microsoft Teams, or any RSS reader to `http://oss.jsigroup.local:8080/catalog/advisories.rss` (supports `?ecosystem=`, `?component=`, and `?min_cvss=`).
+3. **JSON API & CLI**:
+   ```bash
+   # CLI summary of vulnerable components, CVE links, and newest passing upgrades
+   python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --advisories
+
+   # Filterable JSON API (e.g., Critical/High advisories from the last 24h)
+   curl -fsSL "http://oss.jsigroup.local:8080/catalog/advisories?min_cvss=7.0&since_hours=24" | jq
+   ```
+4. **Real-Time Webhooks & Upgraded Daily Digest**:
+   - Set `VULN_ALERT_WEBHOOK_URL` (and optional `VULN_ALERT_WEBHOOK_SECRET` for `X-Trusted-OSS-Signature: sha256=...`) in `.env` or `docker-compose.yml` to receive immediate deduplicated alerts (`audit/vuln_alerts.jsonl`) whenever a remediation sweep quarantines a newly vulnerable component. Set `VULN_ALERT_IMMEDIATE_EMAIL=true` to also trigger immediate Microsoft Graph email alerts.
+   - The **Daily Digest** (`scripts/daily_digest.py` and `oss-engine`) automatically pairs every vulnerable or quarantined component version with clickable OSV advisory links and the **newest `CLEAN` (passing-scan) version available for upgrade**.
+
+

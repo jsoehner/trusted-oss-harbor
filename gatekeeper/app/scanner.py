@@ -19,6 +19,32 @@ EICAR_SIGNATURE = (
     b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
 )
 
+MAX_ARCHIVE_MEMBERS = 10_000
+MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024  # 512 MiB
+_EICAR_OVERLAP = len(EICAR_SIGNATURE) - 1
+
+
+def _has_unsafe_archive_path(member_name: str) -> bool:
+    """Reject absolute paths, Windows drive letters, backslashes, and '..' traversal."""
+    if not member_name:
+        return False
+    normalized = member_name.replace("\\", "/")
+    if normalized.startswith("/") or (len(normalized) >= 2 and normalized[1] == ":"):
+        return True
+    return ".." in normalized.split("/")
+
+
+def _file_contains_eicar(file_path: Path) -> bool:
+    """Stream-scan a file for the EICAR test signature without loading the entire file into RAM."""
+    tail = b""
+    with file_path.open("rb") as fh:
+        while chunk := fh.read(65536):
+            buf = tail + chunk
+            if EICAR_SIGNATURE in buf:
+                return True
+            tail = buf[-_EICAR_OVERLAP:] if len(buf) >= _EICAR_OVERLAP else buf
+    return False
+
 
 @dataclass(frozen=True)
 class ScanVerdict:
@@ -32,10 +58,13 @@ class ScanVerdict:
     cve_ids: tuple[str, ...] = field(default_factory=tuple)
 
 
-def inspect_archive_safety(file_path: Path) -> tuple[bool, str]:
-    """Inspect .jar/.whl/.zip/.tar.gz archives for Zip-Slip traversal, symlinks, and EICAR test signatures."""
-    raw_bytes = file_path.read_bytes()
-    if EICAR_SIGNATURE in raw_bytes:
+def inspect_archive_safety(
+    file_path: Path,
+    max_members: int = MAX_ARCHIVE_MEMBERS,
+    max_uncompressed_bytes: int = MAX_UNCOMPRESSED_BYTES,
+) -> tuple[bool, str]:
+    """Inspect .jar/.whl/.zip/.tar.gz archives for Zip-Slip traversal, decompression bombs, symlinks, and EICAR."""
+    if _file_contains_eicar(file_path):
         return False, "Win.Test.EICAR_HDB-1 FOUND"
 
     name_lower = file_path.name.lower()
@@ -43,9 +72,13 @@ def inspect_archive_safety(file_path: Path) -> tuple[bool, str]:
         if not zipfile.is_zipfile(file_path):
             return False, "Corrupt or invalid ZIP/JAR/Wheel archive"
         with zipfile.ZipFile(file_path, "r") as zf:
-            for info in zf.infolist():
+            infos = zf.infolist()
+            if len(infos) > max_members:
+                return False, f"Archive member limit exceeded ({len(infos)} > {max_members})"
+            total_uncompressed = 0
+            for info in infos:
                 member_name = info.filename
-                if member_name.startswith("/") or ".." in member_name.split("/"):
+                if _has_unsafe_archive_path(member_name):
                     return False, f"Archive path traversal detected: {member_name}"
                 # Check Unix symlink mode in external_attr (0o120000)
                 unix_mode = (info.external_attr >> 16) & 0o170000
@@ -53,6 +86,12 @@ def inspect_archive_safety(file_path: Path) -> tuple[bool, str]:
                     return False, f"Symlink entry prohibited in archive: {member_name}"
                 if info.flag_bits & 0x1:
                     return False, f"Encrypted entry prohibited in archive: {member_name}"
+                total_uncompressed += max(0, info.file_size)
+                if total_uncompressed > max_uncompressed_bytes:
+                    return False, (
+                        f"Archive uncompressed size limit exceeded "
+                        f"({total_uncompressed} > {max_uncompressed_bytes} bytes)"
+                    )
                 with zf.open(info, "r") as member_stream:
                     data = member_stream.read(1024 * 1024)
                     if EICAR_SIGNATURE in data:
@@ -60,11 +99,22 @@ def inspect_archive_safety(file_path: Path) -> tuple[bool, str]:
     elif name_lower.endswith((".tar.gz", ".tgz")):
         try:
             with tarfile.open(file_path, "r:gz") as tf:
+                member_count = 0
+                total_uncompressed = 0
                 for member in tf.getmembers():
-                    if member.name.startswith("/") or ".." in member.name.split("/"):
+                    member_count += 1
+                    if member_count > max_members:
+                        return False, f"Tar member limit exceeded (> {max_members})"
+                    if _has_unsafe_archive_path(member.name):
                         return False, f"Tar path traversal detected: {member.name}"
                     if member.issym() or member.islnk():
                         return False, f"Symlink/hardlink entry prohibited in tar: {member.name}"
+                    total_uncompressed += max(0, member.size)
+                    if total_uncompressed > max_uncompressed_bytes:
+                        return False, (
+                            f"Tar uncompressed size limit exceeded "
+                            f"({total_uncompressed} > {max_uncompressed_bytes} bytes)"
+                        )
                     if member.isfile():
                         extracted = tf.extractfile(member)
                         if extracted is not None:
@@ -230,6 +280,7 @@ async def evaluate_artifact_security(
     package_ecosystem: str = "",
     package_name: str = "",
     package_version: str = "",
+    trivy_required: bool = False,
 ) -> ScanVerdict:
     """Run Antivirus and High/Critical CVE threshold gates on a staged artifact."""
     av_ok, av_status = await scan_with_clamd_instream(
@@ -255,6 +306,14 @@ async def evaluate_artifact_security(
             effective_cvss = max(effective_cvss, trivy_cvss)
             detected_cves.extend(trivy_cves)
             scanner_notes.append(trivy_note)
+        elif trivy_required:
+            return ScanVerdict(
+                passed=False,
+                clamav_status=av_status,
+                cve_status=f"FAILED ({trivy_note})",
+                max_cvss=effective_cvss,
+                reason=f"Vulnerability gate failed closed: Trivy required but unavailable ({trivy_note})",
+            )
 
     if mode in {"auto", "osv"} and package_ecosystem and package_name and package_version:
         ran_osv, osv_cvss, osv_cves, osv_note = await query_osv_vulnerabilities(

@@ -87,6 +87,9 @@ services:
       GRAPH_REFRESH_TOKEN: ${GRAPH_REFRESH_TOKEN:-}
       GRAPH_ACCESS_TOKEN: ${GRAPH_ACCESS_TOKEN:-}
       GRAPH_TOKEN_FILE: ${GRAPH_TOKEN_FILE:-/data/trusted-oss/audit/msgraph_token.json}
+      VULN_ALERT_WEBHOOK_URL: ${VULN_ALERT_WEBHOOK_URL:-}
+      VULN_ALERT_WEBHOOK_SECRET: ${VULN_ALERT_WEBHOOK_SECRET:-}
+      VULN_ALERT_IMMEDIATE_EMAIL: ${VULN_ALERT_IMMEDIATE_EMAIL:-false}
     volumes:
       - ${OSS_DATA_ROOT:-/home/jsoehner/trusted-oss-data}:/data/trusted-oss
     expose:
@@ -143,6 +146,9 @@ services:
       GRAPH_REFRESH_TOKEN: ${GRAPH_REFRESH_TOKEN:-}
       GRAPH_ACCESS_TOKEN: ${GRAPH_ACCESS_TOKEN:-}
       GRAPH_TOKEN_FILE: ${GRAPH_TOKEN_FILE:-/data/trusted-oss/audit/msgraph_token.json}
+      VULN_ALERT_WEBHOOK_URL: ${VULN_ALERT_WEBHOOK_URL:-}
+      VULN_ALERT_WEBHOOK_SECRET: ${VULN_ALERT_WEBHOOK_SECRET:-}
+      VULN_ALERT_IMMEDIATE_EMAIL: ${VULN_ALERT_IMMEDIATE_EMAIL:-false}
     volumes:
       - ${OSS_DATA_ROOT:-/home/jsoehner/trusted-oss-data}:/data/trusted-oss
     networks:

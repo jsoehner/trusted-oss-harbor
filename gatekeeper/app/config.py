@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     gatekeeper_admin_token: str = Field(
         default="", alias="GATEKEEPER_ADMIN_TOKEN"
     )
+    provenance_hmac_key: str = Field(default="", alias="PROVENANCE_HMAC_KEY")
+    max_artifact_bytes: int = Field(
+        default=250 * 1024 * 1024, alias="MAX_ARTIFACT_BYTES"
+    )
+    trivy_required: bool = Field(default=False, alias="TRIVY_REQUIRED")
     allow_simulated_cvss: bool = Field(default=False, alias="ALLOW_SIMULATED_CVSS")
     pqc_signing_enabled: bool = Field(default=True, alias="PQC_SIGNING_ENABLED")
     bom_generation_enabled: bool = Field(default=True, alias="BOM_GENERATION_ENABLED")
@@ -86,6 +91,9 @@ class Settings(BaseSettings):
         default=["cgr.dev", "docker.io", "ghcr.io", "quay.io"],
         alias="TRUSTED_SOURCES",
     )
+    vuln_alert_webhook_url: str = Field(default="", alias="VULN_ALERT_WEBHOOK_URL")
+    vuln_alert_webhook_secret: str = Field(default="", alias="VULN_ALERT_WEBHOOK_SECRET")
+    vuln_alert_immediate_email: bool = Field(default=False, alias="VULN_ALERT_IMMEDIATE_EMAIL")
 
     @model_validator(mode="after")
     def resolve_dynamic_paths(self) -> "Settings":

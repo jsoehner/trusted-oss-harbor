@@ -48,13 +48,30 @@ def dearmor_mldsa_bytes(content: str | bytes) -> bytes:
     return content if isinstance(content, bytes) else content.encode("utf-8")
 
 
+def _write_secret_bytes(path: Path, data: bytes) -> None:
+    """Write sensitive key material with restrictive 0o600 permissions atomically where supported."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def ensure_mldsa_signing_key(
     mldsa_keys_dir: Path,
     public_keys_dir: Path,
 ) -> Path:
     """Ensure an ML-DSA-65 (NIST FIPS 204) keypair exists and export trusted-oss-mldsa65.pub."""
     mldsa_keys_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(mldsa_keys_dir, 0o700)
+    os.chmod(mldsa_keys_dir, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
     public_keys_dir.mkdir(parents=True, exist_ok=True)
 
     privkey_file = mldsa_keys_dir / "trusted-oss-mldsa65.key"
@@ -63,8 +80,7 @@ def ensure_mldsa_signing_key(
 
     if not privkey_file.exists() or not pubkey_file.exists():
         pk, sk = Dilithium3.keygen()
-        privkey_file.write_bytes(sk)
-        os.chmod(privkey_file, 0o600)
+        _write_secret_bytes(privkey_file, sk)
 
         armored_pub = armor_mldsa_public_key(pk)
         pubkey_file.write_text(armored_pub, encoding="utf-8")
@@ -129,7 +145,7 @@ def ensure_gpg_signing_key(
 ) -> Path:
     """Ensure a GPG signing key exists in gnupghome and export trusted-oss-pubkey.asc."""
     gnupghome.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(gnupghome, 0o700)
+    os.chmod(gnupghome, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
     public_keys_dir.mkdir(parents=True, exist_ok=True)
     pubkey_file = public_keys_dir / "trusted-oss-pubkey.asc"
 
@@ -199,10 +215,17 @@ def sign_artifact_detached_gpg(
         cmd.extend(["--local-user", key_id])
     cmd.extend(["--output", str(sig_path)])
     if passphrase:
-        cmd.extend(["--pinentry-mode", "loopback", "--passphrase", passphrase])
+        cmd.extend(["--pinentry-mode", "loopback", "--passphrase-fd", "0"])
     cmd.append(str(artifact_path))
 
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    proc = subprocess.run(
+        cmd,
+        input=f"{passphrase}\n" if passphrase else None,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     if proc.returncode != 0 or not sig_path.exists():
         raise SigningError(f"GPG signing failed for {artifact_path.name}: {proc.stderr}")
 
@@ -250,8 +273,7 @@ def ensure_provenance_hmac_key(key_path: Path, configured_key: str = "") -> byte
         if raw:
             return raw
     new_key = os.urandom(32).hex().encode("ascii")
-    key_path.write_bytes(new_key)
-    os.chmod(key_path, 0o600)
+    _write_secret_bytes(key_path, new_key)
     return new_key
 
 

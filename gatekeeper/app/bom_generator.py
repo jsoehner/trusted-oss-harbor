@@ -8,13 +8,20 @@ import json
 import re
 import tarfile
 import uuid
-import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-from app.storage import ArtifactDigests, is_safe_subpath, normalize_pypi_name
+from defusedxml import ElementTree as ET
+
+from app.storage import (
+    ArtifactDigests,
+    SAFE_SEGMENT_RE,
+    is_safe_subpath,
+    normalize_pypi_name,
+    resolve_safe_relative_path,
+)
 
 BOM_SCANNER_NAME = "trusted-oss-gatekeeper-bom"
 BOM_SCANNER_VERSION = "1.0.0"
@@ -316,7 +323,8 @@ def _extract_sbom_dependencies_from_archive(file_path: Path) -> list[dict[str, s
                 for info in zf.infolist()[:MAX_ARCHIVE_MEMBERS]:
                     fname = info.filename
                     if fname.endswith("/METADATA") or fname == "METADATA":
-                        raw = zf.read(info)[:MAX_MEMBER_BYTES].decode("utf-8", errors="replace")
+                        with zf.open(info, "r") as stream:
+                            raw = stream.read(MAX_MEMBER_BYTES).decode("utf-8", errors="replace")
                         for line in raw.splitlines():
                             if line.startswith("Requires-Dist:") and "; extra ==" not in line:
                                 spec = line.split(":", 1)[1].strip().split(";")[0].strip()
@@ -324,7 +332,8 @@ def _extract_sbom_dependencies_from_archive(file_path: Path) -> list[dict[str, s
                                 if m:
                                     deps.append({"ecosystem": "pypi", "name": m.group(1)})
                     elif fname.endswith("pom.xml"):
-                        raw = zf.read(info)[:MAX_MEMBER_BYTES].decode("utf-8", errors="replace")
+                        with zf.open(info, "r") as stream:
+                            raw = stream.read(MAX_MEMBER_BYTES).decode("utf-8", errors="replace")
                         try:
                             root = ET.fromstring(raw)
                             for dep_el in root.iter():
@@ -362,12 +371,14 @@ def inspect_artifact_crypto(file_path: Path) -> list[dict[str, Any]]:
                     continue
                 member_lower = info.filename.lower()
                 if member_lower.endswith(TEXT_SCAN_EXTS):
-                    data = zf.read(info)[:MAX_MEMBER_BYTES]
+                    with zf.open(info, "r") as stream:
+                        data = stream.read(MAX_MEMBER_BYTES)
                     _scan_text_for_crypto(
                         data.decode("utf-8", errors="ignore"), info.filename, found
                     )
                 elif member_lower.endswith(BINARY_SCAN_EXTS):
-                    data = zf.read(info)[:MAX_MEMBER_BYTES]
+                    with zf.open(info, "r") as stream:
+                        data = stream.read(MAX_MEMBER_BYTES)
                     _scan_text_for_crypto(
                         _extract_printable_ascii(data), info.filename, found
                     )
@@ -606,16 +617,22 @@ def resolve_purl_to_bom_file(
         if not namespace:
             return None
         group_path = namespace.replace(".", "/")
-        art_dir = trusted_maven_dir / group_path / name
-        if not art_dir.is_dir() or not is_safe_subpath(trusted_maven_dir, art_dir):
+        try:
+            art_dir = resolve_safe_relative_path(trusted_maven_dir, f"{group_path}/{name}")
+        except ValueError:
+            return None
+        if not art_dir.is_dir():
             return None
         search_dirs: list[Path] = []
         if version:
-            vdir = art_dir / version
-            if vdir.is_dir() and is_safe_subpath(trusted_maven_dir, vdir):
+            try:
+                vdir = resolve_safe_relative_path(art_dir, version)
+            except ValueError:
+                return None
+            if vdir.is_dir():
                 search_dirs.append(vdir)
         else:
-            search_dirs = [p for p in sorted(art_dir.iterdir()) if p.is_dir()]
+            search_dirs = [p for p in sorted(art_dir.iterdir()) if p.is_dir() and not p.is_symlink()]
 
         for vdir in reversed(search_dirs):
             # Prefer .jar BOM over .pom BOM
@@ -628,7 +645,7 @@ def resolve_purl_to_bom_file(
                     continue
                 base_name = bom_file.name[: -len(suffix)]
                 base_file = vdir / base_name
-                if not base_file.is_file():
+                if base_file.is_symlink() or not base_file.is_file():
                     continue
                 if base_name.endswith(".jar"):
                     jar_matches.append((base_file, bom_file))
@@ -643,13 +660,22 @@ def resolve_purl_to_bom_file(
     if eco in ("oci", "docker"):
         # Search harbor_oci_cache_dir for matching repo/manifests/<ref>
         repo_sub = f"{namespace}/{name}" if namespace else name
-        manifests_dir = harbor_oci_cache_dir / repo_sub / "manifests"
-        if not manifests_dir.is_dir() or not is_safe_subpath(harbor_oci_cache_dir, manifests_dir):
-            return None
         ref = version or "latest"
-        base_file = manifests_dir / ref
-        bom_file = manifests_dir / f"{ref}{suffix}"
-        if base_file.is_file() and bom_file.is_file():
+        if not SAFE_SEGMENT_RE.match(ref):
+            return None
+        try:
+            manifests_dir = resolve_safe_relative_path(harbor_oci_cache_dir, f"{repo_sub}/manifests")
+            base_file = resolve_safe_relative_path(manifests_dir, ref)
+            bom_file = resolve_safe_relative_path(manifests_dir, f"{ref}{suffix}")
+        except ValueError:
+            return None
+        if (
+            manifests_dir.is_dir()
+            and base_file.is_file()
+            and not base_file.is_symlink()
+            and bom_file.is_file()
+            and not bom_file.is_symlink()
+        ):
             return base_file, bom_file
         return None
 

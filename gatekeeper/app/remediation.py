@@ -3,20 +3,22 @@
 from __future__ import annotations
 
 import datetime
+import html
 import json
 import logging
 import os
 import re
 import shutil
 import time
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+from defusedxml import ElementTree as ET
 import httpx
 
 from app.activity import append_activity_event
 from app.config import Settings
+from app.storage import normalize_pypi_name, resolve_safe_relative_path
 from app.virtual_repo import extract_package_coordinates
 
 logger = logging.getLogger("gatekeeper.remediation")
@@ -176,7 +178,8 @@ def update_latest_tag(
     path.write_text(json.dumps(tags, indent=2) + "\n", encoding="utf-8")
 
     if ecosystem == "pypi":
-        pkg_dir = settings.trusted_pypi_dir / component
+        norm_pkg = normalize_pypi_name(component)
+        pkg_dir = resolve_safe_relative_path(settings.trusted_pypi_dir, norm_pkg)
         pkg_dir.mkdir(parents=True, exist_ok=True)
         (pkg_dir / "latest.json").write_text(
             json.dumps({"tag": "latest", "version": version, "artifact": rel_artifact_path}, indent=2) + "\n",
@@ -184,15 +187,19 @@ def update_latest_tag(
         )
     elif ecosystem == "maven" and ":" in component:
         group_id, artifact_id = component.split(":", 1)
-        art_dir = settings.trusted_maven_dir / group_id.replace(".", "/") / artifact_id
+        if not group_id or not artifact_id or "/" in group_id or "\\" in group_id or ".." in group_id or "/" in artifact_id or "\\" in artifact_id or ".." in artifact_id:
+            raise ValueError(f"Invalid Maven coordinate: {component!r}")
+        art_dir = resolve_safe_relative_path(
+            settings.trusted_maven_dir, f"{group_id.replace('.', '/')}/{artifact_id}"
+        )
         art_dir.mkdir(parents=True, exist_ok=True)
         xml = (
             "<metadata>\n"
-            f"  <groupId>{group_id}</groupId>\n"
-            f"  <artifactId>{artifact_id}</artifactId>\n"
+            f"  <groupId>{html.escape(group_id)}</groupId>\n"
+            f"  <artifactId>{html.escape(artifact_id)}</artifactId>\n"
             "  <versioning>\n"
-            f"    <latest>{version}</latest>\n"
-            f"    <release>{version}</release>\n"
+            f"    <latest>{html.escape(version)}</latest>\n"
+            f"    <release>{html.escape(version)}</release>\n"
             "  </versioning>\n"
             "</metadata>\n"
         )

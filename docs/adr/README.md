@@ -12,3 +12,4 @@
 | [0008](0008-digest-artifact-telemetry-and-scheduled-lan-priming.md) | Daily Digest Artifact Activity Telemetry and Scheduled LAN Cache Priming | Accepted | 2026-11-17 |
 | [0009](0009-standardized-html-email-notifications.md) | Standardized HTML Email Notifications Across Operational Digests | Accepted | 2026-11-20 |
 | [0010](0010-signed-artifact-cbom-attestations-and-purl-batch-api.md) | Per-Artifact Dual-Signed CycloneDX 1.6 SBOM/CBOM Attestations, PURL Batch API, and OCI 1.1 Referrers | Accepted | 2026-11-20 |
+| [0011](0011-security-assessment-remediation-and-governance.md) | Comprehensive Security Assessment Remediation & Governance Hardening | Accepted | 2026-11-22 |

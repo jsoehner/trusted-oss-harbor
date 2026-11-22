@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,9 @@ def _http_json(
     payload: dict[str, Any] | None = None,
     timeout: float = 30.0,
 ) -> tuple[int, dict[str, Any]]:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"Unsupported URL scheme: {url!r}")
     headers = {"Accept": "application/json"}
     if token:
         headers["X-Gatekeeper-Token"] = token
@@ -42,7 +46,7 @@ def _http_json(
         headers["Content-Type"] = "application/json"
         data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         return resp.status, json.loads(resp.read().decode("utf-8"))
 
 

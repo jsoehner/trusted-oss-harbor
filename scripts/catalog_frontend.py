@@ -25,15 +25,23 @@ def _build_ssl_context(ca_bundle: str = "", insecure: bool = False) -> ssl.SSLCo
     return None
 
 
+def _validate_http_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"Unsupported URL scheme: {url!r}")
+    return url
+
+
 def _get_json(
     url: str,
     timeout: float = 60.0,
     ssl_ctx: ssl.SSLContext | None = None,
     token: str = "",
 ) -> dict[str, Any]:
+    _validate_http_url(url)
     headers = {"X-Gatekeeper-Token": token} if token else {}
     req = urllib.request.Request(url, method="GET", headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:  # nosec B310 # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -43,9 +51,10 @@ def _post_json(
     ssl_ctx: ssl.SSLContext | None = None,
     token: str = "",
 ) -> dict[str, Any]:
+    _validate_http_url(url)
     headers = {"X-Gatekeeper-Token": token} if token else {}
     req = urllib.request.Request(url, method="POST", data=b"", headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:  # nosec B310 # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -55,10 +64,11 @@ def _head_or_get_ok(
     ssl_ctx: ssl.SSLContext | None = None,
     token: str = "",
 ) -> tuple[bool, str]:
+    _validate_http_url(url)
     headers = {"X-Gatekeeper-Token": token} if token else {}
     req = urllib.request.Request(url, method="GET", headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:  # nosec B310 # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             body = resp.read().decode("utf-8", errors="replace").strip()
             return resp.status == 200, body
     except urllib.error.HTTPError as exc:
@@ -617,6 +627,11 @@ def main() -> int:
         help="Override number of newest versions to keep during --gc (default: server GC_RETENTION_VERSIONS=2)",
     )
     parser.add_argument(
+        "--advisories",
+        action="store_true",
+        help="Show enriched vulnerability advisories, OSV/NVD links, and upgrade guidance (GET /catalog/advisories)",
+    )
+    parser.add_argument(
         "--activity",
         action="store_true",
         help="Show scheduled task, rescan, quarantine, and GC activity log events (GET /audit/activity)",
@@ -641,6 +656,43 @@ def main() -> int:
     parser.add_argument("--insecure", action="store_true", help="Skip TLS certificate verification")
     parser.add_argument("--json", action="store_true", help="Output JSON inventory")
     args = parser.parse_args()
+
+    if args.advisories:
+        try:
+            ssl_ctx = _build_ssl_context(args.ca_bundle, args.insecure)
+            base = args.url.rstrip("/")
+            params: list[str] = []
+            if args.ecosystem and args.ecosystem != "all":
+                params.append(f"ecosystem={urllib.parse.quote(args.ecosystem)}")
+            if args.components:
+                params.append(f"component={urllib.parse.quote(args.components)}")
+            qs = f"?{'&'.join(params)}" if params else ""
+            adv_data = _get_json(f"{base}/catalog/advisories{qs}", ssl_ctx=ssl_ctx, token=args.token)
+        except Exception as exc:
+            print(f"[ERROR] Could not fetch vulnerability advisories from {args.url}: {exc}")
+            return 1
+        if args.json:
+            print(json.dumps(adv_data, indent=2))
+            return 0
+        advisories = adv_data.get("advisories") or []
+        print(f"=== Trusted OSS Vulnerability Advisories ({len(advisories)}) ===")
+        print(f"Dashboard: {args.url.rstrip('/')}/catalog/advisories/dashboard")
+        print(f"RSS Feed : {args.url.rstrip('/')}/catalog/advisories.rss")
+        if not advisories:
+            print("  No vulnerable or quarantined components found.")
+            return 0
+        rows = [
+            [
+                f"{a.get('severity', '')} ({float(a.get('max_cvss', 0.0)):.1f})",
+                f"{a.get('ecosystem', '')}:{a.get('component', '')}@{a.get('version', '')}",
+                ",".join(a.get("cve_ids") or []) or "-",
+                str(a.get("superseded_by") or "none"),
+                (a.get("advisory_urls") or [{}])[0].get("url", "-"),
+            ]
+            for a in advisories
+        ]
+        print(_render_table(["SEVERITY", "COMPONENT", "CVES", "UPGRADE_TO", "ADVISORY_URL"], rows))
+        return 0
 
     try:
         report = catalog_frontend(

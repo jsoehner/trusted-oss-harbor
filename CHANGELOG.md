@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Vulnerability Advisory Center & Real-Time Alerts ([SecADR-0011](docs/adr/0011-security-assessment-remediation-and-governance.md))**:
+  - Added `gatekeeper/app/advisories.py` and frontend endpoints `GET /catalog/advisories` (filterable JSON with PURLs, severity, OSV/NVD links, and upgrade guidance), `GET /catalog/advisories.rss` (RSS 2.0 subscription feed), and `GET /catalog/advisories/dashboard` (zero-JS, CSP-safe HTML Security Advisory Center).
+  - Added real-time deduplicated vulnerability alert dispatch (`audit/vuln_alerts.jsonl`) supporting HMAC-SHA256 signed webhooks (`VULN_ALERT_WEBHOOK_URL`, `VULN_ALERT_WEBHOOK_SECRET`) and optional immediate Microsoft Graph email alerts (`VULN_ALERT_IMMEDIATE_EMAIL=true`).
+  - Added `--advisories` CLI option to `scripts/catalog_frontend.py`.
+- **Automated Security Governance CI & Posture Documentation**:
+  - Added `.github/workflows/security-governance.yml` (SHA-pinned, least-privilege Gitleaks, Bandit, Semgrep, and `pip-audit` gates) and updated `.github/dependabot.yml` with the mandatory 7-day cooldown across `github-actions`, `pip`, and `docker`.
+  - Added [SECURITY_POSTURE.md](SECURITY_POSTURE.md), [SecADR-0011](docs/adr/0011-security-assessment-remediation-and-governance.md), and regression test suite `gatekeeper/tests/test_security_assessment_fixes.py`.
+
+### Changed
+- **Daily Digest Upgrade-Path Reporting (`gatekeeper/app/notifications.py`)**: Updated both plain-text and HTML daily digests to show all vulnerable/quarantined component versions alongside clickable OSV advisory links and the **newest `CLEAN` (passing-scan) version available for upgrade**.
+
+### Security
+- **Path Traversal & Symlink Containment**: Hardened `/v2/{namespace}/{repo_path}/referrers/{digest}`, `/v2/{namespace}/{repo_path}/blobs/{digest}`, `resolve_purl_to_bom_file()`, and `update_latest_tag()` with strict `resolve_safe_relative_path()` and symlink checks.
+- **Archive DoS, Backslash Zip-Slip & Streaming Limits**: Restored `MAX_ARTIFACT_BYTES` (250 MB, HTTP `413`), `MAX_ARCHIVE_MEMBERS` (10,000), `MAX_UNCOMPRESSED_BYTES` (512 MB), streaming ZIP/EICAR reads, Windows backslash/drive-letter Zip-Slip rejection, and `TRIVY_REQUIRED` fail-closed mode (closing ADR-0002 regressions).
+- **SSRF, Auth & Pagination**: Enforced `settings.trusted_sources` in dynamic OCI warmup and strict `http`/`https` URL validation across Gatekeeper and CLI scripts; capped `POST /bom/batch` to 500 PURLs and gated `trigger_pull_on_miss` behind admin auth; deduplicated JIT routes, authenticated `GET /status/{job_id}`, bounded `JIT_PROMOTION_JOBS`, and paginated `GET /audit/provenance`.
+- **Cryptographic, XML & Gateway Hardening**: Restored persistent `0o600` provenance HMAC key (`keys/provenance.hmac.key`), switched GPG passphrase passing to `--passphrase-fd 0` stdin, migrated XML parsing to `defusedxml`, hardened Nginx headers (`server_tokens off`, CSP, `Permissions-Policy`), pinned `oras-project/setup-oras` to its commit SHA, and added least-privilege `permissions` to `probe-wan-connectivity.yml`.
+
 ## [1.6.0] - 2026-11-20
 
 ### Added

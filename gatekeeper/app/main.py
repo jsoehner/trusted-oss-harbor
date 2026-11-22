@@ -9,6 +9,7 @@ from pathlib import Path
 import secrets
 import sys
 from typing import Annotated, Any
+from urllib.parse import urlparse
 import uuid
 
 import httpx
@@ -17,6 +18,12 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from pydantic import BaseModel
 
 from app.activity import append_activity_event, read_activity_events
+from app.advisories import (
+    build_vulnerability_advisories,
+    dispatch_vulnerability_alerts,
+    render_advisories_dashboard_html,
+    render_advisories_rss,
+)
 from app.bom_generator import (
     compute_file_sha256,
     generate_artifact_boms,
@@ -36,6 +43,7 @@ from app.signer import (
     append_provenance_record,
     ensure_gpg_signing_key,
     ensure_mldsa_signing_key,
+    ensure_provenance_hmac_key,
     sign_artifact_detached_gpg,
     sign_artifact_mldsa65,
     verify_artifact_signature,
@@ -95,8 +103,58 @@ def get_settings(request: Request) -> Settings:
     return settings
 
 
+def _get_provenance_hmac_key(settings: Settings) -> bytes:
+    """Return the persistent instance-unique HMAC key for provenance attestations."""
+    return ensure_provenance_hmac_key(
+        key_path=settings.oss_data_root / "keys" / "provenance.hmac.key",
+        configured_key=settings.provenance_hmac_key,
+    )
+
+
+def _validate_http_url(url: str) -> str:
+    """Ensure an upstream URL strictly uses http or https scheme with a valid host."""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"Unsupported or invalid upstream URL: {url!r}")
+    return url
+
+
+async def _stream_download_to_file(
+    client: httpx.AsyncClient,
+    url: str,
+    dest_file: Path,
+    max_bytes: int,
+) -> bool:
+    """Stream an upstream HTTP(S) response to dest_file, rejecting payloads above max_bytes."""
+    _validate_http_url(url)
+    async with client.stream("GET", url) as resp:
+        if resp.status_code != 200:
+            return False
+        content_len = resp.headers.get("content-length")
+        if content_len and content_len.isdigit() and int(content_len) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Upstream artifact exceeds maximum allowed size ({max_bytes} bytes)",
+            )
+        written = 0
+        try:
+            with dest_file.open("wb") as fh:
+                async for chunk in resp.aiter_bytes(chunk_size=65536):
+                    written += len(chunk)
+                    if written > max_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Upstream artifact exceeds maximum allowed size ({max_bytes} bytes)",
+                        )
+                    fh.write(chunk)
+        except Exception:
+            dest_file.unlink(missing_ok=True)
+            raise
+        return True
+
+
 def initialize_storage_and_keys(settings: Settings) -> Path:
-    """Create persistent directory structure and ensure Trusted OSS GPG and PQC keys exist."""
+    """Create persistent directory structure and ensure Trusted OSS GPG, PQC, and HMAC keys exist."""
     for directory in (
         settings.quarantine_dir,
         settings.trusted_maven_dir,
@@ -107,6 +165,8 @@ def initialize_storage_and_keys(settings: Settings) -> Path:
         settings.provenance_log_path.parent,
     ):
         directory.mkdir(parents=True, exist_ok=True)
+
+    _get_provenance_hmac_key(settings)
 
     if settings.pqc_signing_enabled:
         ensure_mldsa_signing_key(
@@ -530,6 +590,7 @@ async def quarantine_scan_sign_and_promote(
         package_ecosystem=ecosystem,
         package_name=pkg_name,
         package_version=pkg_version,
+        trivy_required=settings.trivy_required,
     )
     if not verdict.passed:
         staged_file.unlink(missing_ok=True)
@@ -658,6 +719,7 @@ async def quarantine_scan_sign_and_promote(
         cve_status=verdict.cve_status,
         signature_file=f"{artifact_rel_path}.asc",
         signature_file_mldsa=f"{artifact_rel_path}.mldsa65" if settings.pqc_signing_enabled else "",
+        hmac_key=_get_provenance_hmac_key(settings),
         max_cvss=verdict.max_cvss,
         cve_ids=verdict.cve_ids,
         sbom_file=sbom_rel,
@@ -739,11 +801,13 @@ async def ensure_maven_artifact_cached(
             for base_url in upstream_urls:
                 candidate_url = f"{base_url.rstrip('/')}/{base_rel_path}"
                 try:
-                    resp = await client.get(candidate_url)
-                    if resp.status_code == 200:
-                        staged_file.write_bytes(resp.content)
+                    if await _stream_download_to_file(
+                        client, candidate_url, staged_file, settings.max_artifact_bytes
+                    ):
                         downloaded = True
                         break
+                except HTTPException:
+                    raise
                 except Exception as e:
                     logger.warning(
                         f"Failed to fetch maven artifact from {candidate_url}: {e}"
@@ -818,11 +882,13 @@ async def ensure_pypi_artifact_cached(
         async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
             for candidate_url in candidate_urls:
                 try:
-                    resp = await client.get(candidate_url)
-                    if resp.status_code == 200:
-                        staged_file.write_bytes(resp.content)
+                    if await _stream_download_to_file(
+                        client, candidate_url, staged_file, settings.max_artifact_bytes
+                    ):
                         downloaded = True
                         break
+                except HTTPException:
+                    raise
                 except Exception as e:
                     logger.warning(
                         f"Failed to fetch PyPI artifact from {candidate_url}: {e}"
@@ -964,7 +1030,8 @@ async def get_chainguard_cached_manifest(
 
     base_sig = base_file.with_name(f"{base_file.name}.asc")
     if requested_file.name.endswith(".mldsa65") and settings.pqc_signing_enabled:
-        if not verify_artifact_mldsa65(base_file, requested_file, settings.mldsa_public_key_path):
+        target_for_sig = requested_file.with_name(requested_file.name[: -len(".mldsa65")])
+        if not verify_artifact_mldsa65(target_for_sig, requested_file, settings.mldsa_public_key_path):
             raise HTTPException(
                 status_code=403,
                 detail="Integrity violation: OCI manifest lacks a valid Trusted OSS ML-DSA-65 PQC signature",
@@ -1053,7 +1120,8 @@ async def get_virtual_oci_manifest(
 
     base_sig = base_file.with_name(f"{base_file.name}.asc")
     if requested_file.name.endswith(".mldsa65") and settings.pqc_signing_enabled:
-        if not verify_artifact_mldsa65(base_file, requested_file, settings.mldsa_public_key_path):
+        target_for_sig = requested_file.with_name(requested_file.name[: -len(".mldsa65")])
+        if not verify_artifact_mldsa65(target_for_sig, requested_file, settings.mldsa_public_key_path):
             raise HTTPException(
                 status_code=403,
                 detail="Integrity violation: OCI manifest lacks a valid Trusted OSS ML-DSA-65 PQC signature",
@@ -1136,7 +1204,18 @@ async def _execute_catalog_warmup(
     async def warm_oci(img: dict[str, Any]) -> None:
         repo = img["repository"]
         ref = img.get("reference", "latest")
-        registry = img.get("registry", "cgr.dev")
+        registry = str(img.get("registry", "cgr.dev")).strip().lower()
+        allowed_registries = set(settings.trusted_sources) | {"cgr.dev", "registry-1.docker.io", ""}
+        if registry not in allowed_registries:
+            failures.append(
+                {
+                    "ecosystem": "oci",
+                    "target": f"{registry}/{repo}:{ref}",
+                    "status_code": 403,
+                    "detail": f"Registry {registry!r} is not in trusted_sources",
+                }
+            )
+            return
         upstream_url = f"https://{registry}" if "." in registry else settings.upstream_chainguard_url
         ns = "chainguard-cache" if registry in {"cgr.dev", ""} else registry.replace(".", "-")
         async with sem:
@@ -1822,6 +1901,97 @@ async def get_catalog_vulnerabilities(
     }
 
 
+@app.get("/catalog/advisories")
+async def get_catalog_advisories(
+    settings: Annotated[Settings, Depends(get_settings)],
+    ecosystem: str | None = None,
+    component: str | None = None,
+    min_cvss: float = 0.0,
+    since_hours: int | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Return enriched, filterable advisories for components that became vulnerable or quarantined."""
+    vuln_data = await get_catalog_vulnerabilities(
+        settings=settings,
+        ecosystem=ecosystem,
+        components=component,
+        verify_signatures=False,
+    )
+    advisories = build_vulnerability_advisories(
+        quarantined=vuln_data["quarantined"],
+        vulnerable_components=vuln_data["components"],
+        ecosystem=ecosystem,
+        component_filter=component,
+        min_cvss=min_cvss,
+        since_hours=since_hours,
+        limit=limit,
+    )
+    return {
+        "cvss_fail_threshold": settings.cvss_fail_threshold,
+        "count": len(advisories),
+        "summary": vuln_data["summary"],
+        "advisories": advisories,
+    }
+
+
+@app.get("/catalog/advisories.rss")
+async def get_catalog_advisories_rss(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    ecosystem: str | None = None,
+    component: str | None = None,
+    min_cvss: float = 0.0,
+    limit: int = 100,
+) -> PlainTextResponse:
+    """Subscribe to newly vulnerable and quarantined OSS components via RSS 2.0."""
+    vuln_data = await get_catalog_vulnerabilities(
+        settings=settings,
+        ecosystem=ecosystem,
+        components=component,
+        verify_signatures=False,
+    )
+    advisories = build_vulnerability_advisories(
+        quarantined=vuln_data["quarantined"],
+        vulnerable_components=vuln_data["components"],
+        ecosystem=ecosystem,
+        component_filter=component,
+        min_cvss=min_cvss,
+        limit=limit,
+    )
+    rss_xml = render_advisories_rss(advisories, base_url=str(request.base_url).rstrip("/"))
+    return PlainTextResponse(content=rss_xml, media_type="application/rss+xml; charset=utf-8")
+
+
+@app.get("/catalog/advisories/dashboard", response_class=HTMLResponse)
+async def get_catalog_advisories_dashboard(
+    settings: Annotated[Settings, Depends(get_settings)],
+    ecosystem: str | None = None,
+    component: str | None = None,
+    min_cvss: float = 0.0,
+) -> HTMLResponse:
+    """Browser-friendly Security Advisory Center dashboard for vulnerable and quarantined components."""
+    vuln_data = await get_catalog_vulnerabilities(
+        settings=settings,
+        ecosystem=ecosystem,
+        components=component,
+        verify_signatures=False,
+    )
+    advisories = build_vulnerability_advisories(
+        quarantined=vuln_data["quarantined"],
+        vulnerable_components=vuln_data["components"],
+        ecosystem=ecosystem,
+        component_filter=component,
+        min_cvss=min_cvss,
+        limit=200,
+    )
+    page = render_advisories_dashboard_html(
+        advisories=advisories,
+        summary=vuln_data["summary"],
+        cvss_threshold=settings.cvss_fail_threshold,
+    )
+    return HTMLResponse(content=page)
+
+
 async def _try_upgrade_component(
     ecosystem: str,
     component: str,
@@ -2000,6 +2170,7 @@ async def remediate_vulnerable_components(
                         cve_status=f"CLEAN (max CVSS {max_cvss:.1f} < {settings.cvss_fail_threshold:.1f}) [{cve_status}]",
                         signature_file=f"{prov_key}.asc",
                         signature_file_mldsa=f"{prov_key}.mldsa65" if path.with_name(f"{path.name}.mldsa65").exists() else "",
+                        hmac_key=_get_provenance_hmac_key(settings),
                         max_cvss=max_cvss,
                         cve_ids=cve_ids,
                     )
@@ -2080,6 +2251,8 @@ async def remediate_vulnerable_components(
     if targets:
         await asyncio.gather(*(_process_target(t) for t in targets))
 
+    alert_summary = await dispatch_vulnerability_alerts(settings, quarantined_items)
+
     return {
         "status": "remediated",
         "ecosystems": sorted(active_ecosystems),
@@ -2091,6 +2264,7 @@ async def remediate_vulnerable_components(
         "upgraded": upgraded_items,
         "failed_upgrades": failed_upgrades,
         "latest_tags": load_latest_tags(settings),
+        "alerts": alert_summary,
     }
 
 
@@ -2267,14 +2441,21 @@ async def get_mldsa65_fingerprint(
 @app.get("/audit/provenance")
 async def get_provenance_log(
     settings: Annotated[Settings, Depends(get_settings)],
+    limit: int = 500,
+    offset: int = 0,
 ) -> dict[str, Any]:
-    """Return all recorded cryptographic provenance attestations."""
+    """Return paginated cryptographic provenance attestations."""
+    safe_limit = max(1, min(limit, 2000))
+    safe_offset = max(0, offset)
     records: list[dict[str, Any]] = []
     if settings.provenance_log_path.exists():
-        for line in settings.provenance_log_path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                records.append(json.loads(line))
-    return {"count": len(records), "records": records}
+        with settings.provenance_log_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    records.append(json.loads(line))
+    total = len(records)
+    sliced = records[safe_offset : safe_offset + safe_limit]
+    return {"count": len(sliced), "total": total, "offset": safe_offset, "limit": safe_limit, "records": sliced}
 
 
 @app.get("/audit/activity")
@@ -2324,8 +2505,20 @@ async def ingest_artifact(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     staged_file.parent.mkdir(parents=True, exist_ok=True)
-    content = await file.read()
-    staged_file.write_bytes(content)
+    written = 0
+    try:
+        with staged_file.open("wb") as fh:
+            while chunk := await file.read(65536):
+                written += len(chunk)
+                if written > settings.max_artifact_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Artifact exceeds maximum allowed size ({settings.max_artifact_bytes} bytes)",
+                    )
+                fh.write(chunk)
+    except Exception:
+        staged_file.unlink(missing_ok=True)
+        raise
 
     record = await quarantine_scan_sign_and_promote(
         staged_file=staged_file,
@@ -2548,6 +2741,7 @@ async def get_pypi_trusted_package_file(
     return await _serve_pypi_package_file(package, filename, request, settings)
 
 
+MAX_JIT_PROMOTION_JOBS = 500
 JIT_PROMOTION_JOBS: dict[str, dict[str, Any]] = {}
 
 
@@ -2611,12 +2805,20 @@ async def request_artifact(
     """Just-In-Time (JIT) promotion endpoint for OCI images."""
     require_admin_token(x_gatekeeper_token, settings)
 
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON request body") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
     image_uri = str(data.get("image", "")).strip()
     if not image_uri:
         raise HTTPException(status_code=400, detail="Missing 'image' field in request body")
 
     job_id = str(uuid.uuid4())
+    while len(JIT_PROMOTION_JOBS) >= MAX_JIT_PROMOTION_JOBS:
+        oldest_key = next(iter(JIT_PROMOTION_JOBS))
+        JIT_PROMOTION_JOBS.pop(oldest_key, None)
     JIT_PROMOTION_JOBS[job_id] = {
         "image": image_uri,
         "status": "queued",
@@ -2638,13 +2840,15 @@ async def request_artifact(
 @app.get("/status/{job_id}")
 async def get_jit_status(
     job_id: str,
+    settings: Annotated[Settings, Depends(get_settings)],
+    x_gatekeeper_token: Annotated[str | None, Header()] = None,
 ) -> JSONResponse:
     """Poll the status of a JIT promotion request."""
+    require_admin_token(x_gatekeeper_token, settings)
     job = JIT_PROMOTION_JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job ID not found")
     return JSONResponse(content=job)
-
 
 
 @app.api_route("/pypi/virtual/simple/{package}/", methods=["GET", "HEAD"], response_class=HTMLResponse)
@@ -2676,104 +2880,6 @@ async def get_pypi_virtual_package_file(
     if not settings.virtual_repo_enabled:
         raise HTTPException(status_code=404, detail="Virtual repository feature is disabled")
     return await _serve_pypi_package_file(package, filename, request, settings)
-
-
-JIT_PROMOTION_JOBS: dict[str, dict[str, Any]] = {}
-
-
-async def process_jit_promotion(
-    job_id: str,
-    image_uri: str,
-    settings: Settings,
-    app_instance: FastAPI,
-) -> None:
-    """Process a JIT OCI promotion request: validate trusted source, fetch, scan, sign, and cache."""
-    try:
-        parts = image_uri.split("/", 1)
-        if len(parts) != 2 or not parts[0] or not parts[1]:
-            JIT_PROMOTION_JOBS[job_id]["status"] = "failed"
-            JIT_PROMOTION_JOBS[job_id]["error"] = f"Invalid image URI: {image_uri}"
-            return
-
-        registry, repo_and_ref = parts
-        if registry not in settings.trusted_sources:
-            JIT_PROMOTION_JOBS[job_id]["status"] = "failed"
-            JIT_PROMOTION_JOBS[job_id]["error"] = f"Registry {registry} is not in trusted_sources."
-            return
-
-        if ":" in repo_and_ref.rsplit("/", 1)[-1]:
-            repo_path, reference = repo_and_ref.rsplit(":", 1)
-        else:
-            repo_path, reference = repo_and_ref, "latest"
-
-        JIT_PROMOTION_JOBS[job_id]["status"] = "processing"
-        JIT_PROMOTION_JOBS[job_id]["progress"] = "Fetching, scanning, and signing..."
-
-        upstream_url = (
-            settings.upstream_chainguard_url
-            if registry == "cgr.dev"
-            else f"https://{registry if registry != 'docker.io' else 'registry-1.docker.io'}"
-        )
-        ns = "chainguard-cache" if registry == "cgr.dev" else registry.replace(".", "-")
-        await ensure_oci_manifest_cached(
-            repo_path=repo_path,
-            base_ref=reference,
-            settings=settings,
-            upstream_base_url=upstream_url,
-            cache_namespace=ns,
-            app_instance=app_instance,
-        )
-
-        JIT_PROMOTION_JOBS[job_id]["status"] = "completed"
-        JIT_PROMOTION_JOBS[job_id]["progress"] = "Promoted"
-    except Exception as exc:
-        logger.error("JIT Promotion failed for %s: %s", job_id, exc)
-        JIT_PROMOTION_JOBS[job_id]["status"] = "failed"
-        JIT_PROMOTION_JOBS[job_id]["error"] = str(exc)
-
-
-@app.post("/request-artifact")
-async def request_artifact(
-    request: Request,
-    settings: Annotated[Settings, Depends(get_settings)],
-    x_gatekeeper_token: Annotated[str | None, Header()] = None,
-) -> JSONResponse:
-    """Just-In-Time (JIT) promotion endpoint for OCI images."""
-    require_admin_token(x_gatekeeper_token, settings)
-
-    data = await request.json()
-    image_uri = str(data.get("image", "")).strip()
-    if not image_uri:
-        raise HTTPException(status_code=400, detail="Missing 'image' field in request body")
-
-    job_id = str(uuid.uuid4())
-    JIT_PROMOTION_JOBS[job_id] = {
-        "image": image_uri,
-        "status": "queued",
-        "progress": "Waiting in queue",
-        "error": None,
-    }
-    asyncio.create_task(process_jit_promotion(job_id, image_uri, settings, request.app))
-
-    return JSONResponse(
-        status_code=202,
-        content={
-            "job_id": job_id,
-            "status": "queued",
-            "message": f"Artifact {image_uri} has been queued for JIT promotion.",
-        },
-    )
-
-
-@app.get("/status/{job_id}")
-async def get_jit_status(
-    job_id: str,
-) -> JSONResponse:
-    """Poll the status of a JIT promotion request."""
-    job = JIT_PROMOTION_JOBS.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job ID not found")
-    return JSONResponse(content=job)
 
 
 # ==============================================================================
@@ -2926,11 +3032,16 @@ async def batch_lookup_boms(
     req: BomBatchRequest,
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
+    x_gatekeeper_token: Annotated[str | None, Header()] = None,
 ) -> JSONResponse:
     """Batch-resolve PURLs to signed Trusted OSS CBOM/SBOM attestations in a single round-trip."""
     btype = req.bom_type.lower().strip()
     if btype not in ("cbom", "sbom"):
         raise HTTPException(status_code=400, detail="bom_type must be 'cbom' or 'sbom'")
+    if len(req.purls) > 500:
+        raise HTTPException(status_code=400, detail="Maximum 500 PURLs allowed per batch request")
+    if req.trigger_pull_on_miss:
+        require_admin_token(x_gatekeeper_token, settings)
 
     found: dict[str, dict[str, Any]] = {}
     missing: list[str] = []
@@ -2991,13 +3102,27 @@ async def trigger_backfill_boms(
     require_admin_token(x_gatekeeper_token, settings)
     if not wait or settings.gatekeeper_role == "frontend":
         bus = get_job_bus(request.app, settings)
-        job_id = await bus.enqueue("backfill_boms", {"force": force})
+        job = await bus.enqueue("backfill_boms", {"force": force})
         return JSONResponse(
             status_code=202,
-            content={"job_id": job_id, "status": "queued", "job_type": "backfill_boms"},
+            content=job,
         )
     summary = backfill_cached_boms(settings=settings, force=force)
     return JSONResponse(content=summary)
+
+
+def _resolve_oci_manifests_dir(settings: Settings, namespace: str, repo_path: str) -> Path:
+    """Safely resolve an OCI namespace/repo manifests directory inside harbor/registry."""
+    registry_root = settings.oss_data_root / "harbor" / "registry"
+    try:
+        cache_root = (
+            settings.harbor_oci_cache_dir
+            if namespace == "chainguard-cache"
+            else resolve_safe_relative_path(registry_root, namespace)
+        )
+        return resolve_safe_relative_path(cache_root, f"{repo_path}/manifests")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/v2/{namespace}/{repo_path:path}/referrers/{digest}")
@@ -3009,12 +3134,7 @@ async def get_oci_referrers(
     artifactType: str | None = None,
 ) -> JSONResponse:
     """OCI Distribution Spec v1.1 Referrers API exposing attached CycloneDX CBOM/SBOM descriptors."""
-    cache_root = (
-        settings.harbor_oci_cache_dir
-        if namespace == "chainguard-cache"
-        else settings.oss_data_root / "harbor" / "registry" / namespace
-    )
-    manifests_dir = resolve_safe_relative_path(cache_root, f"{repo_path}/manifests")
+    manifests_dir = _resolve_oci_manifests_dir(settings, namespace, repo_path)
     if not manifests_dir.is_dir():
         return JSONResponse(
             content={"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": []},
@@ -3079,12 +3199,7 @@ async def get_oci_referrer_blob(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> FileResponse:
     """Serve attached CycloneDX CBOM/SBOM blobs referenced by the OCI 1.1 Referrers API."""
-    cache_root = (
-        settings.harbor_oci_cache_dir
-        if namespace == "chainguard-cache"
-        else settings.oss_data_root / "harbor" / "registry" / namespace
-    )
-    manifests_dir = resolve_safe_relative_path(cache_root, f"{repo_path}/manifests")
+    manifests_dir = _resolve_oci_manifests_dir(settings, namespace, repo_path)
     target_hex = digest.split(":", 1)[1] if digest.startswith("sha256:") else digest
     if manifests_dir.is_dir():
         for bom_file in manifests_dir.iterdir():

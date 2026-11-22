@@ -180,6 +180,9 @@ GATEKEEPER_ADMIN_TOKEN="<your-token>" \
 # Catalog all cached components and per-version vulnerability status via frontend HTTP endpoints
 GATEKEEPER_ADMIN_TOKEN="<your-token>" \
   python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080
+
+# Inspect newly vulnerable / quarantined components with OSV/NVD links and newest passing upgrades
+python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --advisories
 ```
 
 ---
@@ -202,7 +205,7 @@ Every security control in `trusted-oss-harbor` is decoupled behind standard prot
 | **Integrity & BOMs** | **Tamper-Evident Provenance** | Append-only `audit/provenance.jsonl` signed with instance-unique `0o600` HMAC-SHA384 key (`PROVENANCE_HMAC_KEY`) + paginated `/audit/provenance` & `activity.jsonl` | Sigstore Rekor, Splunk, Datadog, Microsoft Sentinel, WORM Object Lock |
 | **Runtime & Storage** | **Zero-CVE Least-Privilege Runtime** | Chainguard Wolfi multi-stage build (no `pip`/build tools), non-root `uid 10001`, `0o700` key dirs, Valkey worker isolation | Distroless, Red Hat UBI Minimal, Kubernetes `restricted` PSS, gVisor |
 | **Runtime & Storage** | **Immutable Storage & TTL GC** | TrueNAS SCALE Native ZFS (`Pool1/trusted-oss-data`: LZ4, 500 GiB quota, daily 30d snapshots) + 90-day Inactivity-TTL GC (`audit/last_accessed.json`) | AWS S3 Object Lock + Lifecycle, Azure Immutable Blob, NetApp ONTAP, Ceph |
-| **Governance & Alerting** | **Security Digests & Telemetry** | Daily Standardized HTML Email Digest ([ADR 0009](docs/adr/0009-standardized-html-email-notifications.md)) via Microsoft Graph OAuth2 / SMTP STARTTLS (+ ≤160-char SMS) & `stdout` `[CACHE]`/`[ENGINE]` telemetry | PagerDuty, Slack, Microsoft Teams, ServiceNow, Opsgenie |
+| **Governance & Alerting** | **Security Advisories, Digests & CI Gates** | Real-time Vulnerability Advisory Center (`/catalog/advisories`, `.rss`, `/dashboard`), HMAC-signed webhooks (`VULN_ALERT_WEBHOOK_URL`), Daily Standardized HTML Digest ([ADR 0009](docs/adr/0009-standardized-html-email-notifications.md), [SecADR 0011](docs/adr/0011-security-assessment-remediation-and-governance.md)) pairing vulnerable versions with newest passing upgrades, and automated Gitleaks/Bandit/Semgrep CI ([SECURITY_POSTURE.md](SECURITY_POSTURE.md)) | PagerDuty, Slack, Microsoft Teams, ServiceNow, Opsgenie |
 
 
 ---

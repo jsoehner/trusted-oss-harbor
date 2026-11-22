@@ -3,6 +3,9 @@ name: Probe WAN Edge Connectivity
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   probe:
     name: Test Inbound Connectivity to pfSense & Trusted OSS

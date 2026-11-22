@@ -13,6 +13,7 @@ import html
 import json
 import logging
 import os
+import re
 import smtplib
 import ssl
 import time
@@ -35,6 +36,107 @@ def _fmt_bytes(num: int | float) -> str:
             return f"{val:.1f} {unit}"
         val /= 1024.0
     return f"{val:.1f} TB"
+
+
+def _version_sort_key(version: str) -> tuple[tuple[int, int, str], ...]:
+    """Sortable version key (newest-first when reversed) matching remediation.version_sort_key."""
+    parts = re.split(r"[.\-_+]", version.strip())
+    key: list[tuple[int, int, str]] = []
+    for part in parts:
+        if not part:
+            continue
+        if part.isdigit():
+            key.append((1, int(part), ""))
+        else:
+            m = re.match(r"^(\d+)(.*)$", part)
+            if m:
+                key.append((1, int(m.group(1)), m.group(2).lower()))
+            else:
+                key.append((0, 0, part.lower()))
+    return tuple(key)
+
+
+def _resolve_newest_clean_versions(vuln_data: dict[str, Any]) -> dict[tuple[str, str], str]:
+    """Map (ecosystem, component) -> newest CLEAN cached version passing scanning."""
+    clean_by_comp: dict[tuple[str, str], list[str]] = {}
+    for comp in vuln_data.get("components") or []:
+        if str(comp.get("vulnerability_status", "")).upper() != "CLEAN":
+            continue
+        eco = str(comp.get("ecosystem", "")).strip()
+        name = str(comp.get("component", "")).strip()
+        ver = str(comp.get("version", "")).strip()
+        if eco and name and ver and ver not in {"unknown"}:
+            clean_by_comp.setdefault((eco, name), []).append(ver)
+
+    newest: dict[tuple[str, str], str] = {}
+    latest_tags = vuln_data.get("latest_tags") or {}
+    for (eco, name), versions in clean_by_comp.items():
+        unique_sorted = sorted(set(versions), key=_version_sort_key, reverse=True)
+        tag_ver = str((latest_tags.get(f"{eco}:{name}") or {}).get("latest_version", "")).strip()
+        if tag_ver and tag_ver in unique_sorted:
+            newest[(eco, name)] = tag_ver
+        elif unique_sorted:
+            newest[(eco, name)] = unique_sorted[0]
+    return newest
+
+
+def _build_vulnerable_upgrade_rows(vuln_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect all vulnerable/quarantined component versions paired with newest passing upgrade version."""
+    newest_clean = _resolve_newest_clean_versions(vuln_data)
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for q in vuln_data.get("quarantined") or []:
+        eco = str(q.get("ecosystem", "")).strip()
+        comp = str(q.get("component", "")).strip()
+        ver = str(q.get("version", "")).strip()
+        key = (eco, comp, ver)
+        if key in seen:
+            continue
+        seen.add(key)
+        superseded = str(q.get("superseded_by") or "").strip()
+        clean_upgrade = superseded or newest_clean.get((eco, comp), "")
+        if clean_upgrade == ver:
+            clean_upgrade = ""
+        rows.append(
+            {
+                "ecosystem": eco,
+                "component": comp,
+                "vulnerable_version": ver,
+                "status": "QUARANTINED",
+                "max_cvss": float(q.get("max_cvss", 0.0) or 0.0),
+                "cve_ids": [str(c).strip() for c in (q.get("cve_ids") or []) if str(c).strip()],
+                "newest_clean_version": clean_upgrade,
+            }
+        )
+
+    for item in vuln_data.get("components") or []:
+        if str(item.get("vulnerability_status", "")).upper() != "VULNERABLE":
+            continue
+        eco = str(item.get("ecosystem", "")).strip()
+        comp = str(item.get("component", "")).strip()
+        ver = str(item.get("version", "")).strip()
+        key = (eco, comp, ver)
+        if key in seen:
+            continue
+        seen.add(key)
+        clean_upgrade = newest_clean.get((eco, comp), "")
+        if clean_upgrade == ver:
+            clean_upgrade = ""
+        rows.append(
+            {
+                "ecosystem": eco,
+                "component": comp,
+                "vulnerable_version": ver,
+                "status": "VULNERABLE",
+                "max_cvss": float(item.get("max_cvss", 0.0) or 0.0),
+                "cve_ids": [str(c).strip() for c in (item.get("cve_ids") or []) if str(c).strip()],
+                "newest_clean_version": clean_upgrade,
+            }
+        )
+
+    rows.sort(key=lambda r: (r["max_cvss"], r["component"], r["vulnerable_version"]), reverse=True)
+    return rows
 
 
 def build_daily_digest(
@@ -183,28 +285,27 @@ def build_daily_digest(
                 f"(unused={item.get('unused_days')}d, removes in {item.get('days_until_removal')}d, size={_fmt_bytes(item.get('size_bytes', 0))})"
             )
 
-    if quarantined:
-        seen_q: set[tuple[str, str, str]] = set()
-        unique_q: list[dict[str, Any]] = []
-        for q in quarantined:
-            q_key = (
-                str(q.get("ecosystem", "")),
-                str(q.get("component", "")),
-                str(q.get("version", "")),
-            )
-            if q_key not in seen_q:
-                seen_q.add(q_key)
-                unique_q.append(q)
+    vuln_upgrade_rows = _build_vulnerable_upgrade_rows(vuln_data)
+    if vuln_upgrade_rows:
         lines.append("")
-        lines.append("Quarantined (Vulnerable) Components:")
-        for q in unique_q[:15]:
-            cves = ",".join(q.get("cve_ids") or []) or "none"
-            lines.append(
-                f"  - {q.get('ecosystem')}:{q.get('component')}@{q.get('version')} "
-                f"(CVSS={q.get('max_cvss', 0.0):.1f}, CVEs={cves}, latest={q.get('superseded_by') or '-'})"
+        lines.append("Vulnerable Component Versions & Clean Upgrades Available:")
+        for row in vuln_upgrade_rows[:15]:
+            raw_cves = row["cve_ids"]
+            cves = ",".join(raw_cves) or "none"
+            clean_ver = row["newest_clean_version"]
+            upgrade_note = (
+                f"Newest Passing Version: {clean_ver}"
+                if clean_ver
+                else "Newest Passing Version: None cached yet"
             )
-        if len(unique_q) > 15:
-            lines.append(f"  ... and {len(unique_q) - 15} more")
+            adv_links = " ".join(f"https://osv.dev/vulnerability/{cid}" for cid in raw_cves[:3])
+            link_suffix = f" | Advisories: {adv_links}" if adv_links else ""
+            lines.append(
+                f"  - [{row['status']}] {row['ecosystem']}:{row['component']}@{row['vulnerable_version']} "
+                f"(CVSS={row['max_cvss']:.1f}, CVEs={cves}) -> {upgrade_note}{link_suffix}"
+            )
+        if len(vuln_upgrade_rows) > 15:
+            lines.append(f"  ... and {len(vuln_upgrade_rows) - 15} more")
 
     if recent_events:
         lines.append("")
@@ -275,27 +376,41 @@ def render_daily_digest_html(
             "</table></div>"
         )
 
-    if quarantined:
-        q_rows: list[str] = []
-        seen: set[tuple[str, str, str]] = set()
-        for q in quarantined:
-            key = (str(q.get("ecosystem", "")), str(q.get("component", "")), str(q.get("version", "")))
-            if key in seen:
-                continue
-            seen.add(key)
-            cves = ", ".join(q.get("cve_ids") or []) or "none"
-            bg = "#ffffff" if len(q_rows) % 2 == 0 else "#f8fafc"
+    vuln_upgrade_rows = _build_vulnerable_upgrade_rows(vuln_data)
+    if vuln_upgrade_rows:
+        q_rows: list[str] = [
+            '<tr style="background:#fef2f2;font-size:11px;font-weight:700;text-transform:uppercase;color:#991b1b;">'
+            '<td style="padding:8px 12px;border-bottom:1px solid #fecaca;">Vulnerable Component Version</td>'
+            '<td style="padding:8px 12px;border-bottom:1px solid #fecaca;">CVSS &amp; Advisories</td>'
+            '<td style="padding:8px 12px;border-bottom:1px solid #fecaca;">Newest Passing Upgrade</td>'
+            "</tr>"
+        ]
+        for idx, row in enumerate(vuln_upgrade_rows[:15]):
+            raw_cves = row["cve_ids"]
+            cve_links_html = ", ".join(
+                f'<a href="https://osv.dev/vulnerability/{html.escape(cid, quote=True)}" style="color:#0369a1;text-decoration:none;">{html.escape(cid)}</a>'
+                for cid in raw_cves
+            ) or "none"
+            clean_ver = row["newest_clean_version"]
+            upgrade_html = (
+                f'<span style="display:inline-block;padding:3px 9px;border-radius:999px;background:#dcfce7;color:#15803d;font-weight:700;font-size:11px;">'
+                f'&#10003; {html.escape(clean_ver)}</span>'
+                if clean_ver
+                else '<span style="display:inline-block;padding:3px 9px;border-radius:999px;background:#fee2e2;color:#991b1b;font-weight:700;font-size:11px;">None cached yet</span>'
+            )
+            bg = "#ffffff" if idx % 2 == 0 else "#f8fafc"
             q_rows.append(
                 f'<tr style="background:{bg};">'
-                f'<td style="padding:9px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;color:#991b1b;font-weight:700;">{html.escape(key[0])}:{html.escape(key[1])}@{html.escape(key[2])}</td>'
-                f'<td style="padding:9px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;color:#1e293b;">CVSS {float(q.get("max_cvss", 0.0)):.1f} &bull; {html.escape(cves)}</td>'
+                f'<td style="padding:9px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;color:#991b1b;font-weight:700;">'
+                f'{html.escape(row["ecosystem"])}:{html.escape(row["component"])}@{html.escape(row["vulnerable_version"])}'
+                f' <span style="font-size:10px;font-weight:600;color:#64748b;">({html.escape(row["status"])})</span></td>'
+                f'<td style="padding:9px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;color:#1e293b;">CVSS {row["max_cvss"]:.1f} &bull; {cve_links_html}</td>'
+                f'<td style="padding:9px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;">{upgrade_html}</td>'
                 f"</tr>"
             )
-            if len(q_rows) >= 15:
-                break
         sections_html.append(
             '<div style="margin-top:16px;">'
-            '<div style="font-size:12px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;color:#991b1b;margin-bottom:8px;">Quarantined (Vulnerable) Components</div>'
+            '<div style="font-size:12px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;color:#991b1b;margin-bottom:8px;">Vulnerable Component Versions &amp; Clean Upgrades Available</div>'
             '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #fecaca;border-radius:8px;overflow:hidden;border-collapse:separate;">'
             + "".join(q_rows)
             + "</table></div>"
@@ -485,10 +600,21 @@ def load_msgraph_token_cache(path: Path) -> dict[str, Any]:
 
 
 def save_msgraph_token_cache(path: Path, data: dict[str, Any]) -> None:
-    """Persist Microsoft Graph OAuth2 token payload with 0600 permissions."""
+    """Persist Microsoft Graph OAuth2 token payload with 0600 permissions atomically."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.chmod(path, 0o600)
+    payload = json.dumps(data, indent=2).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def request_msgraph_device_code(
