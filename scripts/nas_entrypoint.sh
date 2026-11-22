@@ -16,6 +16,7 @@ mkdir -p \
   "${OSS_DATA_ROOT}/packages/quarantine" \
   "${OSS_DATA_ROOT}/packages/trusted-maven" \
   "${OSS_DATA_ROOT}/packages/trusted-pypi" \
+  "${OSS_DATA_ROOT}/harbor/registry/chainguard-cache" \
   "${OSS_DATA_ROOT}/scanners/clamav" \
   "${OSS_DATA_ROOT}/keys/gnupg" \
   "${OSS_DATA_ROOT}/keys/mldsa" \
@@ -30,6 +31,7 @@ mkdir -p \
 # 2. Enforce strict permissions on private key directories and gatekeeper ownership
 chown -R gatekeeper:gatekeeper \
   "${OSS_DATA_ROOT}/packages" \
+  "${OSS_DATA_ROOT}/harbor" \
   "${OSS_DATA_ROOT}/keys" \
   "${OSS_DATA_ROOT}/audit" \
   "${OSS_DATA_ROOT}/catalog" 2>/dev/null || true
