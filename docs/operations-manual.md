@@ -1,6 +1,6 @@
-# Trusted OSS Supply Chain Platform — Operations Manual (`v1.6.0`)
+# Trusted OSS Supply Chain Platform — Operations Manual (`v1.6.x`)
 
-This manual documents every operational capability of `trusted-oss-harbor` (`v1.6.0`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack and the single-container **TrueNAS / NAS Appliance** image (`ghcr.io/jsoehner/trusted-oss-gatekeeper:1.6.0`), and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, BOM consumers (`jsi-bom-actions`), and GitHub Actions projects.
+This manual documents every operational capability of `trusted-oss-harbor` (`v1.6.x`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack and the single-container **TrueNAS / NAS Appliance** image (`ghcr.io/jsoehner/trusted-oss-gatekeeper:latest`, auto-versioned per commit on `main`), and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, BOM consumers (`jsi-bom-actions`), and GitHub Actions projects.
 
 ---
 
@@ -510,7 +510,9 @@ Because package managers (`mvn`, `pip`, `uv`) and AI/CI upgrade bots often treat
 
 | Tool / Layer | Human-Readable Path / Command | Ecosystems Covered | What It Shows |
 | :--- | :--- | :--- | :--- |
-| **Gatekeeper Interactive Web UI (Swagger)** | `http://oss.jsigroup.local:8080/docs` | **OCI, Maven, PyPI** | Browser UI to query `/catalog/vulnerabilities`, `/catalog/retention`, `/audit/activity`, and `/bom/lookup` without writing `curl` commands |
+| **Gatekeeper Security Advisory Dashboard** | `http://oss.jsigroup.local:8080/catalog/advisories/dashboard` | **OCI, Maven, PyPI** | Zero-JS, CSP-safe HTML Security Advisory Center showing `CRITICAL`/`HIGH` badges, OSV/NVD links, and clean `UPGRADE_TO` versions |
+| **Gatekeeper Advisories RSS 2.0 Feed** | `http://oss.jsigroup.local:8080/catalog/advisories.rss` | **OCI, Maven, PyPI** | Subscribable RSS 2.0 feed for Slack, Teams, or feed readers (supports `?ecosystem=`, `?component=`, `?min_cvss=`) |
+| **Gatekeeper Interactive Web UI (Swagger)** | `http://oss.jsigroup.local:8080/docs` | **OCI, Maven, PyPI** | Browser UI to query `/catalog/vulnerabilities`, `/catalog/advisories`, `/catalog/retention`, `/audit/activity`, and `/bom/lookup` without writing `curl` commands |
 | **Gatekeeper CLI Table Viewer** | `python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --components <name>` | **OCI, Maven, PyPI** | Formatted ASCII tables: **Cached (Releasable)**, **Quarantined (Blocked)**, and **Component Caching History (`SERVING_LATEST` / `CACHED` / `QUARANTINED` / `HISTORICAL`)** |
 | **Gatekeeper Lifecycle JSON API** | `GET /catalog/vulnerabilities?ecosystem=<eco>&components=<name>` | **OCI, Maven, PyPI** | `summary` counts, `components` (releasable), `quarantined` (blocked + CVEs + replacement), and `history` (full version lifecycle) |
 | **Gatekeeper Retention & TTL API** | `GET /catalog/retention` | **OCI, Maven, PyPI** | Every cached version's inactivity age and 90-day TTL runway (`active`, `expiring_soon`, `expired`) |
@@ -580,22 +582,79 @@ curl -fsSL "http://oss.jsigroup.local:8080/audit/activity?limit=25" | jq '.event
 
 ---
 
-### 5.4 Proactive Vulnerability Advisories, RSS Subscriptions & Upgrade Alerts ([SecADR-0011](adr/0011-security-assessment-remediation-and-governance.md))
+### 5.4 Proactive Vulnerability Advisories, RSS Subscriptions & Real-Time Alerts ([SecADR-0011](adr/0011-security-assessment-remediation-and-governance.md))
 
-Rather than waiting for a build to fail with HTTP `451`, developers and platform operators can monitor newly vulnerable components and their clean replacement versions via four channels:
+Rather than waiting for a developer build to fail with `HTTP 451`, operators and engineering teams can monitor newly vulnerable cached components and their verified clean upgrade targets through four channels:
 
-1. **Browser Advisory Dashboard**: Open `http://oss.jsigroup.local:8080/catalog/advisories/dashboard` for a zero-JS, CSP-safe Security Advisory Center displaying severity badges, clickable OSV.dev/NVD links, and upgrade guidance.
-2. **RSS 2.0 Feed Subscription**: Subscribe in Slack, Microsoft Teams, or any RSS reader to `http://oss.jsigroup.local:8080/catalog/advisories.rss` (supports `?ecosystem=`, `?component=`, and `?min_cvss=`).
-3. **JSON API & CLI**:
-   ```bash
-   # CLI summary of vulnerable components, CVE links, and newest passing upgrades
-   python3 scripts/catalog_frontend.py --url http://oss.jsigroup.local:8080 --advisories
+#### 1. Browser Security Advisory Center (Zero-JS HTML Dashboard)
+Open `http://oss.jsigroup.local:8080/catalog/advisories/dashboard` (or `https://oss.yourdomain.com/catalog/advisories/dashboard` over WAN mTLS).
+- Renders a self-contained, CSP-safe (`script-src 'none'`) HTML dashboard with KPI summary cards (`Total`, `Clean`, `Quarantined`, `Unscanned`), severity badges (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`), clickable **OSV.dev / NVD** links, and the **newest `CLEAN` cached version** available for upgrade.
+- Supports query-string filters directly in the URL:
+  - `?ecosystem=maven` (or `pypi`, `oci`)
+  - `?component=spring` (substring match)
+  - `?min_cvss=7.0`
+  - `?since_hours=24`
 
-   # Filterable JSON API (e.g., Critical/High advisories from the last 24h)
-   curl -fsSL "http://oss.jsigroup.local:8080/catalog/advisories?min_cvss=7.0&since_hours=24" | jq
-   ```
-4. **Real-Time Webhooks & Upgraded Daily Digest**:
-   - Set `VULN_ALERT_WEBHOOK_URL` (and optional `VULN_ALERT_WEBHOOK_SECRET` for `X-Trusted-OSS-Signature: sha256=...`) in `.env` or `docker-compose.yml` to receive immediate deduplicated alerts (`audit/vuln_alerts.jsonl`) whenever a remediation sweep quarantines a newly vulnerable component. Set `VULN_ALERT_IMMEDIATE_EMAIL=true` to also trigger immediate Microsoft Graph email alerts.
-   - The **Daily Digest** (`scripts/daily_digest.py` and `oss-engine`) automatically pairs every vulnerable or quarantined component version with clickable OSV advisory links and the **newest `CLEAN` (passing-scan) version available for upgrade**.
+#### 2. Subscribable RSS 2.0 Feed (Slack / Microsoft Teams / RSS Readers)
+Subscribe to `http://oss.jsigroup.local:8080/catalog/advisories.rss` (supports the same `?ecosystem=`, `?component=`, `?min_cvss=`, and `?since_hours=` filters):
+- **Slack**: `/feed subscribe http://oss.jsigroup.local:8080/catalog/advisories.rss?min_cvss=7.0`
+- **Microsoft Teams**: Add the **RSS** connector to a Security/Platform channel and point it to `/catalog/advisories.rss`.
+- Nginx forwards `Host: $http_host` and `X-Forwarded-Proto` on `/catalog/` so `<link>` URLs inside the RSS feed preserve `:8080` on LAN and stay portless over WAN HTTPS `:443`.
+
+#### 3. Operator CLI & Filterable JSON API
+```bash
+# Formatted ASCII table of all active advisories, CVE IDs, UPGRADE_TO versions, and OSV links
+python3 scripts/catalog_frontend.py \
+  --url http://oss.jsigroup.local:8080 \
+  --advisories
+
+# Filter to Maven High/Critical advisories only
+python3 scripts/catalog_frontend.py \
+  --url http://oss.jsigroup.local:8080 \
+  --ecosystem maven \
+  --advisories
+
+# Filterable JSON API (e.g., Critical/High advisories discovered in the last 24h)
+curl -fsSL "http://oss.jsigroup.local:8080/catalog/advisories?min_cvss=7.0&since_hours=24" | jq '{
+  count,
+  summary,
+  advisories: [.advisories[] | {id, severity, max_cvss, cve_ids, superseded_by, guidance}]
+}'
+```
+
+#### 4. Real-Time Webhook Alerts, Immediate Email & Enriched Daily Digest
+Configure real-time push alerts in `.env`, `docker-compose.yml`, or TrueNAS container environment variables:
+
+```dotenv
+# Optional Slack / Teams / Generic JSON webhook endpoint (must be http:// or https://)
+VULN_ALERT_WEBHOOK_URL=https://hooks.example.com/services/T000/B000/XXXX
+# Optional HMAC-SHA256 signing secret (sends X-Trusted-OSS-Signature: sha256=<hex>)
+VULN_ALERT_WEBHOOK_SECRET=replace-with-random-32-byte-secret
+# Optional: also send an immediate Microsoft Graph HTML email on newly quarantined CVEs
+VULN_ALERT_IMMEDIATE_EMAIL=false
+```
+
+- **Deduplication**: Sent alerts are tracked in `/data/audit/vuln_alerts.jsonl` (keyed by ecosystem, component, version, and CVE set) so repeated hourly scans do not spam channels.
+- **Webhook Signature Verification**: When `VULN_ALERT_WEBHOOK_SECRET` is set, receivers can verify authenticity by computing `HMAC-SHA256(secret, raw_request_body)` and comparing it in constant time against the `X-Trusted-OSS-Signature` header (`sha256=<hexdigest>`).
+- **Daily Digest Upgrade Paths**: Both plain-text and HTML Daily Digests (`scripts/daily_digest.py` and the in-container `oss-engine` digest loop) automatically pair every vulnerable/quarantined version with clickable OSV links and the **newest `CLEAN` (passing-scan) version** available for upgrade.
+
+---
+
+## 6. Security Controls, Operational Limits & Hardening Reference ([SecADR-0011](adr/0011-security-assessment-remediation-and-governance.md))
+
+Starting with `v1.6.x` (see [SECURITY_POSTURE.md](../SECURITY_POSTURE.md) and [SecADR-0011](adr/0011-security-assessment-remediation-and-governance.md)), Gatekeeper and the Nginx gateway enforce strict fail-closed bounds. Operators should be aware of these defaults and how to tune them when legitimate exceptions arise:
+
+| Control / Setting | Default | Behavior When Triggered | How to Tune / Operate |
+| :--- | :--- | :--- | :--- |
+| **`MAX_ARTIFACT_BYTES`** | `262144000` (250 MB) | Streaming upload/pull-through aborts with `HTTP 413 Payload Too Large` (Nginx cap: `260M`) | Raise `MAX_ARTIFACT_BYTES` in `.env` and `client_max_body_size` in Nginx if caching large ML wheels/JARs |
+| **Archive Bomb Guard** | `10,000` members / `512 MB` uncompressed | Blocks oversized ZIP/TAR archives, symlinks, encrypted entries, and Windows backslash/drive-letter Zip-Slip paths | Hardcoded defense-in-depth in `gatekeeper/app/scanner.py` |
+| **`POST /bom/batch` Limits** | Max `500` PURLs; `trigger_pull_on_miss` admin-gated | `>500` PURLs returns `HTTP 400`; `trigger_pull_on_miss=true` without `X-Gatekeeper-Token` returns `HTTP 403` | Chunk large BOM manifests into batches of `<= 500` PURLs; pass `X-Gatekeeper-Token` only for CI warmups |
+| **Admin-Gated Endpoints** | `X-Gatekeeper-Token` required | `GET /jobs`, `GET /jobs/{id}`, `GET /status/{job_id}`, `POST /catalog/remediate`, `POST /catalog/warm`, `POST /catalog/gc`, `POST /catalog/backfill-boms`, `POST /ingest/*` return `HTTP 403` without a valid token | Set a strong random `GATEKEEPER_ADMIN_TOKEN` (default placeholder tokens are rejected on startup) |
+| **`TRUSTED_SOURCES` SSRF Allowlist** | Approved upstream registries | Dynamic OCI warmup (`POST /catalog/warm`) skips untrusted `Dockerfile` registries | Add private/approved upstream registries explicitly via `TRUSTED_SOURCES` in `.env` |
+| **`TRIVY_REQUIRED`** | `false` | When `true`, Gatekeeper fails closed if `trivy` is unavailable or errors during scanning | Set `TRIVY_REQUIRED=true` in strict high-assurance environments |
+| **Paginated Provenance Log** | `offset=0`, `limit=100` (max `1000`) | `GET /audit/provenance?offset=0&limit=100` returns `{count, total, offset, limit, records}` | Page through large provenance ledgers using `offset` & `limit` |
+| **Persistent Provenance HMAC Key** | `/data/keys/provenance.hmac.key` (`0600`) | Every entry in `audit/provenance.jsonl` is signed with a persistent key (or `PROVENANCE_HMAC_KEY`) | Back up `/data/keys/` alongside GPG/ML-DSA keys to preserve long-term ledger verifiability |
+| **CI Security Governance Gate** | `.github/workflows/security-governance.yml` | Runs Gitleaks, Bandit (`-ll`), Semgrep (`ERROR`), and `pip-audit` on every push/PR; Dependabot enforces a 7-day cooldown across `github-actions`, `pip`, and `docker` | Review findings in the GitHub **Security -> Code scanning** tab |
+
 
 
