@@ -349,9 +349,9 @@ Verify any downloaded artifact against its `.mldsa65` signature using [`client-t
 ```bash
 curl -fsSLO http://oss.jsigroup.local:8080/keys/trusted-oss-mldsa65.pub
 python3 client-templates/pqc-verify.py \
-  --pubkey trusted-oss-mldsa65.pub \
-  --artifact my-package.whl \
-  --sig my-package.whl.mldsa65
+  my-package.whl \
+  my-package.whl.mldsa65 \
+  trusted-oss-mldsa65.pub
 ```
 
 ### 4.4 Container Builds (Chainguard Zero-CVE Base Images)
@@ -507,10 +507,10 @@ gpg --verify "${PROOF_DIR}/manifest.json.asc" "${PROOF_DIR}/manifest.json"
 gpg --verify "${PROOF_DIR}/cbom.cdx.json.asc" "${PROOF_DIR}/cbom.cdx.json"
 gpg --verify "${PROOF_DIR}/sbom.cdx.json.asc" "${PROOF_DIR}/sbom.cdx.json"
 
-# 4. Verify NIST FIPS 204 ML-DSA-65 post-quantum signatures
-python3 client-templates/pqc-verify.py --pubkey "${PROOF_DIR}/trusted-oss-mldsa65.pub" --artifact "${PROOF_DIR}/manifest.json" --sig "${PROOF_DIR}/manifest.json.mldsa65"
-python3 client-templates/pqc-verify.py --pubkey "${PROOF_DIR}/trusted-oss-mldsa65.pub" --artifact "${PROOF_DIR}/cbom.cdx.json" --sig "${PROOF_DIR}/cbom.cdx.json.mldsa65"
-python3 client-templates/pqc-verify.py --pubkey "${PROOF_DIR}/trusted-oss-mldsa65.pub" --artifact "${PROOF_DIR}/sbom.cdx.json" --sig "${PROOF_DIR}/sbom.cdx.json.mldsa65"
+# 4. Verify NIST FIPS 204 ML-DSA-65 post-quantum signatures (args: <artifact> <signature> <pubkey>)
+python3 client-templates/pqc-verify.py "${PROOF_DIR}/manifest.json" "${PROOF_DIR}/manifest.json.mldsa65" "${PROOF_DIR}/trusted-oss-mldsa65.pub"
+python3 client-templates/pqc-verify.py "${PROOF_DIR}/cbom.cdx.json" "${PROOF_DIR}/cbom.cdx.json.mldsa65" "${PROOF_DIR}/trusted-oss-mldsa65.pub"
+python3 client-templates/pqc-verify.py "${PROOF_DIR}/sbom.cdx.json" "${PROOF_DIR}/sbom.cdx.json.mldsa65" "${PROOF_DIR}/trusted-oss-mldsa65.pub"
 ```
 
 *(For Maven or PyPI packages—or a single-call JSON bundle of BOM + detached signatures across any ecosystem—use `/bom/lookup` or `/bom/batch`:)*
