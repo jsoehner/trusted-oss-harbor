@@ -5,9 +5,14 @@ All notable changes to `trusted-oss-harbor` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.7.0] - 2026-11-23
 
 ### Added
+- **End-to-End Signed Container Verification Demo, Selectable Signature Modes & FAQ ([ADR-0012](docs/adr/0012-selectable-signature-verification-modes-and-oci-container-demo.md))**:
+  - Added [`scripts/trusted_container_demo.sh`](scripts/trusted_container_demo.sh) demonstrating the complete zero-trust container lifecycle (default sample: `apache/airflow:slim-latest-python3.12`) using `curl` + `jq`, rendering the full OCI Index, platform manifest, config, all 24 immutable layers, CycloneDX 1.6 SBOM/CBOM digests, and signature layer hashes.
+  - Added `--sig-mode <both|classic|pqc>` (and `SIG_MODE` env var) plus `EXPECTED_GPG_FPR` / `EXPECTED_PQC_FPR` fingerprint pinning and GPG `:6:` ultimate ownertrust so teams can verify Classical PGP/GPG only (`classic`), Post-Quantum NIST FIPS 204 ML-DSA-65 only (`pqc`), or hybrid dual signatures (`both`) with fail-closed 1-byte tamper detection and tail-first `/audit/provenance` lookup.
+  - Added RFC 6750 `WWW-Authenticate: Bearer` token exchange in `gatekeeper/app/main.py` (`fetch_upstream_oci_manifest`) and safe canonical OCI digest segment validation (`sha256:<64-hex>`) in `gatekeeper/app/storage.py` for multi-registry virtual pull-through (Docker Hub, GHCR, Quay, Chainguard).
+  - Added **Section 7 (End-to-End Trusted Container Demo)** and **Section 8 (FAQ)** to `docs/operations-manual.md`, standalone [`docs/FAQ.md`](docs/FAQ.md), and 5-stage pipeline infographic [`docs/images/trusted-container-verification-flow.png`](docs/images/trusted-container-verification-flow.png).
 - **Vulnerability Advisory Center & Real-Time Alerts ([SecADR-0011](docs/adr/0011-security-assessment-remediation-and-governance.md))**:
   - Added `gatekeeper/app/advisories.py` and frontend endpoints `GET /catalog/advisories` (filterable JSON with PURLs, severity, OSV/NVD links, and upgrade guidance), `GET /catalog/advisories.rss` (RSS 2.0 subscription feed), and `GET /catalog/advisories/dashboard` (zero-JS, CSP-safe HTML Security Advisory Center).
   - Added real-time deduplicated vulnerability alert dispatch (`audit/vuln_alerts.jsonl`) supporting HMAC-SHA256 signed webhooks (`VULN_ALERT_WEBHOOK_URL`, `VULN_ALERT_WEBHOOK_SECRET`) and optional immediate Microsoft Graph email alerts (`VULN_ALERT_IMMEDIATE_EMAIL=true`).

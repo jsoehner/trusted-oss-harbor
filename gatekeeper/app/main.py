@@ -413,7 +413,7 @@ async def lifespan(app: FastAPI):
         app.state.job_bus = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "").strip() or "1.6.1"
+APP_VERSION = os.environ.get("APP_VERSION", "").strip() or "1.7.0"
 
 app = FastAPI(
     title="Trusted OSS Supply Chain Gatekeeper",
