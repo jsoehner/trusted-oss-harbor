@@ -225,3 +225,31 @@ def test_oci_v2_head_support_and_referrers_blobs(tmp_path: Path):
     get_blob = client.get(blob_url)
     assert get_blob.status_code == 200
     assert get_blob.content == cbom_bytes
+
+
+def test_oci_digest_path_segment_and_bearer_challenge_parser(tmp_path: Path):
+    """Verify OCI sha256 digest segments are allowed safely while unsafe colons remain blocked."""
+    import pytest
+    from app.main import _parse_www_authenticate_bearer
+    from app.storage import resolve_safe_relative_path
+
+    valid_digest = "sha256:" + ("a" * 64)
+    p = resolve_safe_relative_path(tmp_path, f"apache/airflow/manifests/{valid_digest}")
+    assert p == tmp_path / "apache" / "airflow" / "manifests" / valid_digest
+
+    p_sig = resolve_safe_relative_path(tmp_path, f"apache/airflow/manifests/{valid_digest}.mldsa65")
+    assert p_sig.name == f"{valid_digest}.mldsa65"
+
+    for bad in ("C:/Windows/System32", "foo:bar", "sha256:nothex", "sha256:../escape"):
+        with pytest.raises(ValueError):
+            resolve_safe_relative_path(tmp_path, bad)
+
+    challenge = _parse_www_authenticate_bearer(
+        'Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:apache/airflow:pull"'
+    )
+    assert challenge == {
+        "realm": "https://auth.docker.io/token",
+        "service": "registry.docker.io",
+        "scope": "repository:apache/airflow:pull",
+    }
+    assert _parse_www_authenticate_bearer("Basic realm=\"other\"") == {}

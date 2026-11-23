@@ -1,0 +1,131 @@
+# Trusted OSS Harbor — Frequently Asked Questions (FAQ)
+
+![Trusted OSS Harbor Signed-Only Container Verification Pipeline](images/trusted-container-verification-flow.png)
+
+This standalone FAQ covers container verification, OCI 1.1 Referrers (SBOM/CBOM), dual-signature validation (GPG + NIST FIPS 204 ML-DSA-65), provenance auditing, and signed-only pipeline enforcement in `trusted-oss-harbor`. For the full step-by-step walkthrough and runnable `curl` commands, see [Section 7 of the Operations Manual](operations-manual.md#7-end-to-end-trusted-container-demo--inspecting-layers-sbomcbom-signatures--provenance-with-curl) or run [`scripts/trusted_container_demo.sh`](../scripts/trusted_container_demo.sh).
+
+---
+
+## 1. Why use a Trusted OSS Registry instead of pulling directly from Docker Hub, PyPI, or Maven Central?
+
+Pulling directly from public registries exposes builds to three risks:
+1. **Mutable tags**: Tags like `apache/airflow:slim-latest-python3.12` can change upstream without any change in your repository.
+2. **Unscanned binaries**: Public registries do not enforce your organization's ClamAV malware policy or CVSS fail threshold (`CVSS < 7.0`).
+3. **Missing cryptographic lineage**: Upstream artifacts lack your organization's dual signatures and signed CycloneDX 1.6 SBOM/CBOM attestations.
+
+`trusted-oss-harbor` intercepts every cache miss in `packages/quarantine/`, scans it for malware and CVEs, generates CycloneDX 1.6 SBOM and CBOM manifests, dual-signs everything with **RSA-3072 GPG** and **NIST FIPS 204 ML-DSA-65**, records an HMAC-authenticated provenance entry, and promotes only clean artifacts to the trusted store.
+
+---
+
+## 2. How do I inspect a container's layers, SBOM, CBOM, and signature hashes using only `curl`?
+
+Run the automated demo script against your Gatekeeper instance:
+
+```bash
+GATEKEEPER_URL=http://oss.jsigroup.local:8080 \
+  NAMESPACE=docker-cache \
+  REPO=apache/airflow \
+  TAG=slim-latest-python3.12 \
+  bash scripts/trusted_container_demo.sh
+```
+
+The script queries:
+- `GET /v2/virtual/docker-cache/apache/airflow/manifests/slim-latest-python3.12` (OCI Image Index)
+- `GET /v2/virtual/docker-cache/apache/airflow/manifests/sha256:<platform_digest>` (`linux/amd64` manifest containing the image config and all 24 layer digests)
+- `GET /v2/docker-cache/apache/airflow/referrers/sha256:<platform_digest>` (OCI 1.1 Referrers returning CycloneDX 1.6 SBOM and CBOM digests)
+- `GET /v2/docker-cache/apache/airflow/blobs/sha256:<bom_digest>` (content-addressed SBOM/CBOM JSON)
+- `GET /v2/virtual/docker-cache/apache/airflow/manifests/sha256:<platform_digest>.asc` and `.mldsa65` (detached signature layers)
+
+### Example Verified Output Tree (`apache/airflow:slim-latest-python3.12`)
+
+```text
+docker-cache/apache/airflow:slim-latest-python3.12  [OCI Image Index]
+│  Digest: sha256:2d3e42b9de0eca948b9a869817068fedcb8a8eac9827b1e6215de3329d59335f
+└── Platform Manifest (linux/amd64)
+    │  Digest: sha256:f22518ba835f4b73d6b75ff32c6b4eda10a5ef0abac18f2d7c11ceced8b651b2  (4.7 KiB)
+    ├── Image Config  (application/vnd.oci.image.config.v1+json, 22.7 KiB)
+    │   └── sha256:09f01fae61878a378966ef7c9472ee388af4216560c3c0435056a573ff522cef
+    ├── Container Layers (24 immutable filesystem layers)
+    │   ├── Layer 01  177.1 KiB   sha256:c76ff3643382044a6a6dd7a482343bd6ae88018536beaccec1196a79768c7294  (tar+zstd)
+    │   ├── Layer 02  37.66 MiB   sha256:2c92ce0a794ae71790367b8331d4f27171f920e302e6d5304165dc5439221697  (tar+zstd)
+    │   │   ... (Layers 03–23 pinned by individual SHA-256 digests) ...
+    │   └── Layer 24  32 B        sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1  (tar+gzip)
+    ├── SBOM Manifest  (CycloneDX 1.6 — application/vnd.cyclonedx+json, 1.7 KiB)
+    │   └── sha256:daa50ec6997f5c2da71081a35f780c3cfc488470a2bacd1777e3efd958dcde50
+    ├── CBOM Manifest  (CycloneDX 1.6 — application/vnd.cyclonedx+json, 1.8 KiB)
+    │   ├── Digest : sha256:c2c5b97348299c90a270d69595e3f603e35fa82368fba4e66efc2904a3ed7670
+    │   └── Status : VERIFIED_INERT  [Assets: none (VERIFIED_INERT)]
+    └── Signature Layers  (Registry Dual-Signed Proof)
+        ├── Classical GPG (RSA-3072 .asc, 695 B)
+        │   └── sha256:2468bc29afc104d7e1b14008628fe0a49d62a422c8905c2bf7657c6202142582
+        └── Post-Quantum (NIST FIPS 204 ML-DSA-65 .mldsa65, 4.4 KiB)
+            └── sha256:b6ab189fd1b084a4fa6007d885ddc0684e3288dedf0332343c526d7e330807ba
+```
+
+---
+
+## 3. How do I fetch the Registry's public keys and prove an image is unaltered?
+
+Fetch both public keys and the PQC fingerprint directly from Gatekeeper:
+
+```bash
+curl -fsSL http://oss.jsigroup.local:8080/keys/trusted-oss-pubkey.asc          -o trusted-oss-pubkey.asc
+curl -fsSL http://oss.jsigroup.local:8080/keys/trusted-oss-mldsa65.pub         -o trusted-oss-mldsa65.pub
+curl -fsSL http://oss.jsigroup.local:8080/keys/trusted-oss-mldsa65.fingerprint -o trusted-oss-mldsa65.fingerprint
+```
+
+Then verify the manifest, SBOM, and CBOM against both keys:
+
+```bash
+gpg --batch --import trusted-oss-pubkey.asc
+gpg --verify manifest.json.asc manifest.json
+python3 client-templates/pqc-verify.py manifest.json manifest.json.mldsa65 trusted-oss-mldsa65.pub
+```
+
+Because the OCI manifest embeds the SHA-256 digest of the image config and every filesystem layer, verifying the manifest signature proves no layer was modified. Changing even 1 byte causes both `gpg --verify` and `pqc-verify.py` to fail closed and reject execution.
+
+---
+
+## 4. Why does Gatekeeper dual-sign with both GPG (RSA-3072) and NIST FIPS 204 ML-DSA-65?
+
+- **RSA-3072 GPG (`.asc`)** integrates directly with existing build tools (`gpg`, Maven `pgpverify-maven-plugin`, standard Linux package tooling).
+- **NIST FIPS 204 ML-DSA-65 (`.mldsa65`)** provides post-quantum lattice-based signatures immune to Shor's algorithm, protecting long-lived provenance records and container attestations from "Harvest Now, Forge Later" threats.
+
+---
+
+## 5. What is the difference between the SBOM and CBOM referrers?
+
+- **SBOM (`sbom.cdx.json`)**: Software Bill of Materials listing component identity, PURL, version, and dependencies in CycloneDX 1.6 format.
+- **CBOM (`cbom.cdx.json`)**: Cryptographic Bill of Materials listing algorithms, key sizes, TLS protocols, certificates, and PQC primitives detected inside the artifact. If an artifact contains no cryptographic primitives, Gatekeeper records `trusted-oss:crypto-scan-status = VERIFIED_INERT` so auditors can distinguish "scanned with zero crypto assets" from "unscanned."
+
+---
+
+## 6. How do I verify that the Registry scanned the container for malware and CVEs?
+
+Query the HMAC-authenticated provenance log (`GET /audit/provenance`) filtered by the manifest's SHA-256 hex digest:
+
+```bash
+curl -fsSL "http://oss.jsigroup.local:8080/audit/provenance?limit=500" | jq --arg sha "<manifest_sha256_hex>" '
+  [.records[] | select(.sha256 == $sha)] | last
+  | {timestamp, ecosystem, artifact, sha256, clamav_status, cve_status, max_cvss, cbom_scan_status, pqc_status, attestation_hmac}
+'
+```
+
+Every record is signed with the Registry's persistent HMAC key (`/data/keys/provenance.hmac.key`) and records the exact ClamAV verdict (`CLAMD_OK`), CVE verdict (`CLEAN (max CVSS < 7.0)`), and dual-signature paths.
+
+---
+
+## 7. What happens if an artifact contains malware or a High/Critical CVE (`CVSS >= 7.0`)?
+
+Gatekeeper aborts promotion, deletes the quarantined file, logs a `BLOCKED` event to `/audit/activity`, and responds with **`HTTP 451 Unavailable For Legal Reasons`**. Because Gatekeeper never signs blocked artifacts, a signed-only pipeline cannot run them. Use [Section 5 of the Operations Manual](operations-manual.md#5-troubleshooting-http-451--debugging-component-lifecycle) to inspect the block reason and find the newest clean replacement.
+
+---
+
+## 8. How do we enforce signed-only execution in CI/CD and production?
+
+1. **Pre-flight CI Gate**: Require [`client-templates/github-actions-verify-component.yml`](../client-templates/github-actions-verify-component.yml) before build or deploy jobs (`if: ${{ needs.verify-base-image.outputs.approved == 'true' }}`).
+2. **Pin by Immutable Digest**: Never execute mutable tags (`docker run apache/airflow:slim-latest-python3.12`). Always execute the verified digest:
+   ```bash
+   docker run --rm apache/airflow@sha256:f22518ba835f4b73d6b75ff32c6b4eda10a5ef0abac18f2d7c11ceced8b651b2 airflow version
+   ```
+3. **WAN mTLS Defense-in-Depth**: Over WAN, pfSense IP filtering (`github_actions_cidrs`) + HAProxy mutual TLS (`Trusted-OSS-GitHub-Client-CA`) ensure only authorized runners can query the Registry.

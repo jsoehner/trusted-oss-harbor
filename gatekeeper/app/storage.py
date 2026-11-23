@@ -10,6 +10,9 @@ from typing import NamedTuple
 
 
 SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
+OCI_DIGEST_SEGMENT_RE = re.compile(
+    r"^sha(?:256|384|512):[0-9a-f]{64,128}(?:\.[A-Za-z0-9._+-]+)*$"
+)
 
 
 class ArtifactDigests(NamedTuple):
@@ -47,7 +50,9 @@ def resolve_safe_relative_path(base_dir: Path, rel_path: str) -> Path:
     if not parts:
         raise ValueError(f"Empty relative artifact path: {rel_path!r}")
     for part in parts:
-        if part in {".", ".."} or not SAFE_SEGMENT_RE.match(part):
+        if part in {".", ".."} or not (
+            SAFE_SEGMENT_RE.match(part) or OCI_DIGEST_SEGMENT_RE.match(part)
+        ):
             raise ValueError(f"Unsafe path segment: {part!r}")
     candidate = base_dir.joinpath(*parts)
     if not is_safe_subpath(base_dir, candidate):

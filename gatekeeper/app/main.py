@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import secrets
 import sys
 from typing import Annotated, Any
@@ -743,10 +744,20 @@ async def quarantine_scan_sign_and_promote(
     return record
 
 
+def _parse_www_authenticate_bearer(header_value: str) -> dict[str, str]:
+    """Parse an OCI/Docker WWW-Authenticate Bearer challenge into realm/service/scope."""
+    if not header_value or not header_value.lower().startswith("bearer "):
+        return {}
+    return {
+        m.group(1).lower(): m.group(2)
+        for m in re.finditer(r'([A-Za-z0-9_-]+)="([^"]*)"', header_value)
+    }
+
+
 async def fetch_upstream_oci_manifest(
     upstream_base_url: str, repo_path: str, reference: str
 ) -> bytes:
-    """Fetch an OCI manifest/index from upstream (e.g., Chainguard cgr.dev) with OCI Bearer token support."""
+    """Fetch an OCI manifest/index from upstream (Chainguard, Docker Hub, GHCR, Quay) with Bearer token support."""
     base = upstream_base_url.rstrip("/")
     manifest_url = f"{base}/v2/{repo_path}/manifests/{reference}"
     headers = {"Accept": OCI_ACCEPT_HEADER}
@@ -754,11 +765,22 @@ async def fetch_upstream_oci_manifest(
     async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
         resp = await client.get(manifest_url, headers=headers)
         if resp.status_code == 401:
-            token_resp = await client.get(
-                f"{base}/token", params={"scope": f"repository:{repo_path}:pull"}
-            )
+            challenge = _parse_www_authenticate_bearer(resp.headers.get("www-authenticate", ""))
+            realm = challenge.get("realm", "")
+            token_params: dict[str, str] = {}
+            if realm.startswith(("https://", "http://")):
+                if challenge.get("service"):
+                    token_params["service"] = challenge["service"]
+                token_params["scope"] = challenge.get("scope") or f"repository:{repo_path}:pull"
+                token_url = realm
+            else:
+                token_url = f"{base}/token"
+                token_params["scope"] = f"repository:{repo_path}:pull"
+
+            token_resp = await client.get(token_url, params=token_params)
             if token_resp.status_code == 200:
-                token = token_resp.json().get("token", "")
+                token_json = token_resp.json()
+                token = token_json.get("token") or token_json.get("access_token") or ""
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
                     resp = await client.get(manifest_url, headers=headers)
