@@ -271,25 +271,38 @@ hr
 echo "[STAGE 4] Inspecting Registry Provenance & Malware/CVE Scan Verdict"
 hr
 MANIFEST_HEX="${MANIFEST_SHA256#sha256:}"
-curl -fsSL "${CURL_TLS[@]}" "${GATEKEEPER_URL}/audit/provenance?limit=500" -o "${WORKDIR}/provenance.json"
+PROV_TOTAL="$(curl -fsSL "${CURL_TLS[@]}" "${GATEKEEPER_URL}/audit/provenance?limit=1" | jq -r '.total // 0')"
+PROV_MATCH=""
+PROV_END="${PROV_TOTAL}"
+while [[ "${PROV_END}" -gt 0 ]]; do
+  PROV_START=$(( PROV_END > 500 ? PROV_END - 500 : 0 ))
+  PROV_LIMIT=$(( PROV_END - PROV_START ))
+  curl -fsSL "${CURL_TLS[@]}" \
+    "${GATEKEEPER_URL}/audit/provenance?offset=${PROV_START}&limit=${PROV_LIMIT}" \
+    -o "${WORKDIR}/provenance.json"
+  PROV_MATCH="$(jq --arg sha "${MANIFEST_HEX}" '[.records[] | select(.sha256 == $sha)] | last // empty' "${WORKDIR}/provenance.json")"
+  [[ -n "${PROV_MATCH}" ]] && break
+  PROV_END="${PROV_START}"
+done
 
-jq --arg sha "${MANIFEST_HEX}" '
-  [.records[] | select(.sha256 == $sha)] | last // {note: "Record outside latest 500 window"}
-  | {
-      timestamp,
-      ecosystem,
-      artifact,
-      sha256,
-      clamav_status,
-      cve_status,
-      max_cvss,
-      cbom_scan_status,
-      pqc_status,
-      signature_file,
-      signature_file_mldsa,
-      attestation_hmac: ((.attestation_hmac // "")[0:24] + "...")
-    }
-' "${WORKDIR}/provenance.json"
+if [[ -n "${PROV_MATCH}" ]]; then
+  printf '%s\n' "${PROV_MATCH}" | jq '{
+    timestamp,
+    ecosystem,
+    artifact,
+    sha256,
+    clamav_status,
+    cve_status,
+    max_cvss,
+    cbom_scan_status,
+    pqc_status,
+    signature_file,
+    signature_file_mldsa,
+    attestation_hmac: ((.attestation_hmac // "")[0:24] + "...")
+  }'
+else
+  echo "  [WARN] No provenance record matched sha256:${MANIFEST_HEX} across ${PROV_TOTAL} ledger entries."
+fi
 echo ""
 
 # ------------------------------------------------------------------------------

@@ -910,7 +910,9 @@ Query the HMAC-authenticated provenance ledger (`/audit/provenance`) to confirm 
 
 ```bash
 MANIFEST_HEX="${PLATFORM_DIGEST#sha256:}"
-curl -fsSL "${GATEKEEPER}/audit/provenance?limit=500" | jq --arg sha "${MANIFEST_HEX}" '
+TOTAL=$(curl -fsSL "${GATEKEEPER}/audit/provenance?limit=1" | jq -r '.total')
+OFFSET=$(( TOTAL > 500 ? TOTAL - 500 : 0 ))
+curl -fsSL "${GATEKEEPER}/audit/provenance?offset=${OFFSET}&limit=500" | jq --arg sha "${MANIFEST_HEX}" '
   [.records[] | select(.sha256 == $sha)] | last
   | {timestamp, ecosystem, artifact, sha256, clamav_status, cve_status, max_cvss, cbom_scan_status, pqc_status}
 '

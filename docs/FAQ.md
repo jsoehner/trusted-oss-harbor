@@ -105,7 +105,9 @@ Because the OCI manifest embeds the SHA-256 digest of the image config and every
 Query the HMAC-authenticated provenance log (`GET /audit/provenance`) filtered by the manifest's SHA-256 hex digest:
 
 ```bash
-curl -fsSL "http://oss.jsigroup.local:8080/audit/provenance?limit=500" | jq --arg sha "<manifest_sha256_hex>" '
+TOTAL=$(curl -fsSL "http://oss.jsigroup.local:8080/audit/provenance?limit=1" | jq -r '.total')
+OFFSET=$(( TOTAL > 500 ? TOTAL - 500 : 0 ))
+curl -fsSL "http://oss.jsigroup.local:8080/audit/provenance?offset=${OFFSET}&limit=500" | jq --arg sha "<manifest_sha256_hex>" '
   [.records[] | select(.sha256 == $sha)] | last
   | {timestamp, ecosystem, artifact, sha256, clamav_status, cve_status, max_cvss, cbom_scan_status, pqc_status, attestation_hmac}
 '
