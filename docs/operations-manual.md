@@ -883,9 +883,11 @@ curl -fsSL "${GATEKEEPER}/keys/trusted-oss-pubkey.asc"          -o /tmp/airflow-
 curl -fsSL "${GATEKEEPER}/keys/trusted-oss-mldsa65.pub"         -o /tmp/airflow-proof/trusted-oss-mldsa65.pub
 curl -fsSL "${GATEKEEPER}/keys/trusted-oss-mldsa65.fingerprint" -o /tmp/airflow-proof/trusted-oss-mldsa65.fingerprint
 
-# 2. Import the GPG public key into an isolated keyring and verify classical signatures
+# 2. Import the GPG public key into an isolated keyring, grant ultimate trust (:6:), and verify
 export GNUPGHOME=/tmp/airflow-proof/gnupg && mkdir -p "${GNUPGHOME}" && chmod 700 "${GNUPGHOME}"
 gpg --batch --import /tmp/airflow-proof/trusted-oss-pubkey.asc
+GPG_FPR=$(gpg --with-colons --fingerprint | awk -F: '$1=="fpr"{print $10; exit}')
+printf '%s:6:\n' "${GPG_FPR}" | gpg --batch --import-ownertrust
 gpg --verify /tmp/airflow-proof/target.asc               /tmp/airflow-proof/manifest.json
 gpg --verify /tmp/airflow-proof/target.sbom.cdx.json.asc /tmp/airflow-proof/sbom.cdx.json
 gpg --verify /tmp/airflow-proof/target.cbom.cdx.json.asc /tmp/airflow-proof/cbom.cdx.json

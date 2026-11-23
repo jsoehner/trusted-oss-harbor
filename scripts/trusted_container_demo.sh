@@ -227,7 +227,21 @@ curl -fsSL "${CURL_TLS[@]}" "${GATEKEEPER_URL}/keys/trusted-oss-mldsa65.fingerpr
 gpg --batch --quiet --import "${WORKDIR}/trusted-oss-pubkey.asc"
 GPG_FPR="$(gpg --with-colons --fingerprint | awk -F: '$1 == "fpr" {print $10; exit}')"
 PQC_FPR="$(grep -i 'sha256' "${WORKDIR}/trusted-oss-mldsa65.fingerprint" | head -n1 || cat "${WORKDIR}/trusted-oss-mldsa65.fingerprint" | head -n1)"
-echo "  • Imported GPG Public Key Fingerprint   : ${GPG_FPR}"
+
+# Optional pinned-fingerprint check (recommended in production CI/CD)
+if [[ -n "${EXPECTED_GPG_FPR:-}" ]]; then
+  NORM_EXPECTED="$(printf '%s' "${EXPECTED_GPG_FPR}" | tr -d ' ' | tr '[:lower:]' '[:upper:]')"
+  if [[ "${GPG_FPR}" != "${NORM_EXPECTED}" ]]; then
+    echo "  [FAIL] GPG key fingerprint mismatch! Expected ${NORM_EXPECTED}, got ${GPG_FPR}" >&2
+    exit 1
+  fi
+fi
+
+# Grant ultimate ownertrust (:6:) to the verified Registry authority in the isolated keyring
+printf '%s:6:\n' "${GPG_FPR}" | gpg --batch --quiet --import-ownertrust
+gpg --batch --quiet --check-trustdb 2>/dev/null || true
+
+echo "  • Imported GPG Public Key Fingerprint   : ${GPG_FPR} (trust: ultimate)"
 echo "  • Fetched ML-DSA-65 Key Fingerprint     : ${PQC_FPR}"
 echo ""
 

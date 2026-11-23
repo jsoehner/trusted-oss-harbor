@@ -78,6 +78,8 @@ Then verify the manifest, SBOM, and CBOM against both keys:
 
 ```bash
 gpg --batch --import trusted-oss-pubkey.asc
+GPG_FPR=$(gpg --with-colons --fingerprint | awk -F: '$1=="fpr"{print $10; exit}')
+printf '%s:6:\n' "${GPG_FPR}" | gpg --batch --import-ownertrust
 gpg --verify manifest.json.asc manifest.json
 python3 client-templates/pqc-verify.py manifest.json manifest.json.mldsa65 trusted-oss-mldsa65.pub
 ```
