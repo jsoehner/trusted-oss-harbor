@@ -13,3 +13,4 @@
 | [0009](0009-standardized-html-email-notifications.md) | Standardized HTML Email Notifications Across Operational Digests | Accepted | 2026-11-20 |
 | [0010](0010-signed-artifact-cbom-attestations-and-purl-batch-api.md) | Per-Artifact Dual-Signed CycloneDX 1.6 SBOM/CBOM Attestations, PURL Batch API, and OCI 1.1 Referrers | Accepted | 2026-11-20 |
 | [0011](0011-security-assessment-remediation-and-governance.md) | Comprehensive Security Assessment Remediation & Governance Hardening | Accepted | 2026-11-22 |
+| [0012](0012-selectable-signature-verification-modes-and-oci-container-demo.md) | Selectable Signature Verification Modes (`classic` / `pqc` / `both`), Multi-Registry OCI Pull-Through & Signed-Only Container Demo | Accepted | 2026-11-23 |

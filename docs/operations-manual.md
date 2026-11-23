@@ -1,6 +1,6 @@
-# Trusted OSS Supply Chain Platform — Operations Manual (`v1.6.x`)
+# Trusted OSS Supply Chain Platform — Operations Manual (`v1.7.0`)
 
-This manual documents every operational capability of `trusted-oss-harbor` (`v1.6.x`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack and the single-container **TrueNAS / NAS Appliance** image (`ghcr.io/jsoehner/trusted-oss-gatekeeper:latest`, auto-versioned per commit on `main`), and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, BOM consumers (`jsi-bom-actions`), and GitHub Actions projects.
+This manual documents every operational capability of `trusted-oss-harbor` (`v1.7.0`), how to run and maintain the decoupled **Frontend + Engine + Valkey Message Bus** stack and the single-container **TrueNAS / NAS Appliance** image (`ghcr.io/jsoehner/trusted-oss-gatekeeper:latest`, auto-versioned per commit on `main`), and how to integrate existing Java (Maven), Python (`uv`/`pip`), OCI/Docker, BOM consumers (`jsi-bom-actions`), and GitHub Actions projects.
 
 ---
 
@@ -762,15 +762,21 @@ flowchart LR
 ```
 
 > [!TIP]
-> Run the complete automated walkthrough against your Gatekeeper instance with one command:
+> Run the complete automated walkthrough against your Gatekeeper instance with selectable signature verification modes ([ADR-0012](adr/0012-selectable-signature-verification-modes-and-oci-container-demo.md)):
 > ```bash
+> # Dual hybrid mode (default: verifies BOTH RSA-3072 GPG + NIST FIPS 204 ML-DSA-65)
 > GATEKEEPER_URL=http://oss.jsigroup.local:8080 \
->   NAMESPACE=docker-cache \
->   REPO=apache/airflow \
->   TAG=slim-latest-python3.12 \
->   bash scripts/trusted_container_demo.sh
+>   bash scripts/trusted_container_demo.sh --sig-mode both
+>
+> # Classical PGP/GPG-only mode (no Python PQC library required)
+> GATEKEEPER_URL=http://oss.jsigroup.local:8080 \
+>   bash scripts/trusted_container_demo.sh --sig-mode classic
+>
+> # Post-Quantum ML-DSA-65-only mode (no gpg binary required)
+> GATEKEEPER_URL=http://oss.jsigroup.local:8080 \
+>   bash scripts/trusted_container_demo.sh --sig-mode pqc
 > ```
-> Over WAN behind pfSense HAProxy mTLS, export `OSS_MTLS_CLIENT_CERT=~/.oss-tls/client.crt` and `OSS_MTLS_CLIENT_KEY=~/.oss-tls/client.key`.
+> Pin your Registry signing authorities in CI/CD with `EXPECTED_GPG_FPR` and/or `EXPECTED_PQC_FPR`. Over WAN behind pfSense HAProxy mTLS, export `OSS_MTLS_CLIENT_CERT=~/.oss-tls/client.crt` and `OSS_MTLS_CLIENT_KEY=~/.oss-tls/client.key`.
 
 ### 7.1 Step 1 — Cache, Scan, Attest & Dual-Sign the Sample Container (`apache/airflow:slim-latest-python3.12`)
 

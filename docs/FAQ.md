@@ -93,6 +93,11 @@ Because the OCI manifest embeds the SHA-256 digest of the image config and every
 - **RSA-3072 GPG (`.asc`)** integrates directly with existing build tools (`gpg`, Maven `pgpverify-maven-plugin`, standard Linux package tooling).
 - **NIST FIPS 204 ML-DSA-65 (`.mldsa65`)** provides post-quantum lattice-based signatures immune to Shor's algorithm, protecting long-lived provenance records and container attestations from "Harvest Now, Forge Later" threats.
 
+You can select which signature mode your client verifies via `--sig-mode` in [`scripts/trusted_container_demo.sh`](../scripts/trusted_container_demo.sh) (see [ADR-0012](adr/0012-selectable-signature-verification-modes-and-oci-container-demo.md)):
+- `--sig-mode classic` — verifies **only** RSA-3072 GPG (`.asc`, no `dilithium-py` required)
+- `--sig-mode pqc` — verifies **only** NIST FIPS 204 ML-DSA-65 (`.mldsa65`, no `gpg` required)
+- `--sig-mode both` *(default)* — verifies **both** classical GPG (`[ultimate]`) and ML-DSA-65, with optional `EXPECTED_GPG_FPR` / `EXPECTED_PQC_FPR` pinning.
+
 ---
 
 ## 5. What is the difference between the SBOM and CBOM referrers?
