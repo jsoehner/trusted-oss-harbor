@@ -129,3 +129,12 @@ Gatekeeper aborts promotion, deletes the quarantined file, logs a `BLOCKED` even
    docker run --rm apache/airflow@sha256:f22518ba835f4b73d6b75ff32c6b4eda10a5ef0abac18f2d7c11ceced8b651b2 airflow version
    ```
 3. **WAN mTLS Defense-in-Depth**: Over WAN, pfSense IP filtering (`github_actions_cidrs`) + HAProxy mutual TLS (`Trusted-OSS-GitHub-Client-CA`) ensure only authorized runners can query the Registry.
+
+---
+
+## 9. What if I want to continue using my existing pipeline to pull just the container image—won't pulling take longer, or will the image hash change compared to the public repo?
+
+- **The image hash never changes.** `trusted-oss-harbor` does not rebuild, repackage, or mutate the upstream container manifest or any of its filesystem layers. The CycloneDX 1.6 SBOM, CBOM, GPG `.asc`, and ML-DSA-65 `.mldsa65` signatures attach externally via **OCI 1.1 Referrers** and sidecars—never inside the image manifest. For example, `apache/airflow:slim-latest-python3.12` (`linux/amd64`) keeps the exact same digest (`sha256:f22518ba835f4b73d6b75ff32c6b4eda10a5ef0abac18f2d7c11ceced8b651b2`) and all 24 layer digests as Docker Hub.
+- **Pulls are faster after the first cache miss, not slower.** Only the first pull of a new tag incurs a brief quarantine scan (ClamAV + OSV/Trivy + SBOM/CBOM + dual signing). Every subsequent pull hits the local TrueNAS ZFS cache (`X-Cache-Status: HIT`), avoiding internet latency and Docker Hub pull rate limits (`HTTP 429`).
+- **Existing pipelines pull only the image.** Standard `docker pull`, `podman pull`, or Kubernetes pulls fetch only the container manifest and layers—they do not download the SBOM, CBOM, or signature artifacts unless a verification step explicitly requests them. Your existing pipeline keeps working unchanged while still gaining fail-closed `HTTP 451` protection against malware and High/Critical CVEs.
+

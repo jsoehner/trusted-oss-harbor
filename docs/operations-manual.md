@@ -957,6 +957,12 @@ No. While `oras discover` and `oras blob fetch` work natively (see [Section 4.6]
 ### Q8: How do we enforce "signed-only execution" automatically in GitHub Actions?
 Wire the reusable gate workflow [`client-templates/github-actions-verify-component.yml`](../client-templates/github-actions-verify-component.yml) as a prerequisite `needs:` job before any `build` or `deploy` job, and pass `if: ${{ needs.verify-base-image.outputs.approved == 'true' }}`. If any signature, SBOM/CBOM referrer, ClamAV verdict, or CVSS threshold fails, the gate exits non-zero and blocks deployment.
 
+### Q9: What if I want to continue using my existing pipeline to pull just the container image—won't pulling take longer, or will the image hash change compared to the public repo?
+- **No hash change:** `trusted-oss-harbor` never mutates or repackages the upstream container manifest or layers. SBOM, CBOM, GPG `.asc`, and ML-DSA-65 `.mldsa65` proofs attach externally via **OCI 1.1 Referrers** and sidecars, so the manifest digest (e.g., `sha256:f22518ba835f4b73d6b75ff32c6b4eda10a5ef0abac18f2d7c11ceced8b651b2` for `apache/airflow:slim-latest-python3.12`) and every layer hash match the public registry byte-for-byte.
+- **Faster repeat pulls:** Only the first cache miss runs the quarantine scan and signing step. All subsequent pulls serve from local ZFS cache (`X-Cache-Status: HIT`), avoiding WAN latency and Docker Hub rate limits.
+- **Zero extra payload on standard pulls:** Standard `docker pull` / `podman pull` commands fetch only the container image and layers—not the attached SBOM, CBOM, or signatures—unless your pipeline explicitly queries them.
+
+
 
 
 
