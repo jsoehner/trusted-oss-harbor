@@ -5,6 +5,17 @@ All notable changes to `trusted-oss-harbor` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Uncached Container Acquisition Report & Interactive PowerShell ORAS Demo**:
+  - Added [`docs/reports/container-artifact-acquisition-and-oras-verification.md`](docs/reports/container-artifact-acquisition-and-oras-verification.md) documenting the end-to-end workflow for pulling uncached container artifacts with a bounded 15-second `HTTP 451` retry timer, `oras` OCI 1.1 Referrers SBOM/CBOM discovery and blob verification, dual GPG/ML-DSA-65 signature checks, and live vulnerability/provenance validation.
+  - Added [`scripts/demo_container_acquisition_oras.ps1`](scripts/demo_container_acquisition_oras.ps1) supporting a combined `<repo>:<tag>` `-Image` parameter, auto-derived `<repo>-cache` namespace routing, no-parameter console usage examples, collapsed HTTP response headers (`-ShowHeaders` to expand + enable `oras --debug`), `[DOWNLOAD]` file status lines, `-Detailed` full JSON output, and ANSI-colored `-TranscriptPath` log capture.
+  - Added `demo-detailed.log`, `demo-output.log`, and `demo-*.log` to `.gitignore`.
+
+### Fixed
+- **OCI 1.1 Referrers `Content-Type` Header (`gatekeeper/app/main.py`)**: Set `media_type="application/vnd.oci.image.index.v1+json"` on `get_oci_referrers()` responses so `oras discover` v1.4+ populates attached CycloneDX SBOM/CBOM referrers natively without falling back to the OCI 1.0 `sha256-<hex>` tag lookup.
+
 ## [1.7.0] - 2026-11-23
 
 ### Added

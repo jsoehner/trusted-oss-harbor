@@ -579,6 +579,9 @@ jobs:
 
 The action fails closed (exits non-zero) if any signature, SBOM/CBOM referrer, malware check, or CVE threshold fails, and publishes a Markdown **Trusted OSS Component Verification Decision** table directly to `$GITHUB_STEP_SUMMARY`.
 
+> [!TIP]
+> **Acquiring Uncached Containers (`HTTP 451` 15s Timer + PowerShell ORAS Demo):** For a full report on pulling brand-new uncached container artifacts with a bounded 15-second `HTTP 451` retry timer followed by `oras` SBOM/CBOM and vulnerability verification, see [`docs/reports/container-artifact-acquisition-and-oras-verification.md`](reports/container-artifact-acquisition-and-oras-verification.md) and run [`scripts/demo_container_acquisition_oras.ps1`](../scripts/demo_container_acquisition_oras.ps1) (supports `-Detailed`, `-ShowHeaders`, and ANSI-colored `-TranscriptPath` logs).
+
 ---
 
 ## 5. Troubleshooting HTTP 451 & Debugging Component Lifecycle

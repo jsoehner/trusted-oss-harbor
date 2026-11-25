@@ -23,3 +23,8 @@ __pycache__/
 venv/
 .coverage
 htmlcov/
+
+# Demo Transcripts & Detailed Output Logs
+demo-detailed.log
+demo-output.log
+demo-*.log
