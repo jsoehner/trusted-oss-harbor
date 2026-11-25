@@ -3160,6 +3160,7 @@ async def get_oci_referrers(
     if not manifests_dir.is_dir():
         return JSONResponse(
             content={"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": []},
+            media_type="application/vnd.oci.image.index.v1+json",
             headers={"Docker-Distribution-API-Version": "registry/2.0"},
         )
 
@@ -3209,6 +3210,7 @@ async def get_oci_referrers(
             "mediaType": "application/vnd.oci.image.index.v1+json",
             "manifests": descriptors,
         },
+        media_type="application/vnd.oci.image.index.v1+json",
         headers=headers,
     )
 
