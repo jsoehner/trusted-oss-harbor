@@ -361,9 +361,10 @@ async def handle_engine_job(
             dry_run=bool(payload.get("dry_run", False)),
         )
     if job_type == "backfill_boms":
-        return backfill_cached_boms(
+        return await backfill_cached_boms(
             settings=settings,
             force=bool(payload.get("force", False)),
+            deep_oci=bool(payload.get("deep_oci", True)),
         )
     raise ValueError(f"Unsupported engine job_type: {job_type}")
 
@@ -3146,18 +3147,47 @@ def _read_bom_payload_with_signatures(
     return entry
 
 
-def backfill_cached_boms(settings: Settings, force: bool = False) -> dict[str, Any]:
+def _resolve_oci_upstream_url(namespace: str, settings: Settings) -> str | None:
+    """Resolve the upstream registry base URL for a cached OCI namespace."""
+    if namespace in ("chainguard-cache", "cgr-dev"):
+        return settings.upstream_chainguard_url
+    if namespace in OCI_REGISTRY_ALIASES:
+        return OCI_REGISTRY_ALIASES[namespace]
+    if namespace == "docker-io":
+        return "https://registry-1.docker.io"
+    return None
+
+
+async def backfill_cached_boms(
+    settings: Settings,
+    force: bool = False,
+    deep_oci: bool = True,
+) -> dict[str, Any]:
     """Generate and dual-sign CycloneDX 1.6 SBOM/CBOM sidecars for existing cached artifacts."""
     scanned = 0
     generated = 0
     skipped = 0
+    oci_deep_scanned = 0
     errors: list[str] = []
 
-    targets: list[tuple[str, Path]] = [
-        ("pypi", settings.trusted_pypi_dir),
-        ("maven", settings.trusted_maven_dir),
-        ("oci-harbor", settings.harbor_oci_cache_dir),
+    targets: list[tuple[str, str, Path]] = [
+        ("pypi", "", settings.trusted_pypi_dir),
+        ("maven", "", settings.trusted_maven_dir),
     ]
+    seen_oci_roots: set[Path] = set()
+    oci_registry_root = settings.oss_data_root / "harbor" / "registry"
+    if oci_registry_root.is_dir():
+        for ns_dir in sorted(oci_registry_root.iterdir()):
+            if ns_dir.is_symlink() or not ns_dir.is_dir():
+                continue
+            resolved_ns = ns_dir.resolve()
+            seen_oci_roots.add(resolved_ns)
+            targets.append(("oci-harbor", ns_dir.name, ns_dir))
+    if settings.harbor_oci_cache_dir.is_dir():
+        resolved_cg = settings.harbor_oci_cache_dir.resolve()
+        if resolved_cg not in seen_oci_roots:
+            targets.append(("oci-harbor", "chainguard-cache", settings.harbor_oci_cache_dir))
+
     skip_suffixes = (
         ".asc",
         ".mldsa65",
@@ -3169,54 +3199,89 @@ def backfill_cached_boms(settings: Settings, force: bool = False) -> dict[str, A
         ".xml",
     )
 
-    for ecosystem, root_dir in targets:
-        if not root_dir.is_dir():
-            continue
-        for file_path in sorted(root_dir.rglob("*")):
-            if file_path.is_symlink() or not file_path.is_file():
+    staging_root = settings.quarantine_dir / f".backfill_layers_{uuid.uuid4().hex[:8]}"
+    layer_cache: dict[tuple[str, str, str], list[Path]] = {}
+
+    try:
+        for ecosystem, ns_name, root_dir in targets:
+            if not root_dir.is_dir():
                 continue
-            if file_path.name.startswith(".") or file_path.name.endswith(skip_suffixes):
-                continue
-            # Only backfill promoted (GPG-signed) artifacts
-            if not file_path.with_name(f"{file_path.name}.asc").is_file():
-                continue
-            scanned += 1
-            cbom_file = file_path.with_name(f"{file_path.name}.cbom.cdx.json")
-            if cbom_file.is_file() and not force:
-                skipped += 1
-                continue
-            try:
-                rel_path = file_path.relative_to(root_dir).as_posix()
-                pkg_name, pkg_version = extract_package_coordinates(ecosystem, rel_path)
-                digests = compute_digests(file_path)
-                sbom_p, cbom_p, _, _ = generate_artifact_boms(
-                    staged_file=file_path,
-                    ecosystem=ecosystem,
-                    pkg_name=pkg_name,
-                    pkg_version=pkg_version,
-                    artifact_rel_path=rel_path,
-                    digests=digests,
-                )
-                for bom_p in (sbom_p, cbom_p):
-                    sign_artifact_detached_gpg(
-                        artifact_path=bom_p,
-                        gnupghome=settings.gnupghome,
-                        passphrase=settings.gpg_passphrase,
-                        key_id=settings.gpg_key_id or settings.gpg_key_email,
+            for file_path in sorted(root_dir.rglob("*")):
+                if file_path.is_symlink() or not file_path.is_file():
+                    continue
+                if file_path.name.startswith(".") or file_path.name.endswith(skip_suffixes):
+                    continue
+                # Only backfill promoted (GPG-signed) artifacts
+                if not file_path.with_name(f"{file_path.name}.asc").is_file():
+                    continue
+                scanned += 1
+                cbom_file = file_path.with_name(f"{file_path.name}.cbom.cdx.json")
+                if cbom_file.is_file() and not force:
+                    skipped += 1
+                    continue
+                try:
+                    rel_in_ns = file_path.relative_to(root_dir).as_posix()
+                    pkg_name, pkg_version = extract_package_coordinates(ecosystem, rel_in_ns)
+                    digests = compute_digests(file_path)
+                    artifact_rel_path = f"{ns_name}/{rel_in_ns}" if ns_name else rel_in_ns
+
+                    oci_layer_paths: list[Path] = []
+                    if (
+                        ecosystem == "oci-harbor"
+                        and deep_oci
+                        and settings.oci_bom_deep_scan_enabled
+                        and "/manifests/" in rel_in_ns
+                    ):
+                        repo_path = rel_in_ns.split("/manifests/", 1)[0]
+                        upstream_url = _resolve_oci_upstream_url(ns_name, settings)
+                        cache_key = (ns_name, repo_path, digests.sha256)
+                        if cache_key in layer_cache:
+                            oci_layer_paths = layer_cache[cache_key]
+                        elif upstream_url:
+                            layer_dir = staging_root / f"{len(layer_cache):03d}"
+                            oci_layer_paths = await fetch_upstream_oci_layers_for_bom(
+                                upstream_base_url=upstream_url,
+                                repo_path=repo_path,
+                                manifest_bytes=file_path.read_bytes(),
+                                staging_dir=layer_dir,
+                                settings=settings,
+                            )
+                            layer_cache[cache_key] = oci_layer_paths
+                        if oci_layer_paths:
+                            oci_deep_scanned += 1
+
+                    sbom_p, cbom_p, _, _ = generate_artifact_boms(
+                        staged_file=file_path,
+                        ecosystem=ecosystem,
+                        pkg_name=pkg_name,
+                        pkg_version=pkg_version,
+                        artifact_rel_path=artifact_rel_path,
+                        digests=digests,
+                        oci_layer_paths=oci_layer_paths or None,
                     )
-                    if settings.pqc_signing_enabled:
-                        sign_artifact_mldsa65(
+                    for bom_p in (sbom_p, cbom_p):
+                        sign_artifact_detached_gpg(
                             artifact_path=bom_p,
-                            privkey_path=settings.mldsa_private_key_path,
+                            gnupghome=settings.gnupghome,
+                            passphrase=settings.gpg_passphrase,
+                            key_id=settings.gpg_key_id or settings.gpg_key_email,
                         )
-                generated += 1
-            except Exception as exc:
-                errors.append(f"{ecosystem}/{file_path.name}: {exc}")
+                        if settings.pqc_signing_enabled:
+                            sign_artifact_mldsa65(
+                                artifact_path=bom_p,
+                                privkey_path=settings.mldsa_private_key_path,
+                            )
+                    generated += 1
+                except Exception as exc:
+                    errors.append(f"{ecosystem}/{file_path.name}: {exc}")
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
     return {
         "scanned": scanned,
         "generated": generated,
         "skipped": skipped,
+        "oci_deep_scanned": oci_deep_scanned,
         "errors": errors,
     }
 
@@ -3324,17 +3389,18 @@ async def trigger_backfill_boms(
     x_gatekeeper_token: Annotated[str | None, Header()] = None,
     force: bool = False,
     wait: bool = True,
+    deep_oci: bool = True,
 ) -> JSONResponse:
     """Admin endpoint to backfill signed SBOM/CBOM sidecars for all previously cached artifacts."""
     require_admin_token(x_gatekeeper_token, settings)
     if not wait or settings.gatekeeper_role == "frontend":
         bus = get_job_bus(request.app, settings)
-        job = await bus.enqueue("backfill_boms", {"force": force})
+        job = await bus.enqueue("backfill_boms", {"force": force, "deep_oci": deep_oci})
         return JSONResponse(
             status_code=202,
             content=job,
         )
-    summary = backfill_cached_boms(settings=settings, force=force)
+    summary = await backfill_cached_boms(settings=settings, force=force, deep_oci=deep_oci)
     return JSONResponse(content=summary)
 
 

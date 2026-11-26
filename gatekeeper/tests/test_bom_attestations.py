@@ -635,3 +635,159 @@ def test_oras_referrers_and_catalog_crypto_risk_endpoints(tmp_path: Path):
     assert cr_data["count"] == 1
     assert cr_data["components"][0]["component"] == "chainguard/jre"
     assert cr_data["components"][0]["crypto_posture"]["coding_risk"] == "MEDIUM"
+
+
+def test_parse_dpkg_status_and_oci_deb_sbom(tmp_path: Path):
+    """Verify Debian dpkg status parsing populates pkg:deb SBOM components in OCI layer inspection."""
+    import io
+    import tarfile
+    from app.bom_generator import inspect_oci_layers
+    from app.crypto_risk import parse_dpkg_status
+
+    status_text = (
+        "Package: openssl\n"
+        "Status: install ok installed\n"
+        "Version: 3.5.0-1deb13u1\n\n"
+        "Package: removed-legacy-pkg\n"
+        "Status: deinstall ok config-files\n"
+        "Version: 1.0.0\n"
+    )
+    fragment_text = "Package: libssl3t64\nVersion: 3.5.0-1deb13u1\n"
+
+    parsed = parse_dpkg_status(status_text)
+    assert parsed == [{"name": "openssl", "version": "3.5.0-1deb13u1"}]
+
+    layer_tar = tmp_path / "debian_layer.tar.gz"
+    with tarfile.open(layer_tar, "w:gz") as tf:
+        for rel, raw in (
+            ("var/lib/dpkg/status", status_text.encode("utf-8")),
+            ("var/lib/dpkg/status.d/libssl3t64", fragment_text.encode("utf-8")),
+        ):
+            ti = tarfile.TarInfo(name=rel)
+            ti.size = len(raw)
+            tf.addfile(ti, io.BytesIO(raw))
+
+    layer_res = inspect_oci_layers([layer_tar])
+    deb_pkgs = {(p["name"], p["version"]) for p in layer_res["deb_packages"]}
+    assert ("openssl", "3.5.0-1deb13u1") in deb_pkgs
+    assert ("libssl3t64", "3.5.0-1deb13u1") in deb_pkgs
+    assert ("removed-legacy-pkg", "1.0.0") not in deb_pkgs
+
+    manifest_file = tmp_path / "slim-latest"
+    manifest_file.write_text('{"schemaVersion":2,"manifests":[]}', encoding="utf-8")
+    sbom_p, _, _, _ = generate_artifact_boms(
+        staged_file=manifest_file,
+        ecosystem="oci-harbor",
+        pkg_name="apache/airflow",
+        pkg_version="slim-latest",
+        artifact_rel_path="docker-cache/apache/airflow/manifests/slim-latest",
+        digests=compute_digests(manifest_file),
+        oci_layer_paths=[layer_tar],
+    )
+    sbom_doc = json.loads(sbom_p.read_text(encoding="utf-8"))
+    purls = {c["purl"] for c in sbom_doc["components"]}
+    assert "pkg:deb/openssl@3.5.0-1deb13u1" in purls
+    assert "pkg:deb/libssl3t64@3.5.0-1deb13u1" in purls
+    assert all("removed-legacy-pkg" not in p for p in purls)
+
+
+def test_backfill_cached_boms_deep_oci_all_namespaces_and_dedup(tmp_path: Path, monkeypatch):
+    """Verify async backfill_cached_boms scans all OCI namespaces, deduplicates layers, and upgrades legacy BOMs."""
+    import asyncio
+    import hashlib
+    import io
+    import tarfile
+    import app.main as main_mod
+
+    settings = Settings(
+        OSS_DATA_ROOT=tmp_path,
+        CLAMAV_REQUIRED=False,
+        CVE_SCANNER_MODE="none",
+        GATEKEEPER_ADMIN_TOKEN="test-secret-token-1234",
+        PQC_SIGNING_ENABLED=True,
+        BOM_GENERATION_ENABLED=True,
+        OCI_BOM_DEEP_SCAN_ENABLED=True,
+        CVE_RESCAN_INTERVAL_SECONDS=0,
+    )
+    initialize_storage_and_keys(settings)
+
+    sha1_root_pem = _wrap_pem(_build_der_test_cert("backfill-sha1-root", bits=2048, sig_oid="1.2.840.113549.1.1.5", is_ca=True))
+
+    def _write_manifest_with_legacy_boms(manifests_dir: Path, ref: str, payload: bytes) -> Path:
+        manifests_dir.mkdir(parents=True, exist_ok=True)
+        mfile = manifests_dir / ref
+        mfile.write_bytes(payload)
+        msha = hashlib.sha256(payload).hexdigest()
+        (manifests_dir / f"{ref}.sha256").write_text(msha, encoding="utf-8")
+        (manifests_dir / f"{ref}.asc").write_text("dummy-manifest-sig", encoding="utf-8")
+        legacy_cbom = {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.6",
+            "components": [],
+            "metadata": {"properties": [{"name": "trusted-oss:crypto-scan-status", "value": "VERIFIED_INERT"}]},
+        }
+        (manifests_dir / f"{ref}.cbom.cdx.json").write_text(json.dumps(legacy_cbom), encoding="utf-8")
+        (manifests_dir / f"{ref}.sbom.cdx.json").write_text(json.dumps({"bomFormat": "CycloneDX", "specVersion": "1.6", "components": []}), encoding="utf-8")
+        return mfile
+
+    cg_dir = settings.harbor_oci_cache_dir / "chainguard" / "jre" / "manifests"
+    cg_payload = b'{"schemaVersion":2,"tag":"latest"}'
+    cg_digest_ref = f"sha256:{hashlib.sha256(cg_payload).hexdigest()}"
+    cg_latest = _write_manifest_with_legacy_boms(cg_dir, "latest", cg_payload)
+    cg_dig_file = _write_manifest_with_legacy_boms(cg_dir, cg_digest_ref, cg_payload)
+
+    docker_dir = settings.oss_data_root / "harbor" / "registry" / "docker-cache" / "apache" / "airflow" / "manifests"
+    docker_payload = b'{"schemaVersion":2,"tag":"slim-latest"}'
+    docker_manifest = _write_manifest_with_legacy_boms(docker_dir, "slim-latest", docker_payload)
+
+    fetch_calls: list[tuple[str, str]] = []
+
+    async def _fake_fetch_layers(*, upstream_base_url, repo_path, manifest_bytes, staging_dir, settings):
+        fetch_calls.append((upstream_base_url, repo_path))
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        out = staging_dir / "layer_00.tar.gz"
+        with tarfile.open(out, "w:gz") as tf:
+            entries = (
+                [
+                    ("lib/apk/db/installed", b"P:openssl-4.0-libcrypto\nV:4.0.3-r8\nT:libcrypto\n\n"),
+                    ("etc/ssl/certs/ca-certificates.crt", sha1_root_pem),
+                    ("etc/ssl/openssl.cnf", b"[default]\nCHAINGUARD_LEGACY_ALLOWED = 1\n[provider_sect]\nlegacy = legacy_sect\n[legacy_sect]\nactivate = $ENV::CHAINGUARD_LEGACY_ALLOWED\n"),
+                ]
+                if "chainguard" in repo_path
+                else [
+                    ("var/lib/dpkg/status", b"Package: openssl\nStatus: install ok installed\nVersion: 3.5.0-1\n\n"),
+                    ("etc/ssl/certs/ca-certificates.crt", sha1_root_pem),
+                    ("usr/lib/libcrypto.so.3", b"OpenSSL 3.5.0 ML-KEM-768\n"),
+                ]
+            )
+            for rel, raw in entries:
+                ti = tarfile.TarInfo(name=rel)
+                ti.size = len(raw)
+                tf.addfile(ti, io.BytesIO(raw))
+        return [out]
+
+    monkeypatch.setattr(main_mod, "fetch_upstream_oci_layers_for_bom", _fake_fetch_layers)
+
+    summary = asyncio.run(main_mod.backfill_cached_boms(settings=settings, force=True, deep_oci=True))
+    assert summary["errors"] == []
+    assert summary["scanned"] == 3
+    assert summary["generated"] == 3
+    assert summary["oci_deep_scanned"] == 3
+    # Same (chainguard-cache, chainguard/jre, sha256) should fetch upstream layers once, plus once for docker-cache
+    assert len(fetch_calls) == 2
+    assert any("registry-1.docker.io" in u and r == "apache/airflow" for u, r in fetch_calls)
+
+    for mf in (cg_latest, cg_dig_file, docker_manifest):
+        sbom_p = mf.with_name(f"{mf.name}.sbom.cdx.json")
+        cbom_p = mf.with_name(f"{mf.name}.cbom.cdx.json")
+        sbom_doc = json.loads(sbom_p.read_text(encoding="utf-8"))
+        cbom_doc = json.loads(cbom_p.read_text(encoding="utf-8"))
+        props = {p["name"]: p["value"] for p in cbom_doc["metadata"]["properties"]}
+        assert len(sbom_doc["components"]) >= 1
+        assert props["trusted-oss:scan-scope"] == "oci-layers"
+        assert props["trusted-oss:crypto-scan-status"] == "CRYPTO_ASSETS_DETECTED"
+        assert props["trusted-oss:cert-sha1-roots"] == "1"
+        assert props["trusted-oss:pqc-adoption-status"] == "PQC_COMPILED_BUT_UNUSED"
+        for bom_p in (sbom_p, cbom_p):
+            assert verify_artifact_signature(bom_p, bom_p.with_name(f"{bom_p.name}.asc"), settings.gnupghome)
+            assert verify_artifact_mldsa65(bom_p, bom_p.with_name(f"{bom_p.name}.mldsa65"), settings.mldsa_public_key_path)

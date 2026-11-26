@@ -702,6 +702,40 @@ def parse_apk_installed_packages(text: str) -> list[dict[str, str]]:
     return pkgs
 
 
+def parse_dpkg_status(text: str) -> list[dict[str, str]]:
+    """Parse Debian/Ubuntu /var/lib/dpkg/status stanza format for installed packages."""
+    pkgs: list[dict[str, str]] = []
+    cur: dict[str, str] = {}
+
+    def _flush() -> None:
+        if not cur.get("Package"):
+            return
+        status = cur.get("Status", "install ok installed").lower()
+        # status.d fragments may omit Status; main status marks removed pkgs as deinstall/config-files
+        if "Status" in cur and "installed" not in status.split():
+            return
+        pkgs.append(
+            {
+                "name": cur["Package"],
+                "version": cur.get("Version", "unknown"),
+            }
+        )
+
+    for raw_line in text.splitlines():
+        if not raw_line.strip():
+            _flush()
+            cur = {}
+            continue
+        if raw_line[0].isspace():
+            continue
+        if ":" in raw_line:
+            k, v = raw_line.split(":", 1)
+            if k in ("Package", "Version", "Status"):
+                cur[k] = v.strip()
+    _flush()
+    return pkgs
+
+
 def _max_risk_level(risks: list[dict[str, Any]]) -> str:
     best = "NONE"
     for item in risks:

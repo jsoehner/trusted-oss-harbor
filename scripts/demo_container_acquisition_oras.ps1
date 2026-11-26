@@ -659,12 +659,15 @@ try {
         $cryptoAssets = @($cbomObj.components | Where-Object { $_.type -eq "cryptographic-asset" } | ForEach-Object { $_.name })
     }
 
-    Write-Host "  [PASS] SBOM Verified : $($sbomObj.bomFormat) $($sbomObj.specVersion) | SHA-256 OK | Components: $sbomCompCount" -ForegroundColor Green
+    $isLegacyInertCbom = ($cbomStatus -eq "VERIFIED_INERT" -and ($riskLevel -eq "UNKNOWN" -or $cbomScope -eq "legacy"))
+    $sbomBannerColor = if ($sbomCompCount -gt 0) { "Green" } else { "Yellow" }
+    $sbomStatusTag = if ($sbomCompCount -gt 0) { "[PASS]" } else { "[WARN]" }
+    Write-Host "  $sbomStatusTag SBOM Verified : $($sbomObj.bomFormat) $($sbomObj.specVersion) | SHA-256 OK | Components: $sbomCompCount" -ForegroundColor $sbomBannerColor
     Write-JsonFilePreview -Label "SBOM JSON" -FilePath $SbomFile -MaxLines 30
 
     $cbomBannerColor = if ($certExpired -gt 0 -or $certWeakKeys -gt 0) {
         "Red"
-    } elseif ($cbomStatus -eq "MANIFEST_ONLY_UNINSPECTED" -or $activeRiskCount -gt 0 -or $certSha1Roots -gt 0) {
+    } elseif ($cbomStatus -eq "MANIFEST_ONLY_UNINSPECTED" -or $isLegacyInertCbom -or $activeRiskCount -gt 0 -or $certSha1Roots -gt 0) {
         "Yellow"
     } else {
         "Green"
@@ -716,11 +719,17 @@ try {
     }
 
     Write-JsonFilePreview -Label "CBOM JSON" -FilePath $CbomFile -MaxLines 30
-    $Gates.SbomVerified = "PASS ($sbomCompCount components)"
+    $Gates.SbomVerified = if ($sbomCompCount -gt 0) {
+        "PASS ($sbomCompCount components)"
+    } else {
+        "WARN (0 components — legacy/uninspected layers; run POST /catalog/backfill-boms?force=true)"
+    }
     if ($certExpired -gt 0 -or $certWeakKeys -gt 0) {
         $Gates.CbomVerified = "FAIL ($cbomStatus | risk=$riskLevel | expired=$certExpired | weak_keys=$certWeakKeys)"
     } elseif ($cbomStatus -eq "MANIFEST_ONLY_UNINSPECTED") {
         $Gates.CbomVerified = "WARN ($cbomStatus — layers not inspected)"
+    } elseif ($isLegacyInertCbom) {
+        $Gates.CbomVerified = "WARN (VERIFIED_INERT — legacy manifest-only CBOM; run POST /catalog/backfill-boms?force=true)"
     } elseif ($activeRiskCount -gt 0 -or $certSha1Roots -gt 0) {
         $Gates.CbomVerified = "WARN ($cbomStatus | risk=$riskLevel | active=$activeRiskCount passive=$passiveRiskCount sha1_roots=$certSha1Roots | $pqcAdoption)"
     } else {

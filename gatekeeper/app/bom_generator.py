@@ -23,6 +23,7 @@ from app.crypto_risk import (
     inspect_openssl_cnf,
     parse_apk_installed_packages,
     parse_cert_store_bytes,
+    parse_dpkg_status,
 )
 from app.storage import (
     ArtifactDigests,
@@ -311,6 +312,8 @@ def build_canonical_purl(
         return f"pkg:maven/{pkg_name}{ver_suffix}"
     if eco == "apk":
         return f"pkg:apk/wolfi/{pkg_name}{ver_suffix}"
+    if eco == "deb":
+        return f"pkg:deb/{pkg_name}{ver_suffix}"
     if eco.startswith("oci"):
         clean = artifact_rel_path.strip("/")
         return f"pkg:oci/{clean}{ver_suffix}"
@@ -718,6 +721,7 @@ def inspect_oci_layers(
     openssl_configs: dict[str, str] = {}
     java_sec_configs: dict[str, str] = {}
     apk_db_text = ""
+    dpkg_chunks: list[str] = []
 
     scanned_files = 0
     for layer_path in layer_paths:
@@ -752,13 +756,14 @@ def inspect_oci_layers(
                     rel_lower = rel.lower()
                     base_lower = base.lower()
                     is_apk_db = rel_lower == "lib/apk/db/installed"
+                    is_dpkg_db = rel_lower == "var/lib/dpkg/status" or rel_lower.startswith("var/lib/dpkg/status.d/")
                     is_jmod = base_lower == "modules" and "/jvm/" in f"/{rel_lower}"
                     is_cert = _is_cert_store_member(rel_lower)
                     is_text = rel_lower.endswith(TEXT_SCAN_EXTS)
                     is_bin = _is_scannable_binary(rel_lower)
                     is_jar = rel_lower.endswith(".jar")
 
-                    if not (is_apk_db or is_jmod or is_cert or is_text or is_bin or is_jar):
+                    if not (is_apk_db or is_dpkg_db or is_jmod or is_cert or is_text or is_bin or is_jar):
                         continue
 
                     extracted = tf.extractfile(member)
@@ -772,13 +777,17 @@ def inspect_oci_layers(
 
                     cap = (
                         MAX_BINARY_MEMBER_BYTES
-                        if (is_bin or is_cert or is_apk_db or is_jar)
+                        if (is_bin or is_cert or is_apk_db or is_dpkg_db or is_jar)
                         else MAX_MEMBER_BYTES
                     )
                     data = extracted.read(cap)
 
                     if is_apk_db:
                         apk_db_text = data.decode("utf-8", errors="replace")
+                        continue
+
+                    if is_dpkg_db:
+                        dpkg_chunks.append(data.decode("utf-8", errors="replace"))
                         continue
 
                     if is_cert:
@@ -865,6 +874,7 @@ def inspect_oci_layers(
     openssl_findings = [inspect_openssl_cnf(txt, loc) for loc, txt in sorted(openssl_configs.items())]
     java_findings = [inspect_java_security(txt, loc) for loc, txt in sorted(java_sec_configs.items())]
     apk_packages = parse_apk_installed_packages(apk_db_text) if apk_db_text else []
+    deb_packages = parse_dpkg_status("\n\n".join(dpkg_chunks)) if dpkg_chunks else []
     components = _build_crypto_components(found, cert_summary)
 
     return {
@@ -875,6 +885,7 @@ def inspect_oci_layers(
         "openssl_findings": openssl_findings,
         "java_findings": java_findings,
         "apk_packages": apk_packages,
+        "deb_packages": deb_packages,
     }
 
 
@@ -938,6 +949,14 @@ def generate_artifact_boms(
                     "version": pkg["version"],
                 }
             )
+        for pkg in scan_res.get("deb_packages", []):
+            extracted_deps.append(
+                {
+                    "ecosystem": "deb",
+                    "name": pkg["name"],
+                    "version": pkg["version"],
+                }
+            )
     elif is_oci:
         manifest_only_uninspected = True
         scan_res = {
@@ -948,10 +967,12 @@ def generate_artifact_boms(
             "openssl_findings": [],
             "java_findings": [],
             "apk_packages": [],
+            "deb_packages": [],
         }
     else:
         scan_res = _inspect_archive_details(staged_file, now=now_dt)
         scan_res["apk_packages"] = []
+        scan_res["deb_packages"] = []
 
     # 1. CycloneDX 1.6 SBOM
     sbom_components: list[dict[str, Any]] = []
