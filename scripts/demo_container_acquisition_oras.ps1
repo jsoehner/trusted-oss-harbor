@@ -41,6 +41,7 @@ param(
     [switch]$KeepProofDir,
     [Alias("FullOutput", "ShowAll")]
     [switch]$Detailed,
+    [switch]$RawJson,
     [switch]$ShowHeaders,
     [string]$TranscriptPath = ""
 )
@@ -168,6 +169,17 @@ function Write-Section {
     param([string]$Title)
     Write-Host ""
     Write-Host ">>> $Title" -ForegroundColor Yellow
+}
+
+function Write-Kv {
+    param(
+        [Parameter(Mandatory)][string]$Key,
+        [AllowEmptyString()][string]$Value = "",
+        [ConsoleColor]$ValueColor = "Gray",
+        [int]$Indent = 4
+    )
+    $pad = " " * $Indent
+    Write-Host ("{0}{1,-22} : {2}" -f $pad, $Key, $Value) -ForegroundColor $ValueColor
 }
 
 function Get-Prop {
@@ -371,7 +383,8 @@ function Invoke-LoggedCli {
     param(
         [Parameter(Mandatory)][string]$Command,
         [Parameter(Mandatory)][string[]]$Arguments,
-        [switch]$AllowNonZeroExit
+        [switch]$AllowNonZeroExit,
+        [switch]$QuietOutput
     )
 
     $displayCmd = "$Command " + (($Arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join " ")
@@ -387,7 +400,7 @@ function Invoke-LoggedCli {
     }
 
     $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
-    if (-not [string]::IsNullOrWhiteSpace($text)) {
+    if (-not $QuietOutput -and -not [string]::IsNullOrWhiteSpace($text)) {
         Write-Host "  [CLI OUT ]" -ForegroundColor DarkCyan
         foreach ($line in ($text -split "`r?`n")) {
             Write-Host "             $line" -ForegroundColor Gray
@@ -472,14 +485,12 @@ try {
     Write-Host "  Target Image  : ${Namespace}/${Repo}${RefSeparator}${Tag}" -ForegroundColor White
     Write-Host "  Manifest URL  : $ManifestUrl" -ForegroundColor White
     Write-Host "  451 Retry     : Up to $MaxRetries attempts, ${RetryDelaySeconds}s timer between retries" -ForegroundColor White
-    $modeText = if ($Detailed -and $ShowHeaders) {
-        "DETAILED + HEADERS (full JSON, all HTTP headers, ORAS --debug)"
+    $modeText = if ($RawJson) {
+        "RAW JSON (parsed summaries + full raw JSON bodies$(if ($ShowHeaders) { ' + raw headers & ORAS --debug' }))"
     } elseif ($Detailed) {
-        "DETAILED (full JSON bodies, compact headers; pass -ShowHeaders for raw headers & ORAS --debug)"
-    } elseif ($ShowHeaders) {
-        "STANDARD + HEADERS (JSON previews, all HTTP headers, ORAS --debug)"
+        "DETAILED (expanded key/value summaries, full SBOM package list$(if ($ShowHeaders) { ' + raw headers & ORAS --debug' }))"
     } else {
-        "STANDARD (compact headers, JSON previews; pass -Detailed for full JSON, -ShowHeaders for raw headers)"
+        "COMPACT KEY/VALUE (pass -Detailed for expanded lists, -RawJson for raw JSON, -ShowHeaders for HTTP headers)"
     }
     Write-Host "  Output Mode   : $modeText" -ForegroundColor White
     Write-Host "  Proof Dir     : $ProofDir" -ForegroundColor White
@@ -500,10 +511,23 @@ try {
     # --------------------------------------------------------------------------
     Write-Banner "STAGE 0 — REGISTRY HEALTH & OCI V2 CONFORMANCE CHECK"
     Write-Section "0.1 Gatekeeper Liveness & Signing Authority Readiness"
-    $null = Invoke-LoggedHttpRequest -Uri "${RegistryUrl}/healthz" -ShowBodyPreview -MaxBodyLines 12
+    $hzResp = Invoke-LoggedHttpRequest -Uri "${RegistryUrl}/healthz" -ShowBodyPreview:$RawJson -MaxBodyLines 12
+    if ($hzResp.StatusCode -eq 200 -and $hzResp.Body) {
+        $hz = $hzResp.Body | ConvertFrom-Json
+        Write-Kv "Status"          (Get-Prop $hz "status" "unknown") -ValueColor Green
+        Write-Kv "Version"         (Get-Prop $hz "version" "unknown") -ValueColor Cyan
+        Write-Kv "Role / Bus"      "$(Get-Prop $hz 'role' 'unknown') / $(Get-Prop $hz 'bus_backend' 'unknown')"
+        Write-Kv "Signing Ready"   ([string](Get-Prop $hz "signing_authority_ready" "false")) -ValueColor Green
+        Write-Kv "CVSS Threshold"  ([string](Get-Prop $hz "cvss_fail_threshold" "7.0"))
+    }
 
     Write-Section "0.2 OCI Distribution Spec v2 Root Probe"
-    $null = Invoke-LoggedHttpRequest -Uri "${RegistryUrl}/v2/" -ShowBodyPreview -MaxBodyLines 10
+    $v2Resp = Invoke-LoggedHttpRequest -Uri "${RegistryUrl}/v2/" -ShowBodyPreview:$RawJson -MaxBodyLines 10
+    if ($v2Resp.StatusCode -eq 200 -and $v2Resp.Body) {
+        $v2 = $v2Resp.Body | ConvertFrom-Json
+        Write-Kv "Proxy Cache"     (Get-Prop $v2 "harbor_proxy_cache" "n/a")
+        Write-Kv "Status"          (Get-Prop $v2 "status" "unknown") -ValueColor Green
+    }
 
     # --------------------------------------------------------------------------
     # STAGE 1: Uncached Container Pull-Through + 15-Second Timer Loop on HTTP 451
@@ -514,9 +538,33 @@ try {
 
     for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
         Write-Section "1.$attempt Requesting Manifest (Attempt $attempt of $MaxRetries)"
-        $resp = Invoke-LoggedHttpRequest -Uri $ManifestUrl -ShowBodyPreview -MaxBodyLines 14 -OutFile $probeFile
+        $resp = Invoke-LoggedHttpRequest -Uri $ManifestUrl -ShowBodyPreview:$RawJson -MaxBodyLines 14 -OutFile $probeFile
 
         if ($resp.StatusCode -eq 200) {
+            if ($resp.Body) {
+                try {
+                    $mfObj = $resp.Body | ConvertFrom-Json
+                    Write-Kv "Media Type"     (Get-Prop $mfObj "mediaType" "unknown")
+                    Write-Kv "Schema Version" ([string](Get-Prop $mfObj "schemaVersion" "n/a"))
+                    if ($mfObj.PSObject.Properties['manifests'] -and $mfObj.manifests) {
+                        $platList = @($mfObj.manifests | ForEach-Object {
+                            $os = if ($_.platform) { $_.platform.os } else { "?" }
+                            $arch = if ($_.platform) { $_.platform.architecture } else { "?" }
+                            $dg = if ($_.digest) { $_.digest.Substring(0, [Math]::Min(19, $_.digest.Length)) + "..." } else { "" }
+                            "${os}/${arch} (${dg})"
+                        })
+                        Write-Kv "Platforms" ($platList -join ", ") -ValueColor Cyan
+                    } elseif ($mfObj.PSObject.Properties['layers'] -and $mfObj.layers) {
+                        Write-Kv "Layers" "$(@($mfObj.layers).Count) layers" -ValueColor Cyan
+                    }
+                    if ($mfObj.PSObject.Properties['annotations'] -and $mfObj.annotations) {
+                        $vendor = Get-Prop $mfObj.annotations "org.opencontainers.image.vendor" ""
+                        $title  = Get-Prop $mfObj.annotations "org.opencontainers.image.title" ""
+                        $created = Get-Prop $mfObj.annotations "org.opencontainers.image.created" ""
+                        if ($vendor -or $title) { Write-Kv "Image Info" "$vendor / $title (created $created)" }
+                    }
+                } catch {}
+            }
             Write-Host "  [PASS] Artifact promoted and available (HTTP 200 OK)." -ForegroundColor Green
             $acquired = $true
             $Gates.ManifestPromoted = "PASS (HTTP 200)"
@@ -578,8 +626,8 @@ try {
     Write-Section "2.3 Discover Attached CycloneDX 1.6 Referrers (Tree View)"
     $null = Invoke-LoggedCli -Command "oras" -Arguments (@("discover") + $OrasVerboseArgs + @("--artifact-type", "application/vnd.cyclonedx+json", "--format", "tree", $OrasReferrerRef))
 
-    Write-Section "2.4 Discover Attached CycloneDX 1.6 Referrers (Machine-Readable JSON)"
-    $discoverJsonRes = Invoke-LoggedCli -Command "oras" -Arguments (@("discover") + $OrasCommonArgs + @("--artifact-type", "application/vnd.cyclonedx+json", "--format", "json", $OrasReferrerRef))
+    Write-Section "2.4 Discover Attached CycloneDX 1.6 Referrers (Parsed)"
+    $discoverJsonRes = Invoke-LoggedCli -Command "oras" -Arguments (@("discover") + $OrasCommonArgs + @("--artifact-type", "application/vnd.cyclonedx+json", "--format", "json", $OrasReferrerRef)) -QuietOutput:(-not $RawJson)
     $referrersObj = $discoverJsonRes.Output | ConvertFrom-Json
 
     $referrerList = @()
@@ -591,13 +639,18 @@ try {
         Write-Host "  [NOTE] 'oras discover' returned 0 referrers (oras v1.4+ requires Content-Type: application/vnd.oci.image.index.v1+json on /referrers/)." -ForegroundColor DarkYellow
         Write-Host "         Querying OCI 1.1 Referrers API directly and continuing with 'oras blob fetch'..." -ForegroundColor DarkYellow
         $referrersUrl = "${RegistryUrl}/v2/${Namespace}/${Repo}/referrers/${ManifestDigest}?artifactType=application/vnd.cyclonedx%2Bjson"
-        $refHttpResp = Invoke-LoggedHttpRequest -Uri $referrersUrl -ShowBodyPreview -MaxBodyLines 30
+        $refHttpResp = Invoke-LoggedHttpRequest -Uri $referrersUrl -ShowBodyPreview:$RawJson -MaxBodyLines 30
         if ($refHttpResp.StatusCode -eq 200 -and -not [string]::IsNullOrWhiteSpace($refHttpResp.Body)) {
             $refIndexObj = $refHttpResp.Body | ConvertFrom-Json
             if ($refIndexObj.PSObject.Properties['manifests'] -and $null -ne $refIndexObj.manifests) {
                 $referrerList = @($refIndexObj.manifests)
             }
         }
+    }
+
+    foreach ($refItem in $referrerList) {
+        $rType = if ($refItem.annotations) { Get-Prop $refItem.annotations "io.cyclonedx.type" "unknown" } else { "unknown" }
+        Write-Kv ("Referrer (" + $rType.ToUpperInvariant() + ")") "$($refItem.digest) ($($refItem.size) bytes | $($refItem.artifactType))" -ValueColor Cyan
     }
 
     $sbomDesc = $referrerList | Where-Object { $_.annotations.'io.cyclonedx.type' -eq 'sbom' } | Select-Object -First 1
@@ -663,7 +716,25 @@ try {
     $sbomBannerColor = if ($sbomCompCount -gt 0) { "Green" } else { "Yellow" }
     $sbomStatusTag = if ($sbomCompCount -gt 0) { "[PASS]" } else { "[WARN]" }
     Write-Host "  $sbomStatusTag SBOM Verified : $($sbomObj.bomFormat) $($sbomObj.specVersion) | SHA-256 OK | Components: $sbomCompCount" -ForegroundColor $sbomBannerColor
-    Write-JsonFilePreview -Label "SBOM JSON" -FilePath $SbomFile -MaxLines 30
+    $sbomProps = @{}
+    if ($sbomObj.metadata -and $sbomObj.metadata.properties) {
+        foreach ($prop in $sbomObj.metadata.properties) {
+            if ($prop.name) { $sbomProps[[string]$prop.name] = [string]$prop.value }
+        }
+    }
+    Write-Kv "SBOM PURL"        (Get-Prop $sbomObj.metadata.component "purl" "n/a")
+    Write-Kv "SBOM Scan Scope"  $(if ($sbomProps.ContainsKey("trusted-oss:scan-scope")) { $sbomProps["trusted-oss:scan-scope"] } else { "legacy" })
+    Write-Kv "SBOM Timestamp"   ([string](Get-Prop $sbomObj.metadata "timestamp" "n/a"))
+    Write-Kv "SBOM Components"  "$sbomCompCount" -ValueColor $sbomBannerColor
+    if ($sbomCompCount -gt 0) {
+        $maxShow = if ($Detailed) { $sbomCompCount } else { 10 }
+        $pkgStrings = @($sbomObj.components | Select-Object -First $maxShow | ForEach-Object { "$($_.name)@$($_.version)" })
+        $moreText = if ($sbomCompCount -gt $maxShow) { " ... (+$($sbomCompCount - $maxShow) more; pass -Detailed for full list)" } else { "" }
+        Write-Kv "Packages" (($pkgStrings -join ", ") + $moreText) -ValueColor Cyan
+    }
+    if ($RawJson) {
+        Write-JsonFilePreview -Label "SBOM JSON" -FilePath $SbomFile -MaxLines 0
+    }
 
     $cbomBannerColor = if ($certExpired -gt 0 -or $certWeakKeys -gt 0) {
         "Red"
@@ -718,7 +789,9 @@ try {
         } catch {}
     }
 
-    Write-JsonFilePreview -Label "CBOM JSON" -FilePath $CbomFile -MaxLines 30
+    if ($RawJson) {
+        Write-JsonFilePreview -Label "CBOM JSON" -FilePath $CbomFile -MaxLines 0
+    }
     $Gates.SbomVerified = if ($sbomCompCount -gt 0) {
         "PASS ($sbomCompCount components)"
     } else {
@@ -887,11 +960,20 @@ try {
     Write-Section "4.1 Live Vulnerability & Malware Posture (/catalog/vulnerabilities)"
     $vulnResp = Invoke-LoggedHttpRequest `
         -Uri "${RegistryUrl}/catalog/vulnerabilities?ecosystem=oci&components=${Repo}&verify_signatures=true" `
-        -ShowBodyPreview -MaxBodyLines 30
+        -ShowBodyPreview:$RawJson -MaxBodyLines 30
 
     $vulnClean = $false
     if ($vulnResp.StatusCode -eq 200) {
         $vulnObj = $vulnResp.Body | ConvertFrom-Json
+        if ($vulnObj.summary) {
+            Write-Kv "Catalog Summary" "total=$($vulnObj.summary.total) | clean=$($vulnObj.summary.clean) | vulnerable=$($vulnObj.summary.vulnerable) | quarantined=$($vulnObj.summary.quarantined)" -ValueColor Cyan
+        }
+        $shownComps = if ($Detailed) { @($vulnObj.components) } else { @($vulnObj.components | Select-Object -First 3) }
+        foreach ($c in $shownComps) {
+            $verShort = if ($c.version.Length -gt 24) { $c.version.Substring(0, 22) + "..." } else { $c.version }
+            $cColor = if ($c.vulnerability_status -eq "CLEAN") { "Green" } else { "Red" }
+            Write-Kv "Version [$verShort]" "ClamAV=$($c.clamav_status) | CVE=$($c.vulnerability_status) (maxCVSS=$($c.max_cvss)) | GPG=$($c.signature_valid) | PQC=$($c.pqc_signed) | scanned=$($c.last_scanned_at)" -ValueColor $cColor
+        }
         $comp = $vulnObj.components | Select-Object -First 1
         if ($null -ne $comp) {
             $clamOk = $comp.clamav_status -in @("CLEAN", "CLAMD_OK", "OK")
@@ -909,19 +991,37 @@ try {
     Write-Section "4.2 Active Security Advisories (/catalog/advisories)"
     $advResp = Invoke-LoggedHttpRequest `
         -Uri "${RegistryUrl}/catalog/advisories?ecosystem=oci&component=${Repo}" `
-        -ShowBodyPreview -MaxBodyLines 20
+        -ShowBodyPreview:$RawJson -MaxBodyLines 20
 
     if ($advResp.StatusCode -eq 200) {
         $advObj = $advResp.Body | ConvertFrom-Json
         $advCount = [int]$advObj.count
+        Write-Kv "Active Advisories" "$advCount (CVSS threshold=$($advObj.cvss_fail_threshold))" -ValueColor $(if ($advCount -eq 0) { "Green" } else { "Red" })
+        if ($advCount -gt 0 -and $advObj.advisories) {
+            foreach ($adv in $advObj.advisories) {
+                Write-Kv "Advisory" "[$($adv.severity)] $($adv.cve_id) — $($adv.component)@$($adv.version)" -ValueColor Red
+            }
+        }
         $Gates.AdvisoriesClean = if ($advCount -eq 0) { "PASS (0 active advisories)" } else { "FAIL ($advCount active advisories)" }
     }
 
     Write-Section "4.2b Catalog Cryptographic Risk Posture (/catalog/crypto-risk)"
     $cryptoResp = Invoke-LoggedHttpRequest `
         -Uri "${RegistryUrl}/catalog/crypto-risk?ecosystem=oci&components=${Repo}" `
-        -ShowBodyPreview -MaxBodyLines 30
-    if ($cryptoResp.StatusCode -eq 404) {
+        -ShowBodyPreview:$RawJson -MaxBodyLines 30
+    if ($cryptoResp.StatusCode -eq 200 -and $cryptoResp.Body) {
+        $crObj = $cryptoResp.Body | ConvertFrom-Json
+        Write-Kv "Matched Records" ([string](Get-Prop $crObj "count" "0")) -ValueColor Cyan
+        $crItems = if ($Detailed) { @($crObj.components) } else { @($crObj.components | Select-Object -First 3) }
+        foreach ($item in $crItems) {
+            $cp = $item.crypto_posture
+            if ($null -ne $cp) {
+                $verShort = if ($item.version.Length -gt 24) { $item.version.Substring(0, 22) + "..." } else { $item.version }
+                $rColor = if ($cp.risk_level -in @("HIGH", "CRITICAL")) { "Yellow" } elseif ($cp.risk_level -eq "NONE") { "Green" } else { "Cyan" }
+                Write-Kv "Crypto [$verShort]" "scope=$($cp.scan_scope) | risk=$($cp.risk_level) (active=$($cp.active_risk_count), passive=$($cp.passive_risk_count)) | certs=$($cp.cert_total) (expired=$($cp.cert_expired), sha1=$($cp.cert_sha1_roots)) | pqc=$($cp.pqc_adoption_status)" -ValueColor $rColor
+            }
+        }
+    } elseif ($cryptoResp.StatusCode -eq 404) {
         Write-Host "  [INFO] /catalog/crypto-risk returned HTTP 404 (registry instance predates Gatekeeper v2.0 CBOM risk API)." -ForegroundColor DarkYellow
     }
 
@@ -933,26 +1033,21 @@ try {
         $match = $provObj.records | Where-Object { $_.sha256 -eq $manifestHex } | Select-Object -Last 1
         if ($null -ne $match) {
             Write-Host "  [MATCHED PROVENANCE RECORD]" -ForegroundColor Green
-            if ($Detailed) {
+            $hmacVal = [string](Get-Prop $match "attestation_hmac" "")
+            $hmacDisplay = if ($Detailed -or $RawJson) { $hmacVal } elseif ($hmacVal) { $hmacVal.Substring(0, [Math]::Min(24, $hmacVal.Length)) + "..." } else { "n/a" }
+            Write-Kv "Timestamp"        ([string](Get-Prop $match "timestamp" "n/a"))
+            Write-Kv "Ecosystem"        ([string](Get-Prop $match "ecosystem" "n/a"))
+            Write-Kv "Artifact"         ([string](Get-Prop $match "artifact" "n/a"))
+            Write-Kv "SHA-256"          ([string](Get-Prop $match "sha256" "n/a"))
+            Write-Kv "ClamAV / CVE"     "$(Get-Prop $match 'clamav_status' 'n/a') | $(Get-Prop $match 'cve_status' 'n/a')" -ValueColor Green
+            Write-Kv "PQC Status"       ([string](Get-Prop $match "pqc_status" "n/a")) -ValueColor Cyan
+            Write-Kv "Signatures"       "$(Get-Prop $match 'signature_file' 'n/a'), $(Get-Prop $match 'signature_file_mldsa' 'n/a')"
+            Write-Kv "Attestation HMAC" $hmacDisplay -ValueColor DarkGray
+            if ($RawJson) {
                 $prettyProv = $match | ConvertTo-Json -Depth 10
                 foreach ($line in ($prettyProv -split "`r?`n")) {
                     Write-Host "             $line" -ForegroundColor Gray
                 }
-            } else {
-                $hmacVal = [string](Get-Prop $match "attestation_hmac" "")
-                $matchSummary = [PSCustomObject]@{
-                    timestamp        = Get-Prop $match "timestamp" "n/a"
-                    ecosystem        = Get-Prop $match "ecosystem" "n/a"
-                    artifact         = Get-Prop $match "artifact" "n/a"
-                    sha256           = Get-Prop $match "sha256" "n/a"
-                    clamav_status    = Get-Prop $match "clamav_status" "n/a"
-                    cve_status       = Get-Prop $match "cve_status" "n/a"
-                    max_cvss         = Get-Prop $match "max_cvss" "n/a"
-                    cbom_scan_status = Get-Prop $match "cbom_scan_status" "n/a"
-                    pqc_status       = Get-Prop $match "pqc_status" "n/a"
-                    attestation_hmac = if ($hmacVal) { $hmacVal.Substring(0, [Math]::Min(24, $hmacVal.Length)) + "..." } else { "n/a" }
-                }
-                $matchSummary | Format-List | Out-String | ForEach-Object { Write-Host $_ -ForegroundColor Gray }
             }
         } else {
             Write-Host "  [WARN] No provenance record matched sha256:$manifestHex in latest 500 entries." -ForegroundColor Yellow
