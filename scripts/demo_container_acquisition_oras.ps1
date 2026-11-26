@@ -776,8 +776,32 @@ try {
         $env:GNUPGHOME = $gpgHome
         try {
             $null = Invoke-LoggedCli -Command "gpg" -Arguments @("--batch", "--quiet", "--import", $GpgPubFile)
+            $fprLines = & gpg --batch --with-colons --fingerprint 2>$null
+            $gpgFpr = ($fprLines | Where-Object { $_ -match '^fpr:' } | Select-Object -First 1)
+            if ($gpgFpr) {
+                $gpgFpr = ($gpgFpr -split ':')[9]
+            }
+            if ($gpgFpr) {
+                "${gpgFpr}:6:" | & gpg --batch --quiet --import-ownertrust 2>$null
+                & gpg --batch --quiet --check-trustdb 2>$null
+                Write-Host "  [INFO] Imported GPG Public Key Fingerprint: $gpgFpr (trust: ultimate)" -ForegroundColor DarkGray
+            }
             foreach ($t in $sigTargets) {
-                $null = Invoke-LoggedCli -Command "gpg" -Arguments @("--batch", "--verify", "$($t.File).asc", $t.File)
+                $gpgRes = Invoke-LoggedCli -Command "gpg" -Arguments @("--batch", "--verify", "$($t.File).asc", $t.File) -AllowNonZeroExit
+                if ($gpgRes.ExitCode -ne 0 -and $ManifestDigest) {
+                    $origAscUrl = "$($t.BaseUrl)$($t.Suffix).asc"
+                    $altAscUrl = "${manifestBaseDirUrl}/${ManifestDigest}$($t.Suffix).asc"
+                    if ($altAscUrl -ne $origAscUrl) {
+                        Write-Host "  [WARN] $origAscUrl failed GPG verification against active key (e.g., rotated historical key); retrying with digest-pinned $altAscUrl for identical bytes." -ForegroundColor Yellow
+                        $altResp = Invoke-LoggedHttpRequest -Uri $altAscUrl -OutFile "$($t.File).asc"
+                        if ($altResp.StatusCode -eq 200) {
+                            $gpgRes = Invoke-LoggedCli -Command "gpg" -Arguments @("--batch", "--verify", "$($t.File).asc", $t.File) -AllowNonZeroExit
+                        }
+                    }
+                }
+                if ($gpgRes.ExitCode -ne 0) {
+                    throw "GPG signature verification failed for $($t.Name) (exit code $($gpgRes.ExitCode))."
+                }
             }
             $sigVerifiedParts += "GPG"
         } finally {
@@ -814,12 +838,15 @@ try {
         $manifestBaseDirUrl = $ManifestUrl.Substring(0, $ManifestUrl.LastIndexOf("/"))
         foreach ($t in $sigTargets) {
             $res = Invoke-LoggedCli -Command $pythonExe -Arguments @($PqcVerifyScript, $t.File, "$($t.File).mldsa65", $PqcPubFile) -AllowNonZeroExit
-            if ($res.ExitCode -ne 0 -and $t.Suffix -ne "") {
-                # Referrer blob may belong to the digest-named manifest entry if both tag and digest are cached
+            if ($res.ExitCode -ne 0 -and $ManifestDigest) {
+                $origPqcUrl = "$($t.BaseUrl)$($t.Suffix).mldsa65"
                 $altSigUrl = "${manifestBaseDirUrl}/${ManifestDigest}$($t.Suffix).mldsa65"
-                $altResp = Invoke-LoggedHttpRequest -Uri $altSigUrl -OutFile "$($t.File).mldsa65"
-                if ($altResp.StatusCode -eq 200) {
-                    $res = Invoke-LoggedCli -Command $pythonExe -Arguments @($PqcVerifyScript, $t.File, "$($t.File).mldsa65", $PqcPubFile) -AllowNonZeroExit
+                if ($altSigUrl -ne $origPqcUrl) {
+                    # Referrer blob or tag signature may belong to the digest-named manifest entry if both tag and digest are cached
+                    $altResp = Invoke-LoggedHttpRequest -Uri $altSigUrl -OutFile "$($t.File).mldsa65"
+                    if ($altResp.StatusCode -eq 200) {
+                        $res = Invoke-LoggedCli -Command $pythonExe -Arguments @($PqcVerifyScript, $t.File, "$($t.File).mldsa65", $PqcPubFile) -AllowNonZeroExit
+                    }
                 }
             }
             if ($res.ExitCode -eq 0) {
