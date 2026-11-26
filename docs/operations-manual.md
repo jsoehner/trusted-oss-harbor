@@ -422,11 +422,11 @@ Developers, security auditors, and CI/CD pipelines can use the standard CNCF **`
   - macOS / Linux Homebrew: `brew install oras`
   - Windows Winget: `winget install ORASProject.ORAS`
   - GitHub Actions: `uses: oras-project/setup-oras@<pinned-sha>` (see [`client-templates/github-actions-verify-component.yml`](../client-templates/github-actions-verify-component.yml))
-- **Backfill pre-`v1.6.0` cached OCI images (one-time after upgrading)**: If an OCI image was cached prior to `v1.6.0`, run `POST /catalog/backfill-boms?wait=true` once so Gatekeeper generates its dual-signed CycloneDX 1.6 SBOM/CBOM sidecars and populates OCI 1.1 Referrers:
+- **Backfill cached OCI images with deep-layer SBOM/CBOM inspection (one-time after upgrading)**: If OCI images were cached prior to deep-layer inspection (`scan_scope: legacy`), run `POST /catalog/backfill-boms?ecosystem=oci&force=true&wait=true` (supports `?ecosystem=oci|maven|pypi|all`) so Gatekeeper deep-scans Wolfi (`usr/lib/apk/db/installed` & `lib/apk/db/installed`) and Debian (`var/lib/dpkg/status`) layers in seconds, re-signs the CycloneDX 1.6 SBOM/CBOM sidecars, and populates OCI 1.1 Referrers without re-signing cached PyPI/Maven packages:
   ```bash
   curl -fsSL -X POST \
     -H "X-Gatekeeper-Token: ${GATEKEEPER_ADMIN_TOKEN}" \
-    "http://oss.jsigroup.local:8080/catalog/backfill-boms?wait=true"
+    "http://oss.jsigroup.local:8080/catalog/backfill-boms?ecosystem=oci&force=true&wait=true"
   ```
 
 #### Step 1 — Resolve the Immutable Digest & Pull the Signed Component Manifest with `oras`

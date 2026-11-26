@@ -458,25 +458,33 @@ For Windows operators (PowerShell 5.1 and PowerShell 7+), the repository include
 - **Auto-Derived `<repo>-cache` Namespace**: Automatically derives `-Namespace` from the leading repository segment plus `-cache` (e.g., `chainguard/jre:latest` $\rightarrow$ `chainguard-cache`), with optional explicit `-Namespace` override (e.g., `-Namespace "docker-cache"` for `apache/airflow:slim-latest-python3.12`).
 - **No-Parameter Usage Banner**: Running with no arguments echoes usage syntax and copy-pasteable examples to the console without making network calls.
 - **Collapsed Headers & `[DOWNLOAD]` Status**: Collapses HTTP response headers into a single status line (`HTTP 200 OK (cache: HIT | 1111 bytes | application/vnd.oci.image.index.v1+json)`) and logs a `[DOWNLOAD]` status line for every saved manifest, SBOM, CBOM, public key, and detached signature.
-- **On-Demand Verbosity (`-Detailed` & `-ShowHeaders`)**: Pass `-Detailed` for full untruncated JSON bodies (Manifest, Referrers, SBOM, CBOM, Vulnerabilities, Advisories, Provenance) and `-ShowHeaders` to expand all raw HTTP response headers plus `oras --debug` wire traces.
+- **Parsed `Key : Value` Summaries & Verbosity Controls (`-Detailed`, `-RawJson`, `-ShowHeaders`)**: Parses all JSON responses (`/healthz`, `/v2/`, manifest platforms, ORAS referrers, SBOM packages, CBOM risk posture, `/catalog/vulnerabilities`, `/catalog/advisories`, `/catalog/crypto-risk`, and `/audit/provenance`) into compact, color-coded `Key : Value` summaries by default. Pass `-Detailed` to expand the full SBOM package list and all catalog entries, `-RawJson` to also dump full raw JSON bodies, and `-ShowHeaders` to expand all raw HTTP response headers plus `oras --debug` wire traces.
 - **ANSI Color Transcript Logging (`-TranscriptPath`)**: Writes a UTF-8 log file containing embedded ANSI SGR color escape sequences (`\x1b[...m`) so colorized runs can be replayed via `Get-Content .\demo-detailed.log` or `less -R` (ignored by Git via `.gitignore`).
 
 ```powershell
 # Show usage & examples (no network calls)
 .\scripts\demo_container_acquisition_oras.ps1
 
-# Auto-derive namespace ('chainguard-cache') and run standard verification
+# Auto-derive namespace ('chainguard-cache') with compact parsed Key : Value summaries
 .\scripts\demo_container_acquisition_oras.ps1 "chainguard/jre:latest"
 
-# Full untruncated JSON bodies + ANSI-colored transcript log
+# Expand full SBOM package list + catalog entries and save an ANSI-colored transcript log
 .\scripts\demo_container_acquisition_oras.ps1 "chainguard/jre:latest" -Detailed -TranscriptPath ".\demo-detailed.log"
 
-# Expand all raw HTTP response headers + ORAS --debug wire trace
-.\scripts\demo_container_acquisition_oras.ps1 "chainguard/jre:latest" -Detailed -ShowHeaders
+# Include raw JSON bodies, all HTTP response headers, and ORAS --debug wire traces
+.\scripts\demo_container_acquisition_oras.ps1 "chainguard/jre:latest" -Detailed -RawJson -ShowHeaders
 
 # Explicit namespace override for Docker Hub org repos + keep downloaded proof files
 .\scripts\demo_container_acquisition_oras.ps1 "apache/airflow:slim-latest-python3.12" -Namespace "docker-cache" -KeepProofDir
 ```
+
+> [!TIP]
+> **Fast OCI-Only Deep-Layer Backfill:** If a previously cached OCI container still reports `0 components` or `scan_scope: legacy`, run an OCI-only forced backfill so Gatekeeper deep-scans Wolfi (`usr/lib/apk/db/installed` & `lib/apk/db/installed`) and Debian (`var/lib/dpkg/status`) layers in seconds without re-signing cached PyPI/Maven packages:
+> ```powershell
+> Invoke-RestMethod -Method Post `
+>   -Uri "http://oss.jsigroup.local:8080/catalog/backfill-boms?ecosystem=oci&force=true&wait=true" `
+>   -Headers @{ "X-Gatekeeper-Token" = $env:GATEKEEPER_ADMIN_TOKEN }
+> ```
 
 > [!NOTE]
 > **OCI 1.1 Referrers `Content-Type` Conformance (`oras` v1.4+):** `gatekeeper/app/main.py` (`get_oci_referrers`) serves `Content-Type: application/vnd.oci.image.index.v1+json` per the OCI Distribution Spec v1.1 so `oras discover` v1.4+ populates referrers natively. Against older deployed instances returning `application/json`, `scripts/demo_container_acquisition_oras.ps1` automatically logs a note, queries `/v2/{namespace}/{repo}/referrers/{digest}` directly, and continues with `oras blob fetch`.
