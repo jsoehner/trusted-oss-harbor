@@ -365,6 +365,7 @@ async def handle_engine_job(
             settings=settings,
             force=bool(payload.get("force", False)),
             deep_oci=bool(payload.get("deep_oci", True)),
+            ecosystems=_parse_ecosystem_filter(payload.get("ecosystem")),
         )
     raise ValueError(f"Unsupported engine job_type: {job_type}")
 
@@ -3162,6 +3163,7 @@ async def backfill_cached_boms(
     settings: Settings,
     force: bool = False,
     deep_oci: bool = True,
+    ecosystems: set[str] | None = None,
 ) -> dict[str, Any]:
     """Generate and dual-sign CycloneDX 1.6 SBOM/CBOM sidecars for existing cached artifacts."""
     scanned = 0
@@ -3170,23 +3172,25 @@ async def backfill_cached_boms(
     oci_deep_scanned = 0
     errors: list[str] = []
 
-    targets: list[tuple[str, str, Path]] = [
-        ("pypi", "", settings.trusted_pypi_dir),
-        ("maven", "", settings.trusted_maven_dir),
-    ]
-    seen_oci_roots: set[Path] = set()
-    oci_registry_root = settings.oss_data_root / "harbor" / "registry"
-    if oci_registry_root.is_dir():
-        for ns_dir in sorted(oci_registry_root.iterdir()):
-            if ns_dir.is_symlink() or not ns_dir.is_dir():
-                continue
-            resolved_ns = ns_dir.resolve()
-            seen_oci_roots.add(resolved_ns)
-            targets.append(("oci-harbor", ns_dir.name, ns_dir))
-    if settings.harbor_oci_cache_dir.is_dir():
-        resolved_cg = settings.harbor_oci_cache_dir.resolve()
-        if resolved_cg not in seen_oci_roots:
-            targets.append(("oci-harbor", "chainguard-cache", settings.harbor_oci_cache_dir))
+    targets: list[tuple[str, str, Path]] = []
+    if ecosystems is None or "pypi" in ecosystems:
+        targets.append(("pypi", "", settings.trusted_pypi_dir))
+    if ecosystems is None or "maven" in ecosystems:
+        targets.append(("maven", "", settings.trusted_maven_dir))
+    if ecosystems is None or "oci" in ecosystems:
+        seen_oci_roots: set[Path] = set()
+        oci_registry_root = settings.oss_data_root / "harbor" / "registry"
+        if oci_registry_root.is_dir():
+            for ns_dir in sorted(oci_registry_root.iterdir()):
+                if ns_dir.is_symlink() or not ns_dir.is_dir():
+                    continue
+                resolved_ns = ns_dir.resolve()
+                seen_oci_roots.add(resolved_ns)
+                targets.append(("oci-harbor", ns_dir.name, ns_dir))
+        if settings.harbor_oci_cache_dir.is_dir():
+            resolved_cg = settings.harbor_oci_cache_dir.resolve()
+            if resolved_cg not in seen_oci_roots:
+                targets.append(("oci-harbor", "chainguard-cache", settings.harbor_oci_cache_dir))
 
     skip_suffixes = (
         ".asc",
@@ -3278,6 +3282,7 @@ async def backfill_cached_boms(
         shutil.rmtree(staging_root, ignore_errors=True)
 
     return {
+        "ecosystem_filter": sorted(ecosystems) if ecosystems else ["all"],
         "scanned": scanned,
         "generated": generated,
         "skipped": skipped,
@@ -3390,17 +3395,31 @@ async def trigger_backfill_boms(
     force: bool = False,
     wait: bool = True,
     deep_oci: bool = True,
+    ecosystem: str | None = None,
 ) -> JSONResponse:
-    """Admin endpoint to backfill signed SBOM/CBOM sidecars for all previously cached artifacts."""
+    """Admin endpoint to backfill signed SBOM/CBOM sidecars for previously cached artifacts.
+
+    Optional ``ecosystem`` query filter accepts ``oci``, ``maven``, ``pypi``, comma-separated
+    combinations (e.g., ``oci,pypi``), or ``all`` (default).
+    """
     require_admin_token(x_gatekeeper_token, settings)
+    eco_filter = _parse_ecosystem_filter(ecosystem)
     if not wait or settings.gatekeeper_role == "frontend":
         bus = get_job_bus(request.app, settings)
-        job = await bus.enqueue("backfill_boms", {"force": force, "deep_oci": deep_oci})
+        job = await bus.enqueue(
+            "backfill_boms",
+            {"force": force, "deep_oci": deep_oci, "ecosystem": ecosystem},
+        )
         return JSONResponse(
             status_code=202,
             content=job,
         )
-    summary = await backfill_cached_boms(settings=settings, force=force, deep_oci=deep_oci)
+    summary = await backfill_cached_boms(
+        settings=settings,
+        force=force,
+        deep_oci=deep_oci,
+        ecosystems=eco_filter,
+    )
     return JSONResponse(content=summary)
 
 

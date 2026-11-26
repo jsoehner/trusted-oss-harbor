@@ -722,14 +722,14 @@ try {
     $Gates.SbomVerified = if ($sbomCompCount -gt 0) {
         "PASS ($sbomCompCount components)"
     } else {
-        "WARN (0 components — legacy/uninspected layers; run POST /catalog/backfill-boms?force=true)"
+        "WARN (0 components — legacy/uninspected layers; run POST /catalog/backfill-boms?ecosystem=oci&force=true)"
     }
     if ($certExpired -gt 0 -or $certWeakKeys -gt 0) {
         $Gates.CbomVerified = "FAIL ($cbomStatus | risk=$riskLevel | expired=$certExpired | weak_keys=$certWeakKeys)"
     } elseif ($cbomStatus -eq "MANIFEST_ONLY_UNINSPECTED") {
         $Gates.CbomVerified = "WARN ($cbomStatus — layers not inspected)"
     } elseif ($isLegacyInertCbom) {
-        $Gates.CbomVerified = "WARN (VERIFIED_INERT — legacy manifest-only CBOM; run POST /catalog/backfill-boms?force=true)"
+        $Gates.CbomVerified = "WARN (VERIFIED_INERT — legacy manifest-only CBOM; run POST /catalog/backfill-boms?ecosystem=oci&force=true)"
     } elseif ($activeRiskCount -gt 0 -or $certSha1Roots -gt 0) {
         $Gates.CbomVerified = "WARN ($cbomStatus | risk=$riskLevel | active=$activeRiskCount passive=$passiveRiskCount sha1_roots=$certSha1Roots | $pqcAdoption)"
     } else {

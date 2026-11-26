@@ -791,3 +791,71 @@ def test_backfill_cached_boms_deep_oci_all_namespaces_and_dedup(tmp_path: Path, 
         for bom_p in (sbom_p, cbom_p):
             assert verify_artifact_signature(bom_p, bom_p.with_name(f"{bom_p.name}.asc"), settings.gnupghome)
             assert verify_artifact_mldsa65(bom_p, bom_p.with_name(f"{bom_p.name}.mldsa65"), settings.mldsa_public_key_path)
+
+
+def test_backfill_cached_boms_ecosystem_filter(tmp_path: Path, monkeypatch):
+    """Verify ecosystem filter on backfill_cached_boms and POST /catalog/backfill-boms."""
+    import asyncio
+    import app.main as main_mod
+
+    settings = Settings(
+        OSS_DATA_ROOT=tmp_path,
+        CLAMAV_REQUIRED=False,
+        CVE_SCANNER_MODE="none",
+        GATEKEEPER_ADMIN_TOKEN="test-secret-token-1234",
+        PQC_SIGNING_ENABLED=False,
+        BOM_GENERATION_ENABLED=True,
+        OCI_BOM_DEEP_SCAN_ENABLED=False,
+        CVE_RESCAN_INTERVAL_SECONDS=0,
+    )
+
+    # Seed one promoted artifact in each ecosystem (pypi, maven, oci)
+    pypi_file = settings.trusted_pypi_dir / "demo" / "demo-1.0.0-py3-none-any.whl"
+    pypi_file.parent.mkdir(parents=True, exist_ok=True)
+    pypi_file.write_bytes(b"pypi-bytes")
+    pypi_file.with_name(f"{pypi_file.name}.asc").write_text("sig", encoding="utf-8")
+
+    maven_file = settings.trusted_maven_dir / "org" / "demo" / "lib" / "1.0" / "lib-1.0.jar"
+    maven_file.parent.mkdir(parents=True, exist_ok=True)
+    maven_file.write_bytes(b"maven-bytes")
+    maven_file.with_name(f"{maven_file.name}.asc").write_text("sig", encoding="utf-8")
+
+    oci_file = settings.harbor_oci_cache_dir / "chainguard" / "jre" / "manifests" / "latest"
+    oci_file.parent.mkdir(parents=True, exist_ok=True)
+    oci_file.write_bytes(b'{"schemaVersion":2,"manifests":[]}')
+    oci_file.with_name(f"{oci_file.name}.asc").write_text("sig", encoding="utf-8")
+
+    monkeypatch.setattr(main_mod, "sign_artifact_detached_gpg", lambda **kw: kw["artifact_path"].with_name(f"{kw['artifact_path'].name}.asc").write_text("sig", encoding="utf-8"))
+
+    # 1. OCI-only filter skips PyPI and Maven
+    oci_summary = asyncio.run(
+        main_mod.backfill_cached_boms(settings=settings, force=True, deep_oci=False, ecosystems={"oci"})
+    )
+    assert oci_summary["ecosystem_filter"] == ["oci"]
+    assert oci_summary["scanned"] == 1
+    assert oci_summary["generated"] == 1
+    assert oci_file.with_name("latest.sbom.cdx.json").is_file()
+    assert not pypi_file.with_name(f"{pypi_file.name}.sbom.cdx.json").is_file()
+    assert not maven_file.with_name(f"{maven_file.name}.sbom.cdx.json").is_file()
+
+    # 2. HTTP endpoint rejects invalid ecosystem filter with 400
+    app.state.settings = settings
+    client = TestClient(app)
+    bad_resp = client.post(
+        "/catalog/backfill-boms?ecosystem=invalid&force=true&wait=true",
+        headers={"X-Gatekeeper-Token": "test-secret-token-1234"},
+    )
+    assert bad_resp.status_code == 400
+
+    # 3. HTTP endpoint with ecosystem=pypi only processes PyPI
+    pypi_resp = client.post(
+        "/catalog/backfill-boms?ecosystem=pypi&force=true&wait=true",
+        headers={"X-Gatekeeper-Token": "test-secret-token-1234"},
+    )
+    assert pypi_resp.status_code == 200
+    pdata = pypi_resp.json()
+    assert pdata["ecosystem_filter"] == ["pypi"]
+    assert pdata["scanned"] == 1
+    assert pdata["generated"] == 1
+    assert pypi_file.with_name(f"{pypi_file.name}.sbom.cdx.json").is_file()
+    assert not maven_file.with_name(f"{maven_file.name}.sbom.cdx.json").is_file()
