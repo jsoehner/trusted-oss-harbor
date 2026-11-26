@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import io
 import json
 import re
 import tarfile
@@ -15,6 +16,14 @@ from urllib.parse import unquote
 
 from defusedxml import ElementTree as ET
 
+from app.crypto_risk import (
+    build_risk_assessment,
+    evaluate_certificates,
+    inspect_java_security,
+    inspect_openssl_cnf,
+    parse_apk_installed_packages,
+    parse_cert_store_bytes,
+)
 from app.storage import (
     ArtifactDigests,
     SAFE_SEGMENT_RE,
@@ -24,20 +33,32 @@ from app.storage import (
 )
 
 BOM_SCANNER_NAME = "trusted-oss-gatekeeper-bom"
-BOM_SCANNER_VERSION = "1.0.0"
+BOM_SCANNER_VERSION = "2.0.0"
 
 # Limits to keep per-artifact inspection fast and memory-bounded
 MAX_ARCHIVE_MEMBERS = 250
-MAX_MEMBER_BYTES = 512 * 1024  # 512 KiB per member
+MAX_OCI_LAYER_FILES = 2500
+MAX_MEMBER_BYTES = 512 * 1024  # 512 KiB per regular source/text member
+MAX_BINARY_MEMBER_BYTES = 8 * 1024 * 1024  # 8 MiB per native shared library / cert store
+MAX_JMOD_BYTES = 80 * 1024 * 1024  # 80 MiB streaming cap for OpenJDK lib/modules
 
-# Scannable text/source/bytecode/binary extensions inside wheels, sdists, and JARs
+# Scannable text/source/bytecode/binary extensions inside wheels, sdists, JARs, and OCI layers
 TEXT_SCAN_EXTS = (
     ".py", ".pyi", ".java", ".kt", ".kts", ".scala", ".groovy",
     ".js", ".ts", ".mjs", ".cjs", ".go", ".rs", ".c", ".cc", ".cpp", ".h", ".hpp",
-    ".rb", ".php", ".cs", ".swift", ".pem", ".crt", ".cer", ".conf", ".cfg",
-    ".ini", ".properties", ".xml", ".json", ".yaml", ".yml", ".toml",
+    ".rb", ".php", ".cs", ".swift", ".pem", ".crt", ".cer", ".conf", ".cfg", ".cnf",
+    ".ini", ".properties", ".security", ".xml", ".json", ".yaml", ".yml", ".toml",
+)
+APP_CODE_EXTS = (
+    ".py", ".pyi", ".java", ".kt", ".kts", ".scala", ".groovy",
+    ".js", ".ts", ".mjs", ".cjs", ".go", ".rs", ".c", ".cc", ".cpp", ".h", ".hpp",
+    ".rb", ".php", ".cs", ".swift", ".class",
 )
 BINARY_SCAN_EXTS = (".class", ".so", ".dylib", ".dll", ".pyd")
+CERT_STORE_EXTS = (".pem", ".crt", ".cer", ".der", ".jks")
+CERT_STORE_FILENAMES = ("cacerts", "ca-certificates.crt", "cert.pem", "cacert.pem")
+
+_VERSIONED_SO_RE = re.compile(r"\.so(?:\.\d+)+$")
 
 # Curated high-signal cryptographic patterns (aligned with jsi-bom-actions/scripts/scan_crypto_ast.py)
 CRYPTO_RULES: list[dict[str, str]] = [
@@ -242,6 +263,34 @@ _COMPILED_RULES = [
     (re.compile(rule["pattern"]), rule) for rule in CRYPTO_RULES
 ]
 
+# Fast byte-token rules for streaming large runtime archives (e.g., OpenJDK lib/modules)
+_JMOD_TOKEN_RULES: tuple[tuple[bytes, str], ...] = (
+    (b"ML-KEM-768", "ML-KEM-768"),
+    (b"ML-KEM-1024", "ML-KEM-1024"),
+    (b"ML-KEM-512", "ML-KEM-512"),
+    (b"ML-KEM", "ML-KEM-768"),
+    (b"ML-DSA-65", "ML-DSA-65"),
+    (b"ML-DSA-87", "ML-DSA-87"),
+    (b"ML-DSA-44", "ML-DSA-44"),
+    (b"ML-DSA", "ML-DSA-65"),
+    (b"X25519", "ECDH-X25519"),
+    (b"Ed25519", "Ed25519"),
+    (b"ECDSA", "ECDSA"),
+    (b"SHA256withRSA", "RSA"),
+    (b"AES/GCM", "AES-256-GCM"),
+    (b"ChaCha20-Poly1305", "ChaCha20-Poly1305"),
+    (b"SHA-256", "SHA-256"),
+    (b"SHA-384", "SHA-384"),
+    (b"SHA-512", "SHA-512"),
+    (b"SHA-1", "SHA-1"),
+    (b"MD5", "MD5"),
+    (b"DESede", "Legacy-Weak-Cipher"),
+    (b"RC4", "Legacy-Weak-Cipher"),
+    (b"TLSv1.3", "TLS"),
+)
+
+_RULE_BY_NAME: dict[str, dict[str, str]] = {r["name"]: r for r in CRYPTO_RULES}
+
 
 def build_canonical_purl(
     ecosystem: str,
@@ -249,7 +298,7 @@ def build_canonical_purl(
     pkg_version: str,
     artifact_rel_path: str = "",
 ) -> str:
-    """Build a canonical Package URL (purl) for Maven, PyPI, or OCI artifacts."""
+    """Build a canonical Package URL (purl) for Maven, PyPI, OCI, or APK artifacts."""
     eco = ecosystem.lower()
     ver_suffix = f"@{pkg_version}" if pkg_version and pkg_version != "unknown" else ""
     if eco == "pypi":
@@ -260,6 +309,8 @@ def build_canonical_purl(
             group_id, artifact_id = pkg_name.split(":", 1)
             return f"pkg:maven/{group_id}/{artifact_id}{ver_suffix}"
         return f"pkg:maven/{pkg_name}{ver_suffix}"
+    if eco == "apk":
+        return f"pkg:apk/wolfi/{pkg_name}{ver_suffix}"
     if eco.startswith("oci"):
         clean = artifact_rel_path.strip("/")
         return f"pkg:oci/{clean}{ver_suffix}"
@@ -291,18 +342,67 @@ def parse_purl(purl: str) -> dict[str, str]:
     }
 
 
-def _scan_text_for_crypto(text: str, location: str, found: dict[str, dict[str, Any]]) -> None:
+def _classify_member_origin(member_path: str, is_binary: bool) -> str:
+    """Classify scanned file as application-code, configuration, or compiled-runtime."""
+    lower = member_path.lower()
+    base = Path(lower).name
+    if base in ("openssl.cnf", "java.security") or lower.endswith((".cnf", ".security")):
+        return "configuration"
+    if (
+        is_binary
+        and not lower.endswith(".class")
+        and (".so" in base or base.endswith((".dylib", ".dll", ".pyd")) or lower.endswith("/modules"))
+    ):
+        return "compiled-runtime"
+    if "site-packages/" in lower or lower.endswith(APP_CODE_EXTS):
+        return "application-code"
+    if lower.endswith((".pem", ".crt", ".cer", ".der", ".jks")) or base in CERT_STORE_FILENAMES:
+        return "configuration"
+    return "compiled-runtime" if is_binary else "application-code"
+
+
+def _is_scannable_binary(member_lower: str) -> bool:
+    return member_lower.endswith(BINARY_SCAN_EXTS) or bool(_VERSIONED_SO_RE.search(member_lower))
+
+
+def _is_cert_store_member(member_lower: str) -> bool:
+    base = Path(member_lower).name
+    return member_lower.endswith(CERT_STORE_EXTS) or base in CERT_STORE_FILENAMES
+
+
+def _record_rule_finding(
+    found: dict[str, dict[str, Any]],
+    rule: dict[str, str],
+    location: str,
+    origin: str,
+    primitives_by_origin: dict[str, set[str]],
+) -> None:
+    key = rule["name"]
+    primitives_by_origin.setdefault(origin, set()).add(key)
+    if key not in found:
+        found[key] = {
+            "rule": rule,
+            "locations": [location],
+            "origins": {origin},
+        }
+    else:
+        found[key]["origins"].add(origin)
+        if len(found[key]["locations"]) < 5 and location not in found[key]["locations"]:
+            found[key]["locations"].append(location)
+
+
+def _scan_text_for_crypto(
+    text: str,
+    location: str,
+    found: dict[str, dict[str, Any]],
+    origin: str = "application-code",
+    primitives_by_origin: dict[str, set[str]] | None = None,
+) -> None:
     """Run compiled cryptographic regex rules over text and accumulate unique findings."""
+    prim_map = primitives_by_origin if primitives_by_origin is not None else {}
     for regex, rule in _COMPILED_RULES:
         if regex.search(text):
-            key = rule["name"]
-            if key not in found:
-                found[key] = {
-                    "rule": rule,
-                    "locations": [location],
-                }
-            elif len(found[key]["locations"]) < 5 and location not in found[key]["locations"]:
-                found[key]["locations"].append(location)
+            _record_rule_finding(found, rule, location, origin, prim_map)
 
 
 def _extract_printable_ascii(data: bytes) -> str:
@@ -359,69 +459,22 @@ def _extract_sbom_dependencies_from_archive(file_path: Path) -> list[dict[str, s
     return deps
 
 
-def inspect_artifact_crypto(file_path: Path) -> list[dict[str, Any]]:
-    """Inspect an artifact (wheel, sdist, JAR, OCI manifest, or generic file) for cryptographic assets."""
-    found: dict[str, dict[str, Any]] = {}
-    name_lower = file_path.name.lower()
-
-    if name_lower.endswith((".whl", ".jar", ".zip")) and zipfile.is_zipfile(file_path):
-        with zipfile.ZipFile(file_path, "r") as zf:
-            for info in zf.infolist()[:MAX_ARCHIVE_MEMBERS]:
-                if info.is_dir():
-                    continue
-                member_lower = info.filename.lower()
-                if member_lower.endswith(TEXT_SCAN_EXTS):
-                    with zf.open(info, "r") as stream:
-                        data = stream.read(MAX_MEMBER_BYTES)
-                    _scan_text_for_crypto(
-                        data.decode("utf-8", errors="ignore"), info.filename, found
-                    )
-                elif member_lower.endswith(BINARY_SCAN_EXTS):
-                    with zf.open(info, "r") as stream:
-                        data = stream.read(MAX_MEMBER_BYTES)
-                    _scan_text_for_crypto(
-                        _extract_printable_ascii(data), info.filename, found
-                    )
-    elif name_lower.endswith((".tar.gz", ".tgz")):
-        try:
-            with tarfile.open(file_path, "r:gz") as tf:
-                count = 0
-                for member in tf.getmembers():
-                    if count >= MAX_ARCHIVE_MEMBERS:
-                        break
-                    if not member.isfile():
-                        continue
-                    count += 1
-                    member_lower = member.name.lower()
-                    if member_lower.endswith(TEXT_SCAN_EXTS) or member_lower.endswith(BINARY_SCAN_EXTS):
-                        extracted = tf.extractfile(member)
-                        if extracted is None:
-                            continue
-                        data = extracted.read(MAX_MEMBER_BYTES)
-                        text = (
-                            data.decode("utf-8", errors="ignore")
-                            if member_lower.endswith(TEXT_SCAN_EXTS)
-                            else _extract_printable_ascii(data)
-                        )
-                        _scan_text_for_crypto(text, member.name, found)
-        except tarfile.TarError:
-            pass
-    else:
-        data = file_path.read_bytes()[:MAX_MEMBER_BYTES]
-        _scan_text_for_crypto(data.decode("utf-8", errors="ignore"), file_path.name, found)
-
+def _build_crypto_components(
+    found: dict[str, dict[str, Any]],
+    cert_summary: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Build CycloneDX 1.6 cryptographic-asset component entries for primitives and flagged certs."""
     components: list[dict[str, Any]] = []
     for key, entry in sorted(found.items()):
         rule = entry["rule"]
         asset_type = rule["asset_type"]
         crypto_props: dict[str, Any] = {"assetType": asset_type}
         if asset_type == "algorithm":
-            algo_props: dict[str, Any] = {
+            crypto_props["algorithmProperties"] = {
                 "name": rule["name"],
                 "primitive": rule["primitive"],
                 "parameterSetIdentifier": rule["param"],
             }
-            crypto_props["algorithmProperties"] = algo_props
             if rule.get("oid"):
                 crypto_props["oid"] = rule["oid"]
         elif asset_type == "protocol":
@@ -434,20 +487,395 @@ def inspect_artifact_crypto(file_path: Path) -> list[dict[str, Any]]:
                 "certificateFormat": "X.509",
             }
 
-        components.append(
-            {
-                "type": "cryptographic-asset",
-                "bom-ref": f"crypto:{key.lower()}",
-                "name": rule["name"],
-                "cryptoProperties": crypto_props,
-                "evidence": {
-                    "occurrences": [
-                        {"location": loc} for loc in entry["locations"]
-                    ]
-                },
-            }
-        )
+        origins = sorted(entry.get("origins", ()))
+        comp_props = [{"name": "trusted-oss:origin", "value": ",".join(origins)}] if origins else []
+        if asset_type == "certificate" and cert_summary.get("total_unique", 0) > 0:
+            comp_props.extend(
+                [
+                    {"name": "trusted-oss:cert-total", "value": str(cert_summary["total_unique"])},
+                    {"name": "trusted-oss:cert-expired", "value": str(cert_summary["expired_count"])},
+                    {"name": "trusted-oss:cert-sha1-roots", "value": str(cert_summary["sha1_root_count"])},
+                ]
+            )
+
+        comp: dict[str, Any] = {
+            "type": "cryptographic-asset",
+            "bom-ref": f"crypto:{key.lower()}",
+            "name": rule["name"],
+            "cryptoProperties": crypto_props,
+            "evidence": {
+                "occurrences": [{"location": loc} for loc in entry["locations"]]
+            },
+        }
+        if comp_props:
+            comp["properties"] = comp_props
+        components.append(comp)
+
+    # Emit concrete certificate findings so downstream auditors see exact expired/SHA-1 subjects
+    flagged_groups = (
+        ("expired", "ACTIVE_EXPIRED"),
+        ("not_yet_valid", "ACTIVE_NOT_YET_VALID"),
+        ("weak_sig_non_roots", "ACTIVE_WEAK_SIG_CHAIN"),
+        ("weak_keys", "ACTIVE_WEAK_KEY"),
+        ("non_ca_in_truststore", "ACTIVE_NON_CA_TRUSTSTORE"),
+        ("sha1_roots", "PASSIVE_SHA1_ROOT_CA"),
+    )
+    seen_cert_refs: set[str] = set()
+    for group_key, risk_tag in flagged_groups:
+        for cert in cert_summary.get(group_key, [])[:10]:
+            bom_ref = f"crypto:cert:{cert['fp']}:{risk_tag.lower()}"
+            if bom_ref in seen_cert_refs:
+                continue
+            seen_cert_refs.add(bom_ref)
+            components.append(
+                {
+                    "type": "cryptographic-asset",
+                    "bom-ref": bom_ref,
+                    "name": f"X.509:{cert['subject'][:80]}",
+                    "cryptoProperties": {
+                        "assetType": "certificate",
+                        "certificateProperties": {
+                            "subjectName": cert["subject"],
+                            "issuerName": cert["issuer"],
+                            "notValidBefore": cert["not_before"],
+                            "notValidAfter": cert["not_after"],
+                            "certificateFormat": "X.509",
+                        },
+                    },
+                    "evidence": {"occurrences": [{"location": cert["location"]}]},
+                    "properties": [
+                        {"name": "trusted-oss:cert-risk", "value": risk_tag},
+                        {"name": "trusted-oss:cert-sig-hash", "value": cert["sig_hash"]},
+                        {"name": "trusted-oss:cert-key-type", "value": cert["key_type"]},
+                        {"name": "trusted-oss:cert-not-after", "value": cert["not_after"]},
+                    ],
+                }
+            )
     return components
+
+
+def _inspect_archive_details(
+    file_path: Path,
+    now: datetime.datetime | None = None,
+) -> dict[str, Any]:
+    """Inspect a non-OCI artifact (wheel, sdist, JAR, or file) for crypto primitives and certs."""
+    found: dict[str, dict[str, Any]] = {}
+    primitives_by_origin: dict[str, set[str]] = {}
+    certs_by_fp: dict[str, dict[str, Any]] = {}
+    openssl_findings: list[dict[str, Any]] = []
+    java_findings: list[dict[str, Any]] = []
+    name_lower = file_path.name.lower()
+    scan_scope = "file-direct"
+
+    def _process_member(member_name: str, data: bytes) -> None:
+        member_lower = member_name.lower()
+        base = Path(member_lower).name
+        if _is_cert_store_member(member_lower):
+            fmt, parsed_certs = parse_cert_store_bytes(data, member_name)
+            for cert in parsed_certs:
+                certs_by_fp.setdefault(cert["fp"], cert)
+            if parsed_certs and "X.509-Certificate" in _RULE_BY_NAME:
+                _record_rule_finding(
+                    found,
+                    _RULE_BY_NAME["X.509-Certificate"],
+                    member_name,
+                    "configuration",
+                    primitives_by_origin,
+                )
+            if fmt != "UNKNOWN":
+                return
+
+        if base == "openssl.cnf":
+            text = data.decode("utf-8", errors="ignore")
+            openssl_findings.append(inspect_openssl_cnf(text, member_name))
+            _scan_text_for_crypto(text, member_name, found, "configuration", primitives_by_origin)
+        elif base == "java.security":
+            text = data.decode("utf-8", errors="ignore")
+            java_findings.append(inspect_java_security(text, member_name))
+            _scan_text_for_crypto(text, member_name, found, "configuration", primitives_by_origin)
+        elif member_lower.endswith(TEXT_SCAN_EXTS):
+            origin = _classify_member_origin(member_name, is_binary=False)
+            _scan_text_for_crypto(
+                data.decode("utf-8", errors="ignore"),
+                member_name,
+                found,
+                origin,
+                primitives_by_origin,
+            )
+        elif _is_scannable_binary(member_lower):
+            origin = _classify_member_origin(member_name, is_binary=True)
+            _scan_text_for_crypto(
+                _extract_printable_ascii(data),
+                member_name,
+                found,
+                origin,
+                primitives_by_origin,
+            )
+
+    if name_lower.endswith((".whl", ".jar", ".zip")) and zipfile.is_zipfile(file_path):
+        scan_scope = "archive-deep"
+        with zipfile.ZipFile(file_path, "r") as zf:
+            for info in zf.infolist()[:MAX_ARCHIVE_MEMBERS]:
+                if info.is_dir():
+                    continue
+                member_lower = info.filename.lower()
+                if member_lower.endswith(TEXT_SCAN_EXTS) or _is_scannable_binary(member_lower) or _is_cert_store_member(member_lower):
+                    cap = MAX_BINARY_MEMBER_BYTES if (_is_scannable_binary(member_lower) or _is_cert_store_member(member_lower)) else MAX_MEMBER_BYTES
+                    with zf.open(info, "r") as stream:
+                        data = stream.read(cap)
+                    _process_member(info.filename, data)
+    elif name_lower.endswith((".tar.gz", ".tgz")):
+        scan_scope = "archive-deep"
+        try:
+            with tarfile.open(file_path, "r:gz") as tf:
+                count = 0
+                for member in tf.getmembers():
+                    if count >= MAX_ARCHIVE_MEMBERS:
+                        break
+                    if not member.isfile():
+                        continue
+                    count += 1
+                    member_lower = member.name.lower()
+                    if member_lower.endswith(TEXT_SCAN_EXTS) or _is_scannable_binary(member_lower) or _is_cert_store_member(member_lower):
+                        extracted = tf.extractfile(member)
+                        if extracted is None:
+                            continue
+                        cap = MAX_BINARY_MEMBER_BYTES if (_is_scannable_binary(member_lower) or _is_cert_store_member(member_lower)) else MAX_MEMBER_BYTES
+                        _process_member(member.name, extracted.read(cap))
+        except tarfile.TarError:
+            pass
+    else:
+        data = file_path.read_bytes()[:MAX_MEMBER_BYTES]
+        if _is_cert_store_member(name_lower):
+            _process_member(file_path.name, data)
+        else:
+            origin = "application-code" if name_lower.endswith(APP_CODE_EXTS) else "configuration"
+            _scan_text_for_crypto(
+                data.decode("utf-8", errors="ignore"),
+                file_path.name,
+                found,
+                origin,
+                primitives_by_origin,
+            )
+
+    cert_summary = evaluate_certificates(certs_by_fp, now=now)
+    components = _build_crypto_components(found, cert_summary)
+    return {
+        "scan_scope": scan_scope,
+        "components": components,
+        "primitives_by_origin": primitives_by_origin,
+        "cert_summary": cert_summary,
+        "openssl_findings": openssl_findings,
+        "java_findings": java_findings,
+    }
+
+
+def inspect_artifact_crypto(file_path: Path) -> list[dict[str, Any]]:
+    """Inspect an artifact (wheel, sdist, JAR, or generic file) for cryptographic assets."""
+    return _inspect_archive_details(file_path)["components"]
+
+
+def _scan_streaming_jmod(
+    stream: io.BufferedReader | Any,
+    location: str,
+    found: dict[str, dict[str, Any]],
+    primitives_by_origin: dict[str, set[str]],
+) -> None:
+    """Scan large Java runtime module image (lib/modules) in bounded streaming chunks."""
+    chunk_size = 2 * 1024 * 1024
+    read_total = 0
+    tail = b""
+    matched_rules: set[str] = set()
+    while read_total < MAX_JMOD_BYTES:
+        chunk = stream.read(chunk_size)
+        if not chunk:
+            break
+        read_total += len(chunk)
+        buf = tail + chunk
+        for token, rule_name in _JMOD_TOKEN_RULES:
+            if rule_name in matched_rules:
+                continue
+            if token in buf and rule_name in _RULE_BY_NAME:
+                matched_rules.add(rule_name)
+                _record_rule_finding(
+                    found,
+                    _RULE_BY_NAME[rule_name],
+                    location,
+                    "compiled-runtime",
+                    primitives_by_origin,
+                )
+        tail = buf[-64:]
+
+
+def inspect_oci_layers(
+    layer_paths: list[Path],
+    now: datetime.datetime | None = None,
+) -> dict[str, Any]:
+    """Inspect downloaded OCI container layer tarballs in memory without unsafe disk extraction."""
+    found: dict[str, dict[str, Any]] = {}
+    primitives_by_origin: dict[str, set[str]] = {}
+    cert_blobs: dict[str, bytes] = {}
+    openssl_configs: dict[str, str] = {}
+    java_sec_configs: dict[str, str] = {}
+    apk_db_text = ""
+
+    scanned_files = 0
+    for layer_path in layer_paths:
+        if not layer_path.is_file():
+            continue
+        try:
+            with tarfile.open(layer_path, "r:*") as tf:
+                for member in tf:
+                    if scanned_files >= MAX_OCI_LAYER_FILES:
+                        break
+                    rel = member.name.lstrip("./")
+                    if not rel or ".." in Path(rel).parts:
+                        continue
+                    base = Path(rel).name
+                    if base == ".wh..wh..opq":
+                        parent_prefix = rel[: -len(base)]
+                        for store_map in (cert_blobs, openssl_configs, java_sec_configs):
+                            for k in [p for p in store_map if p.startswith(parent_prefix)]:
+                                store_map.pop(k, None)
+                        continue
+                    if base.startswith(".wh."):
+                        target_rel = str(Path(rel).with_name(base[4:]))
+                        for store_map in (cert_blobs, openssl_configs, java_sec_configs):
+                            store_map.pop(target_rel, None)
+                            for k in [p for p in store_map if p.startswith(f"{target_rel}/")]:
+                                store_map.pop(k, None)
+                        continue
+
+                    if not member.isfile():
+                        continue
+
+                    rel_lower = rel.lower()
+                    base_lower = base.lower()
+                    is_apk_db = rel_lower == "lib/apk/db/installed"
+                    is_jmod = base_lower == "modules" and "/jvm/" in f"/{rel_lower}"
+                    is_cert = _is_cert_store_member(rel_lower)
+                    is_text = rel_lower.endswith(TEXT_SCAN_EXTS)
+                    is_bin = _is_scannable_binary(rel_lower)
+                    is_jar = rel_lower.endswith(".jar")
+
+                    if not (is_apk_db or is_jmod or is_cert or is_text or is_bin or is_jar):
+                        continue
+
+                    extracted = tf.extractfile(member)
+                    if extracted is None:
+                        continue
+                    scanned_files += 1
+
+                    if is_jmod:
+                        _scan_streaming_jmod(extracted, rel, found, primitives_by_origin)
+                        continue
+
+                    cap = (
+                        MAX_BINARY_MEMBER_BYTES
+                        if (is_bin or is_cert or is_apk_db or is_jar)
+                        else MAX_MEMBER_BYTES
+                    )
+                    data = extracted.read(cap)
+
+                    if is_apk_db:
+                        apk_db_text = data.decode("utf-8", errors="replace")
+                        continue
+
+                    if is_cert:
+                        cert_blobs[rel] = data
+                        continue
+
+                    if base_lower == "openssl.cnf":
+                        txt = data.decode("utf-8", errors="ignore")
+                        openssl_configs[rel] = txt
+                        _scan_text_for_crypto(txt, rel, found, "configuration", primitives_by_origin)
+                        continue
+
+                    if base_lower == "java.security":
+                        txt = data.decode("utf-8", errors="ignore")
+                        java_sec_configs[rel] = txt
+                        _scan_text_for_crypto(txt, rel, found, "configuration", primitives_by_origin)
+                        continue
+
+                    if is_jar:
+                        try:
+                            with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+                                for info in zf.infolist()[:MAX_ARCHIVE_MEMBERS]:
+                                    if info.is_dir():
+                                        continue
+                                    il = info.filename.lower()
+                                    if il.endswith(TEXT_SCAN_EXTS):
+                                        jtxt = zf.read(info).decode("utf-8", errors="ignore")
+                                        _scan_text_for_crypto(
+                                            jtxt,
+                                            f"{rel}!/{info.filename}",
+                                            found,
+                                            "application-code",
+                                            primitives_by_origin,
+                                        )
+                                    elif _is_scannable_binary(il):
+                                        jbin = _extract_printable_ascii(zf.read(info)[:MAX_MEMBER_BYTES])
+                                        _scan_text_for_crypto(
+                                            jbin,
+                                            f"{rel}!/{info.filename}",
+                                            found,
+                                            "application-code",
+                                            primitives_by_origin,
+                                        )
+                        except Exception:
+                            pass
+                        continue
+
+                    if is_text:
+                        origin = _classify_member_origin(rel, is_binary=False)
+                        _scan_text_for_crypto(
+                            data.decode("utf-8", errors="ignore"),
+                            rel,
+                            found,
+                            origin,
+                            primitives_by_origin,
+                        )
+                    elif is_bin:
+                        origin = _classify_member_origin(rel, is_binary=True)
+                        _scan_text_for_crypto(
+                            _extract_printable_ascii(data),
+                            rel,
+                            found,
+                            origin,
+                            primitives_by_origin,
+                        )
+        except (tarfile.TarError, OSError):
+            continue
+
+    certs_by_fp: dict[str, dict[str, Any]] = {}
+    for rel, raw in sorted(cert_blobs.items()):
+        fmt, parsed = parse_cert_store_bytes(raw, rel)
+        for cert in parsed:
+            certs_by_fp.setdefault(cert["fp"], cert)
+        if parsed and "X.509-Certificate" in _RULE_BY_NAME:
+            _record_rule_finding(
+                found,
+                _RULE_BY_NAME["X.509-Certificate"],
+                rel,
+                "configuration",
+                primitives_by_origin,
+            )
+
+    cert_summary = evaluate_certificates(certs_by_fp, now=now)
+    openssl_findings = [inspect_openssl_cnf(txt, loc) for loc, txt in sorted(openssl_configs.items())]
+    java_findings = [inspect_java_security(txt, loc) for loc, txt in sorted(java_sec_configs.items())]
+    apk_packages = parse_apk_installed_packages(apk_db_text) if apk_db_text else []
+    components = _build_crypto_components(found, cert_summary)
+
+    return {
+        "scan_scope": "oci-layers",
+        "components": components,
+        "primitives_by_origin": primitives_by_origin,
+        "cert_summary": cert_summary,
+        "openssl_findings": openssl_findings,
+        "java_findings": java_findings,
+        "apk_packages": apk_packages,
+    }
 
 
 def generate_artifact_boms(
@@ -457,12 +885,15 @@ def generate_artifact_boms(
     pkg_version: str,
     artifact_rel_path: str,
     digests: ArtifactDigests,
+    oci_layer_paths: list[Path] | None = None,
+    now: datetime.datetime | None = None,
 ) -> tuple[Path, Path, int, str]:
     """Generate CycloneDX 1.6 SBOM and CBOM sidecars next to staged_file.
 
     Returns (sbom_path, cbom_path, crypto_asset_count, scan_status).
     """
-    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    now_dt = now or datetime.datetime.now(datetime.timezone.utc)
+    now_iso = now_dt.isoformat()
     purl = build_canonical_purl(ecosystem, pkg_name, pkg_version, artifact_rel_path)
 
     hashes = [{"alg": "SHA-256", "content": digests.sha256}]
@@ -490,8 +921,39 @@ def generate_artifact_boms(
         ]
     }
 
-    # 1. CycloneDX 1.6 SBOM
     extracted_deps = _extract_sbom_dependencies_from_archive(staged_file)
+
+    is_oci = ecosystem.lower().startswith("oci")
+    valid_layers = [p for p in (oci_layer_paths or []) if p.is_file()]
+    manifest_only_uninspected = False
+
+    if is_oci and valid_layers:
+        scan_res = inspect_oci_layers(valid_layers, now=now_dt)
+        apk_packages = scan_res["apk_packages"]
+        for pkg in apk_packages:
+            extracted_deps.append(
+                {
+                    "ecosystem": "apk",
+                    "name": pkg["name"],
+                    "version": pkg["version"],
+                }
+            )
+    elif is_oci:
+        manifest_only_uninspected = True
+        scan_res = {
+            "scan_scope": "oci-manifest-only",
+            "components": [],
+            "primitives_by_origin": {},
+            "cert_summary": evaluate_certificates({}, now=now_dt),
+            "openssl_findings": [],
+            "java_findings": [],
+            "apk_packages": [],
+        }
+    else:
+        scan_res = _inspect_archive_details(staged_file, now=now_dt)
+        scan_res["apk_packages"] = []
+
+    # 1. CycloneDX 1.6 SBOM
     sbom_components: list[dict[str, Any]] = []
     seen_dep_purls: set[str] = set()
     for dep in extracted_deps:
@@ -522,14 +984,40 @@ def generate_artifact_boms(
             "properties": [
                 {"name": "trusted-oss:ecosystem", "value": ecosystem},
                 {"name": "trusted-oss:artifact-path", "value": artifact_rel_path},
+                {"name": "trusted-oss:scan-scope", "value": scan_res["scan_scope"]},
             ],
         },
         "components": sbom_components,
     }
 
-    # 2. CycloneDX 1.6 CBOM
-    crypto_components = inspect_artifact_crypto(staged_file)
-    scan_status = "CRYPTO_ASSETS_DETECTED" if crypto_components else "VERIFIED_INERT"
+    # 2. CycloneDX 1.6 CBOM + Risk Assessment
+    crypto_components = scan_res["components"]
+    risk = build_risk_assessment(
+        primitives_by_origin=scan_res["primitives_by_origin"],
+        cert_summary=scan_res["cert_summary"],
+        openssl_findings=scan_res["openssl_findings"],
+        java_findings=scan_res["java_findings"],
+        apk_packages=scan_res["apk_packages"],
+        declared_deps=extracted_deps,
+        scan_scope=scan_res["scan_scope"],
+        manifest_only_uninspected=manifest_only_uninspected,
+    )
+
+    if manifest_only_uninspected:
+        scan_status = "MANIFEST_ONLY_UNINSPECTED"
+    elif crypto_components or risk["active_risk_count"] > 0 or risk["passive_risk_count"] > 0:
+        scan_status = "CRYPTO_ASSETS_DETECTED"
+    else:
+        scan_status = "VERIFIED_INERT"
+
+    cert_summary = risk["cert_summary"]
+    risk_detail_compact = {
+        "active_risks": risk["active_risks"][:10],
+        "passive_risks": risk["passive_risks"][:10],
+        "pqc_ready_unused_libraries": risk["pqc_ready_unused_libraries"],
+        "cert_key_types": cert_summary.get("key_type_counts", {}),
+        "cert_sig_hashes": cert_summary.get("sig_hash_counts", {}),
+    }
 
     cbom_doc = {
         "bomFormat": "CycloneDX",
@@ -544,7 +1032,22 @@ def generate_artifact_boms(
                 {"name": "trusted-oss:ecosystem", "value": ecosystem},
                 {"name": "trusted-oss:artifact-path", "value": artifact_rel_path},
                 {"name": "trusted-oss:crypto-scan-status", "value": scan_status},
+                {"name": "trusted-oss:scan-scope", "value": risk["scan_scope"]},
                 {"name": "trusted-oss:crypto-asset-count", "value": str(len(crypto_components))},
+                {"name": "trusted-oss:crypto-risk-level", "value": risk["crypto_risk_level"]},
+                {"name": "trusted-oss:active-risk-count", "value": str(risk["active_risk_count"])},
+                {"name": "trusted-oss:passive-risk-count", "value": str(risk["passive_risk_count"])},
+                {"name": "trusted-oss:cert-total", "value": str(cert_summary.get("total_unique", 0))},
+                {"name": "trusted-oss:cert-expired", "value": str(cert_summary.get("expired_count", 0))},
+                {"name": "trusted-oss:cert-expiring-90d", "value": str(cert_summary.get("expiring_90d_count", 0))},
+                {"name": "trusted-oss:cert-sha1-roots", "value": str(cert_summary.get("sha1_root_count", 0))},
+                {"name": "trusted-oss:cert-weak-keys", "value": str(cert_summary.get("weak_key_count", 0))},
+                {"name": "trusted-oss:pqc-compiled-ready", "value": str(risk["pqc_compiled_ready"]).lower()},
+                {"name": "trusted-oss:pqc-code-used", "value": str(risk["pqc_code_used"]).lower()},
+                {"name": "trusted-oss:pqc-adoption-status", "value": risk["pqc_adoption_status"]},
+                {"name": "trusted-oss:pqc-compiled-risk", "value": risk["compiled_risk"]},
+                {"name": "trusted-oss:pqc-coding-risk", "value": risk["coding_risk"]},
+                {"name": "trusted-oss:risk-detail-json", "value": json.dumps(risk_detail_compact, separators=(",", ":"))},
             ],
         },
         "components": crypto_components,

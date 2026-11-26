@@ -399,8 +399,8 @@ Repositories remain **public-by-default** (Maven Central, PyPI, `cgr.dev`) until
 5. **Verify End-to-End Connectivity**:
    - Run [`.github/workflows/probe-wan-connectivity.yml`](../.github/workflows/probe-wan-connectivity.yml) (`gh workflow run probe-wan-connectivity.yml`) and confirm `/healthz` returns `HTTP/2 200` with mTLS while unauthenticated requests without a client certificate are rejected.
 
-6. **Signed Upstream SBOM/CBOM Attestations & Backfill (`v1.6.0+`)**:
-   - Every newly promoted Maven, PyPI, or OCI artifact automatically generates dual-signed CycloneDX 1.6 `.sbom.cdx.json` and `.cbom.cdx.json` sidecars (`.asc` + `.mldsa65`), including explicit `VERIFIED_INERT` attestations when zero cryptographic primitives are present.
+6. **Signed Upstream SBOM/CBOM Attestations, Layer Risk Posture & Backfill (`v1.6.0+`)**:
+   - Every newly promoted Maven, PyPI, or OCI artifact automatically generates dual-signed CycloneDX 1.6 `.sbom.cdx.json` and `.cbom.cdx.json` sidecars (`.asc` + `.mldsa65`). For OCI container images, Gatekeeper inspects bounded platform layers (`OCI_BOM_DEEP_SCAN_ENABLED=true`) to audit OpenSSL/Java configs, X.509/JKS certificates, Active vs. Passive risks, and PQC Compiled-vs-Coding gaps (`PQC_COMPILED_BUT_UNUSED`); manifest-only scans without layers report `MANIFEST_ONLY_UNINSPECTED`, and `VERIFIED_INERT` applies only to inspected artifacts with zero primitives and zero risks.
    - To backfill signed SBOM/CBOM sidecars for artifacts cached prior to `v1.6.0`:
      ```bash
      curl -fsSL -X POST \
@@ -536,16 +536,26 @@ curl -fsSL "${GATEKEEPER}/catalog/vulnerabilities?ecosystem=oci&components=chain
 # 2. Confirm zero active security advisories for this component
 curl -fsSL "${GATEKEEPER}/catalog/advisories?ecosystem=oci&component=chainguard/jre" | jq '{count, advisories}'
 
-# 3. Inspect cryptographic assets detected inside the pulled CBOM
+# 3. Inspect cryptographic assets & risk posture inside the pulled CBOM
 jq '{
   purl: .metadata.component.purl,
   crypto_scan_status: (.metadata.properties[] | select(.name=="trusted-oss:crypto-scan-status") | .value),
+  scan_scope: (.metadata.properties[]? | select(.name=="trusted-oss:scan-scope") | .value),
+  risk_level: (.metadata.properties[]? | select(.name=="trusted-oss:crypto-risk-level") | .value),
+  active_risks: (.metadata.properties[]? | select(.name=="trusted-oss:active-risk-count") | .value),
+  passive_risks: (.metadata.properties[]? | select(.name=="trusted-oss:passive-risk-count") | .value),
+  cert_expired: (.metadata.properties[]? | select(.name=="trusted-oss:cert-expired") | .value),
+  cert_sha1_roots: (.metadata.properties[]? | select(.name=="trusted-oss:cert-sha1-roots") | .value),
+  pqc_adoption: (.metadata.properties[]? | select(.name=="trusted-oss:pqc-adoption-status") | .value),
   crypto_assets: [.components[]? | select(.type=="cryptographic-asset") | .name]
 }' "${PROOF_DIR}/cbom.cdx.json"
+
+# 4. Query Gatekeeper catalog crypto-risk posture (Active vs. Passive, Certs, PQC gap)
+curl -fsSL "${GATEKEEPER}/catalog/crypto-risk?ecosystem=oci&components=chainguard/jre" | jq '.components[] | {component, version, crypto_posture}'
 ```
 
 A component is **approved for use** only when all four checks pass:
-1. **ORAS / BOM Presence**: Both CycloneDX 1.6 **SBOM** and **CBOM** exist and match their OCI 1.1 Referrers `sha256` digests (with `CRYPTO_ASSETS_DETECTED` or `VERIFIED_INERT` status).
+1. **ORAS / BOM Presence & Risk Posture**: Both CycloneDX 1.6 **SBOM** and **CBOM** exist and match their OCI 1.1 Referrers `sha256` digests, with `trusted-oss.crypto.*` annotations (`cert-expired == 0`, `cert-weak-keys == 0`).
 2. **Dual Cryptographic Proof**: Detached **GPG (`.asc`)** verifies against `/keys/trusted-oss-pubkey.asc` and **ML-DSA-65 (`.mldsa65`)** verifies via `client-templates/pqc-verify.py` against `/keys/trusted-oss-mldsa65.pub`.
 3. **Malware & CVE Health Record**: `clamav_status == "CLEAN"`, `vulnerability_status == "CLEAN"`, and `max_cvss < 7.0`.
 4. **Zero Active Advisories / Quarantine**: Component is not listed under `/catalog/advisories` or `quarantined`.
@@ -955,8 +965,8 @@ Verify the downloaded OCI manifest against both Registry public keys fetched fro
 Classical RSA-3072 GPG provides immediate compatibility with existing Maven (`pgpverify`), Linux, and CI toolchains. **NIST FIPS 204 ML-DSA-65** adds quantum-resistant lattice signatures so long-lived provenance records and container attestations remain unforgeable against future quantum cryptanalysis ("Harvest Now, Forge Later").
 
 ### Q4: What is the difference between the SBOM and CBOM attached via OCI 1.1 Referrers?
-- **SBOM (`sbom.cdx.json`)** lists the software components, versions, PURLs, and dependencies packaged in the artifact.
-- **CBOM (`cbom.cdx.json`)** inventories cryptographic assets (algorithms, key lengths, TLS protocols, certificates, PQC primitives) discovered inside the artifact. When no cryptographic primitives are present in the manifest itself, Gatekeeper explicitly marks it `VERIFIED_INERT` so downstream compliance audits distinguish "scanned and clean" from "never scanned."
+- **SBOM (`sbom.cdx.json`)** lists the software components, versions, PURLs, and dependencies (including Wolfi APK OS packages extracted from OCI layers).
+- **CBOM (`cbom.cdx.json`)** inventories cryptographic assets (algorithms, key lengths, TLS protocols, X.509/JKS certificates, PQC primitives) discovered across container layers and archives, separating **Active Risks** (expired/weak/non-CA certs, non-root SHA-1 chains, activated OpenSSL legacy providers, weak code calls) from **Passive Risks** (self-signed SHA-1 root CAs in truststores, policy-disabled runtime symbols, quantum-vulnerable anchors) and reporting **Compiled Risk vs. Coding Risk** (`PQC_COMPILED_BUT_UNUSED`). Only inspected artifacts with zero primitives and zero risks receive `VERIFIED_INERT`; manifest-only scans without layers report `MANIFEST_ONLY_UNINSPECTED`.
 
 ### Q5: How does the provenance log prove the image was scanned for viruses and CVEs?
 When Gatekeeper promotes an artifact from `packages/quarantine/` to the trusted store, it writes an append-only JSONL record to `/data/audit/provenance.jsonl` (queryable via `GET /audit/provenance`) containing `sha256`, `clamav_status` (`CLAMD_OK`), `cve_status` (`CLEAN`), `max_cvss`, `cbom_scan_status`, signature filenames, and an `attestation_hmac` computed with the Registry's persistent HMAC key (`/data/keys/provenance.hmac.key`).

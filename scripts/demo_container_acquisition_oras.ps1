@@ -631,8 +631,28 @@ try {
     $sbomObj = Get-Content -Path $SbomFile -Raw | ConvertFrom-Json
     $cbomObj = Get-Content -Path $CbomFile -Raw | ConvertFrom-Json
     $sbomCompCount = if ($sbomObj.PSObject.Properties['components'] -and $null -ne $sbomObj.components) { @($sbomObj.components).Count } else { 0 }
-    $cbomStatusProp = ($cbomObj.metadata.properties | Where-Object { $_.name -eq "trusted-oss:crypto-scan-status" } | Select-Object -First 1)
-    $cbomStatus = if ($null -ne $cbomStatusProp) { $cbomStatusProp.value } else { "UNKNOWN" }
+
+    $cbomProps = @{}
+    if ($cbomObj.metadata -and $cbomObj.metadata.properties) {
+        foreach ($prop in $cbomObj.metadata.properties) {
+            if ($prop.name) { $cbomProps[[string]$prop.name] = [string]$prop.value }
+        }
+    }
+
+    $cbomStatus = if ($cbomProps.ContainsKey("trusted-oss:crypto-scan-status")) { $cbomProps["trusted-oss:crypto-scan-status"] } else { "UNKNOWN" }
+    $cbomScope = if ($cbomProps.ContainsKey("trusted-oss:scan-scope")) { $cbomProps["trusted-oss:scan-scope"] } else { "legacy" }
+    $riskLevel = if ($cbomProps.ContainsKey("trusted-oss:crypto-risk-level")) { $cbomProps["trusted-oss:crypto-risk-level"] } else { "UNKNOWN" }
+    $activeRiskCount = if ($cbomProps.ContainsKey("trusted-oss:active-risk-count")) { [int]$cbomProps["trusted-oss:active-risk-count"] } else { 0 }
+    $passiveRiskCount = if ($cbomProps.ContainsKey("trusted-oss:passive-risk-count")) { [int]$cbomProps["trusted-oss:passive-risk-count"] } else { 0 }
+    $certTotal = if ($cbomProps.ContainsKey("trusted-oss:cert-total")) { [int]$cbomProps["trusted-oss:cert-total"] } else { 0 }
+    $certExpired = if ($cbomProps.ContainsKey("trusted-oss:cert-expired")) { [int]$cbomProps["trusted-oss:cert-expired"] } else { 0 }
+    $certExp90 = if ($cbomProps.ContainsKey("trusted-oss:cert-expiring-90d")) { [int]$cbomProps["trusted-oss:cert-expiring-90d"] } else { 0 }
+    $certSha1Roots = if ($cbomProps.ContainsKey("trusted-oss:cert-sha1-roots")) { [int]$cbomProps["trusted-oss:cert-sha1-roots"] } else { 0 }
+    $certWeakKeys = if ($cbomProps.ContainsKey("trusted-oss:cert-weak-keys")) { [int]$cbomProps["trusted-oss:cert-weak-keys"] } else { 0 }
+    $pqcAdoption = if ($cbomProps.ContainsKey("trusted-oss:pqc-adoption-status")) { $cbomProps["trusted-oss:pqc-adoption-status"] } else { "UNKNOWN" }
+    $pqcCompiledRisk = if ($cbomProps.ContainsKey("trusted-oss:pqc-compiled-risk")) { $cbomProps["trusted-oss:pqc-compiled-risk"] } else { "UNKNOWN" }
+    $pqcCodingRisk = if ($cbomProps.ContainsKey("trusted-oss:pqc-coding-risk")) { $cbomProps["trusted-oss:pqc-coding-risk"] } else { "UNKNOWN" }
+
     $cryptoAssets = @()
     if ($cbomObj.PSObject.Properties['components'] -and $null -ne $cbomObj.components) {
         $cryptoAssets = @($cbomObj.components | Where-Object { $_.type -eq "cryptographic-asset" } | ForEach-Object { $_.name })
@@ -640,10 +660,71 @@ try {
 
     Write-Host "  [PASS] SBOM Verified : $($sbomObj.bomFormat) $($sbomObj.specVersion) | SHA-256 OK | Components: $sbomCompCount" -ForegroundColor Green
     Write-JsonFilePreview -Label "SBOM JSON" -FilePath $SbomFile -MaxLines 30
-    Write-Host "  [PASS] CBOM Verified : $($cbomObj.bomFormat) $($cbomObj.specVersion) | SHA-256 OK | Status: $cbomStatus | Assets: $(if ($cryptoAssets.Count -gt 0) { $cryptoAssets -join ', ' } else { 'none (VERIFIED_INERT)' })" -ForegroundColor Green
+
+    $cbomBannerColor = if ($certExpired -gt 0 -or $certWeakKeys -gt 0) {
+        "Red"
+    } elseif ($cbomStatus -eq "MANIFEST_ONLY_UNINSPECTED" -or $activeRiskCount -gt 0 -or $certSha1Roots -gt 0) {
+        "Yellow"
+    } else {
+        "Green"
+    }
+    $assetPreview = if ($cryptoAssets.Count -gt 0) {
+        $shownAssets = ($cryptoAssets | Select-Object -First 8) -join ', '
+        if ($cryptoAssets.Count -gt 8) { "$shownAssets ... (+$($cryptoAssets.Count - 8) more)" } else { $shownAssets }
+    } else {
+        "none ($cbomStatus)"
+    }
+    Write-Host "  [CBOM] Verified : $($cbomObj.bomFormat) $($cbomObj.specVersion) | SHA-256 OK | Status: $cbomStatus (scope=$cbomScope) | Risk: $riskLevel | Assets: $assetPreview" -ForegroundColor $cbomBannerColor
+
+    # Display core ORAS OCI 1.1 Referrer risk annotations if exposed by Gatekeeper
+    if ($cbomDesc.annotations -and $cbomDesc.annotations.PSObject.Properties['trusted-oss.crypto.risk-level']) {
+        Write-Host "  [ORAS REFERRER ANNOTATIONS]" -ForegroundColor Cyan
+        Write-Host "    • Risk Level : $($cbomDesc.annotations.'trusted-oss.crypto.risk-level') (Active=$($cbomDesc.annotations.'trusted-oss.crypto.active-risks'), Passive=$($cbomDesc.annotations.'trusted-oss.crypto.passive-risks'))" -ForegroundColor Gray
+        Write-Host "    • Certs      : total=$($cbomDesc.annotations.'trusted-oss.crypto.cert-total'), expired=$($cbomDesc.annotations.'trusted-oss.crypto.cert-expired'), sha1-roots=$($cbomDesc.annotations.'trusted-oss.crypto.cert-sha1-roots'), weak-keys=$($cbomDesc.annotations.'trusted-oss.crypto.cert-weak-keys')" -ForegroundColor Gray
+        Write-Host "    • PQC Gap    : $($cbomDesc.annotations.'trusted-oss.crypto.pqc-adoption') (CompiledRisk=$($cbomDesc.annotations.'trusted-oss.crypto.compiled-risk'), CodingRisk=$($cbomDesc.annotations.'trusted-oss.crypto.coding-risk'))" -ForegroundColor Gray
+    }
+
+    Write-Section "2.6 Cryptographic Risk Posture: Active vs. Passive, Cert Hygiene & PQC Compiled vs. Coding"
+    Write-Host "  • Scan Status / Scope : $cbomStatus [$cbomScope]" -ForegroundColor White
+    Write-Host "  • Overall Risk Level  : $riskLevel (Active=$activeRiskCount, Passive=$passiveRiskCount)" -ForegroundColor $cbomBannerColor
+    Write-Host "  • Truststore / Certs  : total=$certTotal | expired=$certExpired | expiring<=90d=$certExp90 | sha1-roots=$certSha1Roots | weak-keys=$certWeakKeys" -ForegroundColor $(if ($certExpired -gt 0) { "Red" } elseif ($certSha1Roots -gt 0) { "Yellow" } else { "Green" })
+    Write-Host "  • PQC Compiled vs Code: status=$pqcAdoption | compiled_risk=$pqcCompiledRisk | coding_risk=$pqcCodingRisk" -ForegroundColor $(if ($pqcAdoption -eq "PQC_COMPILED_BUT_UNUSED") { "Yellow" } elseif ($pqcAdoption -eq "PQC_COMPILED_AND_USED") { "Green" } else { "Cyan" })
+
+    if ($cbomProps.ContainsKey("trusted-oss:risk-detail-json") -and $cbomProps["trusted-oss:risk-detail-json"]) {
+        try {
+            $detailObj = $cbomProps["trusted-oss:risk-detail-json"] | ConvertFrom-Json
+            if ($detailObj.active_risks -and @($detailObj.active_risks).Count -gt 0) {
+                Write-Host "  [ACTIVE RISKS]" -ForegroundColor Red
+                foreach ($ar in $detailObj.active_risks) {
+                    Write-Host "    - [$($ar.severity)] $($ar.id): $($ar.title) — $($ar.detail)" -ForegroundColor Red
+                }
+            }
+            if ($detailObj.passive_risks -and @($detailObj.passive_risks).Count -gt 0) {
+                Write-Host "  [PASSIVE RISKS]" -ForegroundColor Yellow
+                foreach ($pr in $detailObj.passive_risks) {
+                    Write-Host "    - [$($pr.severity)] $($pr.id): $($pr.title) — $($pr.detail)" -ForegroundColor Yellow
+                }
+            }
+            if ($detailObj.pqc_ready_unused_libraries -and @($detailObj.pqc_ready_unused_libraries).Count -gt 0) {
+                Write-Host "  [PQC-READY LIBRARIES UNUSED IN CODE (Coding Risk)]" -ForegroundColor Cyan
+                foreach ($lib in $detailObj.pqc_ready_unused_libraries) {
+                    Write-Host "    - $lib" -ForegroundColor Gray
+                }
+            }
+        } catch {}
+    }
+
     Write-JsonFilePreview -Label "CBOM JSON" -FilePath $CbomFile -MaxLines 30
     $Gates.SbomVerified = "PASS ($sbomCompCount components)"
-    $Gates.CbomVerified = "PASS ($cbomStatus)"
+    if ($certExpired -gt 0 -or $certWeakKeys -gt 0) {
+        $Gates.CbomVerified = "FAIL ($cbomStatus | risk=$riskLevel | expired=$certExpired | weak_keys=$certWeakKeys)"
+    } elseif ($cbomStatus -eq "MANIFEST_ONLY_UNINSPECTED") {
+        $Gates.CbomVerified = "WARN ($cbomStatus — layers not inspected)"
+    } elseif ($activeRiskCount -gt 0 -or $certSha1Roots -gt 0) {
+        $Gates.CbomVerified = "WARN ($cbomStatus | risk=$riskLevel | active=$activeRiskCount passive=$passiveRiskCount sha1_roots=$certSha1Roots | $pqcAdoption)"
+    } else {
+        $Gates.CbomVerified = "PASS ($cbomStatus | risk=$riskLevel | $pqcAdoption)"
+    }
 
     # --------------------------------------------------------------------------
     # STAGE 3: Public Keys & Detached Signatures (GPG .asc + ML-DSA-65 .mldsa65)
@@ -778,6 +859,14 @@ try {
         $advObj = $advResp.Body | ConvertFrom-Json
         $advCount = [int]$advObj.count
         $Gates.AdvisoriesClean = if ($advCount -eq 0) { "PASS (0 active advisories)" } else { "FAIL ($advCount active advisories)" }
+    }
+
+    Write-Section "4.2b Catalog Cryptographic Risk Posture (/catalog/crypto-risk)"
+    $cryptoResp = Invoke-LoggedHttpRequest `
+        -Uri "${RegistryUrl}/catalog/crypto-risk?ecosystem=oci&components=${Repo}" `
+        -ShowBodyPreview -MaxBodyLines 30
+    if ($cryptoResp.StatusCode -eq 404) {
+        Write-Host "  [INFO] /catalog/crypto-risk returned HTTP 404 (registry instance predates Gatekeeper v2.0 CBOM risk API)." -ForegroundColor DarkYellow
     }
 
     Write-Section "4.3 Tamper-Evident HMAC-SHA384 Provenance Ledger (/audit/provenance)"

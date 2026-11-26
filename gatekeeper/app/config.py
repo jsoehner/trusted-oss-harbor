@@ -66,6 +66,13 @@ class Settings(BaseSettings):
     pqc_signing_enabled: bool = Field(default=True, alias="PQC_SIGNING_ENABLED")
     bom_generation_enabled: bool = Field(default=True, alias="BOM_GENERATION_ENABLED")
     bom_scan_timeout_seconds: int = Field(default=30, alias="BOM_SCAN_TIMEOUT_SECONDS")
+    oci_bom_deep_scan_enabled: bool = Field(default=True, alias="OCI_BOM_DEEP_SCAN_ENABLED")
+    oci_bom_max_layer_bytes: int = Field(
+        default=120 * 1024 * 1024, alias="OCI_BOM_MAX_LAYER_BYTES"
+    )
+    oci_bom_max_layers: int = Field(default=16, alias="OCI_BOM_MAX_LAYERS")
+    oci_bom_target_os: str = Field(default="linux", alias="OCI_BOM_TARGET_OS")
+    oci_bom_target_arch: str = Field(default="amd64", alias="OCI_BOM_TARGET_ARCH")
     virtual_repo_enabled: bool = Field(default=True, alias="VIRTUAL_REPO_ENABLED")
     cve_scanner_mode: str = Field(default="auto", alias="CVE_SCANNER_MODE")
     workspace_scan_roots: str = Field(default="", alias="WORKSPACE_SCAN_ROOTS")

@@ -241,12 +241,20 @@ jq '{
   component_count: (.components | length)
 }' "${PROOF_DIR}/sbom.cdx.json"
 
-# Summarize CBOM cryptographic posture (CRYPTO_ASSETS_DETECTED or VERIFIED_INERT)
+# Summarize CBOM cryptographic posture (active/passive risks, certificates, PQC compiled vs. coding)
 jq '{
   bomFormat,
   specVersion,
   purl: .metadata.component.purl,
   crypto_scan_status: (.metadata.properties[]? | select(.name=="trusted-oss:crypto-scan-status") | .value),
+  scan_scope: (.metadata.properties[]? | select(.name=="trusted-oss:scan-scope") | .value),
+  risk_level: (.metadata.properties[]? | select(.name=="trusted-oss:crypto-risk-level") | .value),
+  active_risks: (.metadata.properties[]? | select(.name=="trusted-oss:active-risk-count") | .value),
+  passive_risks: (.metadata.properties[]? | select(.name=="trusted-oss:passive-risk-count") | .value),
+  cert_expired: (.metadata.properties[]? | select(.name=="trusted-oss:cert-expired") | .value),
+  cert_sha1_roots: (.metadata.properties[]? | select(.name=="trusted-oss:cert-sha1-roots") | .value),
+  pqc_adoption: (.metadata.properties[]? | select(.name=="trusted-oss:pqc-adoption-status") | .value),
+  pqc_coding_risk: (.metadata.properties[]? | select(.name=="trusted-oss:pqc-coding-risk") | .value),
   crypto_assets: [.components[]? | select(.type=="cryptographic-asset") | .name]
 }' "${PROOF_DIR}/cbom.cdx.json"
 ```
@@ -485,7 +493,7 @@ A newly acquired container artifact should be promoted to build/deploy pipelines
 | :--- | :--- | :--- |
 | **1. Manifest Promotion** | `HTTP 200 OK` + immutable `sha256` digest pinned | `oras resolve` & `oras manifest fetch` |
 | **2. SBOM Presence & Integrity** | CycloneDX 1.6 `application/vnd.cyclonedx+json` (`io.cyclonedx.type=sbom`) matches referrer `sha256` | `oras discover` + `oras blob fetch` + `sha256sum` |
-| **3. CBOM Presence & Status** | CycloneDX 1.6 `application/vnd.cyclonedx+json` (`io.cyclonedx.type=cbom`) reports `CRYPTO_ASSETS_DETECTED` or `VERIFIED_INERT` | `oras discover` + `oras blob fetch` + `jq` |
+| **3. CBOM Presence & Risk Posture** | CycloneDX 1.6 `application/vnd.cyclonedx+json` (`io.cyclonedx.type=cbom`) carries `trusted-oss.crypto.*` OCI 1.1 annotations (`CRYPTO_ASSETS_DETECTED` across OCI layers, active/passive risk counts, `cert-expired == 0`, `pqc-adoption`) | `oras discover` + `oras blob fetch` + `GET /catalog/crypto-risk` |
 | **4. Dual Cryptographic Proof** | Valid GPG RSA-3072 (`.asc`) **and** NIST FIPS 204 ML-DSA-65 (`.mldsa65`) signatures | `gpg --verify` + `client-templates/pqc-verify.py` |
 | **5. Malware & Vuln Scan** | `clamav_status == "CLEAN"`, `vulnerability_status == "CLEAN"`, `max_cvss < 7.0` | `GET /catalog/vulnerabilities?ecosystem=oci&components=<repo>&verify_signatures=true` |
 | **6. Advisories & Provenance** | `advisories.count == 0` and matching `sha256` entry with valid HMAC-SHA384 in provenance ledger | `GET /catalog/advisories` & `GET /audit/provenance` |

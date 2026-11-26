@@ -102,8 +102,8 @@ You can select which signature mode your client verifies via `--sig-mode` in [`s
 
 ## 5. What is the difference between the SBOM and CBOM referrers?
 
-- **SBOM (`sbom.cdx.json`)**: Software Bill of Materials listing component identity, PURL, version, and dependencies in CycloneDX 1.6 format.
-- **CBOM (`cbom.cdx.json`)**: Cryptographic Bill of Materials listing algorithms, key sizes, TLS protocols, certificates, and PQC primitives detected inside the artifact. If an artifact contains no cryptographic primitives, Gatekeeper records `trusted-oss:crypto-scan-status = VERIFIED_INERT` so auditors can distinguish "scanned with zero crypto assets" from "unscanned."
+- **SBOM (`sbom.cdx.json`)**: Software Bill of Materials listing component identity, PURL, version, and dependencies (including Wolfi APK OS packages extracted from OCI layers) in CycloneDX 1.6 format.
+- **CBOM (`cbom.cdx.json`)**: Cryptographic Bill of Materials listing algorithms, key sizes, TLS protocols, X.509/JKS certificates, and PQC primitives discovered inside container layers or package archives. Gatekeeper classifies **Active Risks** (expired/weak/non-CA certificates, non-root SHA-1 chains, activated OpenSSL legacy providers, weak code calls) separately from **Passive Risks** (self-signed SHA-1 root CAs in truststores, policy-disabled runtime symbols, quantum-vulnerable classical anchors), tracks **Compiled Risk vs. Coding Risk** (`PQC_COMPILED_BUT_UNUSED` when PQC-ready libraries ship unused by application code), and surfaces `trusted-oss.crypto.*` annotations on OCI 1.1 Referrers and `GET /catalog/crypto-risk`. Only inspected artifacts with zero primitives and zero risks receive `VERIFIED_INERT`; manifest-only OCI scans without layers report `MANIFEST_ONLY_UNINSPECTED`.
 
 ---
 

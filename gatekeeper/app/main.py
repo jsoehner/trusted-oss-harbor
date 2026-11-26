@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sys
 from typing import Annotated, Any
 from urllib.parse import urlparse
@@ -31,6 +32,7 @@ from app.bom_generator import (
     parse_purl,
     resolve_purl_to_bom_file,
 )
+from app.crypto_risk import RISK_LEVEL_ORDER, extract_cbom_risk_summary
 from app.bus import BaseJobBus, create_job_bus
 from app.config import Settings
 from app.discovery import (
@@ -577,6 +579,7 @@ async def quarantine_scan_sign_and_promote(
     artifact_rel_path: str,
     settings: Settings,
     simulated_cvss: float = 0.0,
+    oci_layer_paths: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Execute the Quarantine -> ClamAV -> CVE -> GPG + ML-DSA-65 Dual Sign -> Trusted Promotion pipeline."""
     pkg_name, pkg_version = extract_package_coordinates(ecosystem, artifact_rel_path)
@@ -650,6 +653,7 @@ async def quarantine_scan_sign_and_promote(
                 pkg_version=pkg_version,
                 artifact_rel_path=artifact_rel_path,
                 digests=digests,
+                oci_layer_paths=oci_layer_paths,
             )
             staged_bom_cleanup.extend([sbom_path, cbom_path])
             cbom_sha256 = compute_file_sha256(cbom_path)
@@ -754,6 +758,32 @@ def _parse_www_authenticate_bearer(header_value: str) -> dict[str, str]:
     }
 
 
+async def _acquire_oci_bearer_token(
+    client: httpx.AsyncClient,
+    base: str,
+    repo_path: str,
+    www_authenticate: str,
+) -> str:
+    """Exchange an OCI 401 Bearer challenge for a pull token."""
+    challenge = _parse_www_authenticate_bearer(www_authenticate)
+    realm = challenge.get("realm", "")
+    token_params: dict[str, str] = {}
+    if realm.startswith(("https://", "http://")):
+        if challenge.get("service"):
+            token_params["service"] = challenge["service"]
+        token_params["scope"] = challenge.get("scope") or f"repository:{repo_path}:pull"
+        token_url = realm
+    else:
+        token_url = f"{base}/token"
+        token_params["scope"] = f"repository:{repo_path}:pull"
+
+    token_resp = await client.get(token_url, params=token_params)
+    if token_resp.status_code == 200:
+        token_json = token_resp.json()
+        return str(token_json.get("token") or token_json.get("access_token") or "")
+    return ""
+
+
 async def fetch_upstream_oci_manifest(
     upstream_base_url: str, repo_path: str, reference: str
 ) -> bytes:
@@ -765,25 +795,12 @@ async def fetch_upstream_oci_manifest(
     async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
         resp = await client.get(manifest_url, headers=headers)
         if resp.status_code == 401:
-            challenge = _parse_www_authenticate_bearer(resp.headers.get("www-authenticate", ""))
-            realm = challenge.get("realm", "")
-            token_params: dict[str, str] = {}
-            if realm.startswith(("https://", "http://")):
-                if challenge.get("service"):
-                    token_params["service"] = challenge["service"]
-                token_params["scope"] = challenge.get("scope") or f"repository:{repo_path}:pull"
-                token_url = realm
-            else:
-                token_url = f"{base}/token"
-                token_params["scope"] = f"repository:{repo_path}:pull"
-
-            token_resp = await client.get(token_url, params=token_params)
-            if token_resp.status_code == 200:
-                token_json = token_resp.json()
-                token = token_json.get("token") or token_json.get("access_token") or ""
-                if token:
-                    headers["Authorization"] = f"Bearer {token}"
-                    resp = await client.get(manifest_url, headers=headers)
+            token = await _acquire_oci_bearer_token(
+                client, base, repo_path, resp.headers.get("www-authenticate", "")
+            )
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+                resp = await client.get(manifest_url, headers=headers)
 
         if resp.status_code != 200:
             raise HTTPException(
@@ -791,6 +808,104 @@ async def fetch_upstream_oci_manifest(
                 detail=f"OCI manifest not found upstream: {repo_path}:{reference} (HTTP {resp.status_code})",
             )
         return resp.content
+
+
+async def fetch_upstream_oci_layers_for_bom(
+    upstream_base_url: str,
+    repo_path: str,
+    manifest_bytes: bytes,
+    staging_dir: Path,
+    settings: Settings,
+) -> list[Path]:
+    """Download bounded OCI layer tarballs for deep CBOM/certificate inspection."""
+    try:
+        doc = json.loads(manifest_bytes.decode("utf-8"))
+    except Exception:
+        return []
+
+    base = upstream_base_url.rstrip("/")
+    headers = {"Accept": OCI_ACCEPT_HEADER}
+    layer_paths: list[Path] = []
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=90.0) as client:
+            # Resolve multi-arch OCI Image Index to target platform manifest
+            if isinstance(doc.get("manifests"), list) and doc["manifests"]:
+                chosen = None
+                for m in doc["manifests"]:
+                    plat = m.get("platform") or {}
+                    if plat.get("architecture") == "unknown" or (m.get("annotations") or {}).get("vnd.docker.reference.type") == "attestation-manifest":
+                        continue
+                    if (
+                        plat.get("os") == settings.oci_bom_target_os
+                        and plat.get("architecture") == settings.oci_bom_target_arch
+                    ):
+                        chosen = m
+                        break
+                if chosen is None:
+                    chosen = next(
+                        (
+                            m
+                            for m in doc["manifests"]
+                            if (m.get("platform") or {}).get("architecture") != "unknown"
+                        ),
+                        doc["manifests"][0],
+                    )
+                plat_digest = str(chosen.get("digest", ""))
+                if not plat_digest.startswith("sha256:"):
+                    return []
+                plat_url = f"{base}/v2/{repo_path}/manifests/{plat_digest}"
+                resp = await client.get(plat_url, headers=headers)
+                if resp.status_code == 401:
+                    token = await _acquire_oci_bearer_token(
+                        client, base, repo_path, resp.headers.get("www-authenticate", "")
+                    )
+                    if token:
+                        headers["Authorization"] = f"Bearer {token}"
+                        resp = await client.get(plat_url, headers=headers)
+                if resp.status_code != 200:
+                    return []
+                doc = resp.json()
+
+            layers = [
+                l for l in (doc.get("layers") or []) if isinstance(l, dict) and str(l.get("digest", "")).startswith("sha256:")
+            ][: settings.oci_bom_max_layers]
+
+            total_bytes = 0
+            for idx, layer_desc in enumerate(layers):
+                ldigest = str(layer_desc["digest"])
+                est_size = int(layer_desc.get("size") or 0)
+                if total_bytes + est_size > settings.oci_bom_max_layer_bytes:
+                    logger.info(
+                        "[CBOM] Skipping layer %s for %s (exceeds OCI_BOM_MAX_LAYER_BYTES=%d)",
+                        ldigest[:19],
+                        repo_path,
+                        settings.oci_bom_max_layer_bytes,
+                    )
+                    continue
+                blob_url = f"{base}/v2/{repo_path}/blobs/{ldigest}"
+                resp = await client.get(blob_url, headers=headers)
+                if resp.status_code == 401:
+                    token = await _acquire_oci_bearer_token(
+                        client, base, repo_path, resp.headers.get("www-authenticate", "")
+                    )
+                    if token:
+                        headers["Authorization"] = f"Bearer {token}"
+                        resp = await client.get(blob_url, headers=headers)
+                if resp.status_code != 200:
+                    continue
+                if total_bytes + len(resp.content) > settings.oci_bom_max_layer_bytes:
+                    continue
+                total_bytes += len(resp.content)
+                layer_file = staging_dir / f"layer_{idx:02d}.tar.gz"
+                layer_file.write_bytes(resp.content)
+                layer_paths.append(layer_file)
+    except Exception as exc:
+        logger.warning("[CBOM] OCI layer fetch failed for %s: %s", repo_path, exc)
+        return []
+
+    return layer_paths
 
 
 async def ensure_maven_artifact_cached(
@@ -962,8 +1077,9 @@ async def ensure_oci_manifest_cached(
         if base_file.exists():
             return base_file, "HIT"
 
+        upstream_url = upstream_base_url or settings.upstream_chainguard_url
         manifest_bytes = await fetch_upstream_oci_manifest(
-            upstream_base_url or settings.upstream_chainguard_url, repo_path, base_ref
+            upstream_url, repo_path, base_ref
         )
         staged_file = resolve_safe_relative_path(
             settings.quarantine_dir, f"oci/{cache_namespace}/{rel_manifest_path}"
@@ -971,13 +1087,28 @@ async def ensure_oci_manifest_cached(
         staged_file.parent.mkdir(parents=True, exist_ok=True)
         staged_file.write_bytes(manifest_bytes)
 
-        await quarantine_scan_sign_and_promote(
-            staged_file=staged_file,
-            dest_file=base_file,
-            ecosystem="oci-harbor",
-            artifact_rel_path=f"{cache_namespace}/{rel_manifest_path}",
-            settings=settings,
-        )
+        layer_dir = staged_file.with_name(f".layers_{staged_file.name}_{uuid.uuid4().hex[:8]}")
+        oci_layer_paths: list[Path] = []
+        try:
+            if settings.bom_generation_enabled and settings.oci_bom_deep_scan_enabled:
+                oci_layer_paths = await fetch_upstream_oci_layers_for_bom(
+                    upstream_base_url=upstream_url,
+                    repo_path=repo_path,
+                    manifest_bytes=manifest_bytes,
+                    staging_dir=layer_dir,
+                    settings=settings,
+                )
+
+            await quarantine_scan_sign_and_promote(
+                staged_file=staged_file,
+                dest_file=base_file,
+                ecosystem="oci-harbor",
+                artifact_rel_path=f"{cache_namespace}/{rel_manifest_path}",
+                settings=settings,
+                oci_layer_paths=oci_layer_paths,
+            )
+        finally:
+            shutil.rmtree(layer_dir, ignore_errors=True)
         _record_artifact_requested(settings, "oci", rel_manifest_path, "MISS")
         return base_file, "MISS"
 
@@ -1814,6 +1945,7 @@ async def get_catalog_vulnerabilities(
                 cve_ids = list(prov.get("cve_ids") or [])
                 tag_entry = latest_tags.get(f"oci:{repo_part}", {})
                 comp_tags = ["latest"] if (tag_part == "latest" or tag_entry.get("latest_version") == (tag_part or "latest")) else []
+                crypto_posture = extract_cbom_risk_summary(path.with_name(f"{path.name}.cbom.cdx.json"))
                 cached_components.append(
                     {
                         "ecosystem": "oci",
@@ -1837,6 +1969,7 @@ async def get_catalog_vulnerabilities(
                         "vulnerability_status": _classify_vulnerability_status(
                             cve_status, max_cvss, settings.cvss_fail_threshold
                         ),
+                        "crypto_posture": crypto_posture,
                         "last_scanned_at": str(prov.get("timestamp", "")),
                     }
                 )
@@ -1860,6 +1993,7 @@ async def get_catalog_vulnerabilities(
             cve_ids = list(prov.get("cve_ids") or [])
             tag_entry = latest_tags.get(f"{eco}:{pkg_name or rel}", {})
             comp_tags = ["latest"] if tag_entry.get("latest_version") == (pkg_version or "unknown") else []
+            crypto_posture = extract_cbom_risk_summary(path.with_name(f"{path.name}.cbom.cdx.json"))
             cached_components.append(
                 {
                     "ecosystem": eco,
@@ -1882,6 +2016,7 @@ async def get_catalog_vulnerabilities(
                     "vulnerability_status": _classify_vulnerability_status(
                         cve_status, max_cvss, settings.cvss_fail_threshold
                     ),
+                    "crypto_posture": crypto_posture,
                     "last_scanned_at": str(prov.get("timestamp", "")),
                 }
             )
@@ -1910,6 +2045,28 @@ async def get_catalog_vulnerabilities(
         "vulnerable": sum(1 for c in cached_components if c["vulnerability_status"] == "VULNERABLE"),
         "unscanned": sum(1 for c in cached_components if c["vulnerability_status"] == "UNSCANNED"),
         "quarantined": len(quarantined),
+        "crypto_active_risk_components": sum(
+            1 for c in cached_components if (c.get("crypto_posture") or {}).get("active_risk_count", 0) > 0
+        ),
+        "crypto_passive_risk_components": sum(
+            1 for c in cached_components if (c.get("crypto_posture") or {}).get("passive_risk_count", 0) > 0
+        ),
+        "cert_expired_components": sum(
+            1 for c in cached_components if (c.get("crypto_posture") or {}).get("cert_expired", 0) > 0
+        ),
+        "cert_sha1_root_components": sum(
+            1 for c in cached_components if (c.get("crypto_posture") or {}).get("cert_sha1_roots", 0) > 0
+        ),
+        "pqc_compiled_unused_components": sum(
+            1
+            for c in cached_components
+            if (c.get("crypto_posture") or {}).get("pqc_adoption_status") == "PQC_COMPILED_BUT_UNUSED"
+        ),
+        "manifest_only_uninspected": sum(
+            1
+            for c in cached_components
+            if (c.get("crypto_posture") or {}).get("scan_status") == "MANIFEST_ONLY_UNINSPECTED"
+        ),
     }
     return {
         "cvss_fail_threshold": settings.cvss_fail_threshold,
@@ -1920,6 +2077,52 @@ async def get_catalog_vulnerabilities(
         "quarantined": quarantined,
         "latest_tags": latest_tags,
         "history": history,
+    }
+
+
+@app.get("/catalog/crypto-risk")
+async def get_catalog_crypto_risk(
+    settings: Annotated[Settings, Depends(get_settings)],
+    ecosystem: str | None = None,
+    components: str | None = None,
+    min_risk_level: str | None = None,
+    only_active_risks: bool = False,
+    only_pqc_unused: bool = False,
+) -> dict[str, Any]:
+    """Return active vs. passive cryptographic risks, cert hygiene, and PQC compiled-vs-coding posture."""
+    vuln_data = await get_catalog_vulnerabilities(
+        settings=settings,
+        ecosystem=ecosystem,
+        components=components,
+        verify_signatures=False,
+    )
+    min_rank = RISK_LEVEL_ORDER.get(str(min_risk_level or "").upper(), 0)
+    entries: list[dict[str, Any]] = []
+    for comp in vuln_data["components"]:
+        posture = comp.get("crypto_posture") or {}
+        if min_rank and RISK_LEVEL_ORDER.get(str(posture.get("risk_level", "NONE")).upper(), 0) < min_rank:
+            continue
+        if only_active_risks and posture.get("active_risk_count", 0) <= 0:
+            continue
+        if only_pqc_unused and posture.get("pqc_adoption_status") != "PQC_COMPILED_BUT_UNUSED":
+            continue
+        entries.append(
+            {
+                "ecosystem": comp["ecosystem"],
+                "namespace": comp.get("namespace", ""),
+                "component": comp["component"],
+                "version": comp["version"],
+                "artifact": comp["artifact"],
+                "crypto_posture": posture,
+            }
+        )
+
+    return {
+        "ecosystem_filter": vuln_data["ecosystem_filter"],
+        "component_filter": vuln_data["component_filter"],
+        "count": len(entries),
+        "summary": vuln_data["summary"],
+        "components": entries,
     }
 
 
@@ -2933,6 +3136,8 @@ def _read_bom_payload_with_signatures(
         "artifact_name": base_file.name,
         "artifact_sha256": artifact_sha256,
     }
+    if bom_type == "cbom":
+        entry["risk_summary"] = extract_cbom_risk_summary(doc)
     if include_signatures:
         gpg_sig = bom_file.with_name(f"{bom_file.name}.asc")
         mldsa_sig = bom_file.with_name(f"{bom_file.name}.mldsa65")
@@ -3187,17 +3392,36 @@ async def get_oci_referrers(
             if artifactType and artifactType != art_type:
                 continue
             bom_sha = compute_file_sha256(bom_path)
+            annotations: dict[str, str] = {
+                "org.opencontainers.image.title": f"{btype}.cyclonedx.json",
+                "io.cyclonedx.bomFormat": "CycloneDX",
+                "io.cyclonedx.type": btype,
+            }
+            if btype == "cbom":
+                risk_summary = extract_cbom_risk_summary(bom_path)
+                annotations.update(
+                    {
+                        "trusted-oss.crypto.scan-status": str(risk_summary["scan_status"]),
+                        "trusted-oss.crypto.scan-scope": str(risk_summary["scan_scope"]),
+                        "trusted-oss.crypto.risk-level": str(risk_summary["risk_level"]),
+                        "trusted-oss.crypto.active-risks": str(risk_summary["active_risk_count"]),
+                        "trusted-oss.crypto.passive-risks": str(risk_summary["passive_risk_count"]),
+                        "trusted-oss.crypto.cert-total": str(risk_summary["cert_total"]),
+                        "trusted-oss.crypto.cert-expired": str(risk_summary["cert_expired"]),
+                        "trusted-oss.crypto.cert-sha1-roots": str(risk_summary["cert_sha1_roots"]),
+                        "trusted-oss.crypto.cert-weak-keys": str(risk_summary["cert_weak_keys"]),
+                        "trusted-oss.crypto.pqc-adoption": str(risk_summary["pqc_adoption_status"]),
+                        "trusted-oss.crypto.compiled-risk": str(risk_summary["compiled_risk"]),
+                        "trusted-oss.crypto.coding-risk": str(risk_summary["coding_risk"]),
+                    }
+                )
             descriptors.append(
                 {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
                     "artifactType": art_type,
                     "size": bom_path.stat().st_size,
                     "digest": f"sha256:{bom_sha}",
-                    "annotations": {
-                        "org.opencontainers.image.title": f"{btype}.cyclonedx.json",
-                        "io.cyclonedx.bomFormat": "CycloneDX",
-                        "io.cyclonedx.type": btype,
-                    },
+                    "annotations": annotations,
                 }
             )
 

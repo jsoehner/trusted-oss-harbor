@@ -69,8 +69,14 @@ on:
         description: "Health record vulnerability classification (CLEAN, VULNERABLE, UNSCANNED)"
         value: ${{ jobs.verify-component.outputs.vulnerability_status }}
       cbom_scan_status:
-        description: "CycloneDX CBOM status (CRYPTO_ASSETS_DETECTED or VERIFIED_INERT)"
+        description: "CycloneDX CBOM status (CRYPTO_ASSETS_DETECTED, MANIFEST_ONLY_UNINSPECTED, or VERIFIED_INERT)"
         value: ${{ jobs.verify-component.outputs.cbom_scan_status }}
+      crypto_risk_level:
+        description: "Overall CBOM crypto risk level (CRITICAL, HIGH, MEDIUM, LOW, NONE, UNKNOWN)"
+        value: ${{ jobs.verify-component.outputs.crypto_risk_level }}
+      pqc_adoption_status:
+        description: "PQC compiled vs. coding adoption status"
+        value: ${{ jobs.verify-component.outputs.pqc_adoption_status }}
 
   workflow_dispatch:
     inputs:
@@ -117,6 +123,8 @@ jobs:
       artifact_sha256: ${{ steps.gate.outputs.artifact_sha256 }}
       vulnerability_status: ${{ steps.gate.outputs.vulnerability_status }}
       cbom_scan_status: ${{ steps.gate.outputs.cbom_scan_status }}
+      crypto_risk_level: ${{ steps.gate.outputs.crypto_risk_level }}
+      pqc_adoption_status: ${{ steps.gate.outputs.pqc_adoption_status }}
 
     steps:
       - name: Install ORAS CLI
@@ -239,6 +247,9 @@ jobs:
           failures = []
           artifact_sha256 = ""
           cbom_scan_status = "UNKNOWN"
+          crypto_risk_level = "UNKNOWN"
+          pqc_adoption_status = "UNKNOWN"
+          cbom_risk_summary = {}
 
           # --- Gate 2: Fetch & cryptographically verify signed SBOM and CBOM ---
           for bom_type in ("sbom", "cbom"):
@@ -276,10 +287,14 @@ jobs:
 
               if bom_type == "cbom":
                   doc = payload.get("cbom") or {}
-                  props = (doc.get("metadata") or {}).get("component", {}).get("properties") or []
-                  for p in props:
-                      if p.get("name") == "trusted-oss:crypto-scan-status":
-                          cbom_scan_status = str(p.get("value", "UNKNOWN"))
+                  cbom_risk_summary = payload.get("risk_summary") or {}
+                  props = (doc.get("metadata") or {}).get("properties") or (doc.get("metadata") or {}).get("component", {}).get("properties") or []
+                  prop_map = {str(p.get("name", "")): str(p.get("value", "")) for p in props if isinstance(p, dict)}
+                  cbom_scan_status = prop_map.get("trusted-oss:crypto-scan-status", cbom_risk_summary.get("scan_status", "UNKNOWN"))
+                  crypto_risk_level = prop_map.get("trusted-oss:crypto-risk-level", cbom_risk_summary.get("risk_level", "UNKNOWN"))
+                  pqc_adoption_status = prop_map.get("trusted-oss:pqc-adoption-status", cbom_risk_summary.get("pqc_adoption_status", "UNKNOWN"))
+                  if int(prop_map.get("trusted-oss:cert-expired", cbom_risk_summary.get("cert_expired", 0)) or 0) > 0:
+                      failures.append("CBOM detected expired X.509 certificate(s) in artifact truststore")
 
           # --- Gate 3: Query Component Health Record (/catalog/vulnerabilities) ---
           vuln_q = urllib.parse.urlencode({
@@ -330,6 +345,8 @@ jobs:
               fh.write(f"artifact_sha256={artifact_sha256}\n")
               fh.write(f"vulnerability_status={vuln_status}\n")
               fh.write(f"cbom_scan_status={cbom_scan_status}\n")
+              fh.write(f"crypto_risk_level={crypto_risk_level}\n")
+              fh.write(f"pqc_adoption_status={pqc_adoption_status}\n")
 
           # Write human-readable Step Summary decision table
           summary_lines = [
@@ -342,7 +359,8 @@ jobs:
               f"| **Artifact SHA-256** | `{artifact_sha256 or 'n/a'}` |",
               f"| **GPG Signature (`.asc`)** | `{sig_valid}` |",
               f"| **PQC Signature (ML-DSA-65)** | `{pqc_signed}` (required={require_pqc}) |",
-              f"| **Signed CycloneDX SBOM/CBOM** | `cbom_scan_status={cbom_scan_status}` |",
+              f"| **Signed CycloneDX SBOM/CBOM** | `cbom_scan_status={cbom_scan_status}`, `risk_level={crypto_risk_level}` |",
+              f"| **PQC Compiled vs. Coding** | `{pqc_adoption_status}` (compiled_risk=`{cbom_risk_summary.get('compiled_risk', 'UNKNOWN')}`, coding_risk=`{cbom_risk_summary.get('coding_risk', 'UNKNOWN')}`) |",
               f"| **Malware (ClamAV)** | `{clamav_status}` |",
               f"| **Vulnerability Health** | `{vuln_status}` (max CVSS `{max_cvss}` < `{max_cvss_limit}`) |",
           ]
