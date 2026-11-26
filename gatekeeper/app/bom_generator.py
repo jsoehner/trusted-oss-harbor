@@ -720,7 +720,7 @@ def inspect_oci_layers(
     cert_blobs: dict[str, bytes] = {}
     openssl_configs: dict[str, str] = {}
     java_sec_configs: dict[str, str] = {}
-    apk_db_text = ""
+    apk_db_chunks: list[str] = []
     dpkg_chunks: list[str] = []
 
     scanned_files = 0
@@ -755,7 +755,7 @@ def inspect_oci_layers(
 
                     rel_lower = rel.lower()
                     base_lower = base.lower()
-                    is_apk_db = rel_lower == "lib/apk/db/installed"
+                    is_apk_db = rel_lower in ("lib/apk/db/installed", "usr/lib/apk/db/installed")
                     is_dpkg_db = rel_lower == "var/lib/dpkg/status" or rel_lower.startswith("var/lib/dpkg/status.d/")
                     is_jmod = base_lower == "modules" and "/jvm/" in f"/{rel_lower}"
                     is_cert = _is_cert_store_member(rel_lower)
@@ -783,7 +783,7 @@ def inspect_oci_layers(
                     data = extracted.read(cap)
 
                     if is_apk_db:
-                        apk_db_text = data.decode("utf-8", errors="replace")
+                        apk_db_chunks.append(data.decode("utf-8", errors="replace"))
                         continue
 
                     if is_dpkg_db:
@@ -873,7 +873,14 @@ def inspect_oci_layers(
     cert_summary = evaluate_certificates(certs_by_fp, now=now)
     openssl_findings = [inspect_openssl_cnf(txt, loc) for loc, txt in sorted(openssl_configs.items())]
     java_findings = [inspect_java_security(txt, loc) for loc, txt in sorted(java_sec_configs.items())]
-    apk_packages = parse_apk_installed_packages(apk_db_text) if apk_db_text else []
+    raw_apk_packages = parse_apk_installed_packages("\n\n".join(apk_db_chunks)) if apk_db_chunks else []
+    seen_apk: set[tuple[str, str]] = set()
+    apk_packages: list[dict[str, str]] = []
+    for pkg in raw_apk_packages:
+        key = (pkg.get("name", ""), pkg.get("version", ""))
+        if key not in seen_apk:
+            seen_apk.add(key)
+            apk_packages.append(pkg)
     deb_packages = parse_dpkg_status("\n\n".join(dpkg_chunks)) if dpkg_chunks else []
     components = _build_crypto_components(found, cert_summary)
 

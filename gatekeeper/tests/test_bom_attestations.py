@@ -859,3 +859,32 @@ def test_backfill_cached_boms_ecosystem_filter(tmp_path: Path, monkeypatch):
     assert pdata["generated"] == 1
     assert pypi_file.with_name(f"{pypi_file.name}.sbom.cdx.json").is_file()
     assert not maven_file.with_name(f"{maven_file.name}.sbom.cdx.json").is_file()
+
+
+def test_inspect_oci_layers_wolfi_usrmerge_apk_db(tmp_path: Path):
+    """Verify Wolfi/Chainguard usrmerge usr/lib/apk/db/installed across multiple layers populates SBOM components."""
+    import io
+    import tarfile
+    from app.bom_generator import inspect_oci_layers
+
+    layer0 = tmp_path / "layer0.tar.gz"
+    layer1 = tmp_path / "layer1.tar.gz"
+    with tarfile.open(layer0, "w:gz") as tf:
+        raw = b"P:openjdk-27-jre\nV:27.0.1.1-r2\nT:OpenJDK 27 JRE\n\nP:glibc-2.44\nV:2.44-r28\n\n"
+        ti = tarfile.TarInfo(name="usr/lib/apk/db/installed")
+        ti.size = len(raw)
+        tf.addfile(ti, io.BytesIO(raw))
+    with tarfile.open(layer1, "w:gz") as tf:
+        raw = b"P:openssl-4.0-libcrypto\nV:4.0.3-r8\n\nP:glibc-2.44\nV:2.44-r28\n\n"
+        ti = tarfile.TarInfo(name="usr/lib/apk/db/installed")
+        ti.size = len(raw)
+        tf.addfile(ti, io.BytesIO(raw))
+
+    res = inspect_oci_layers([layer0, layer1])
+    pkgs = {(p["name"], p["version"]) for p in res["apk_packages"]}
+    assert pkgs == {
+        ("openjdk-27-jre", "27.0.1.1-r2"),
+        ("glibc-2.44", "2.44-r28"),
+        ("openssl-4.0-libcrypto", "4.0.3-r8"),
+    }
+    assert len(res["apk_packages"]) == 3
