@@ -446,11 +446,12 @@ if ($Namespace -eq "chainguard-cache") {
 }
 
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$PqcVerifyScript = Join-Path $RepoRoot "client-templates\pqc-verify.py"
+$PqcVerifyScript = Join-Path (Join-Path $RepoRoot "client-templates") "pqc-verify.py"
 
 $CreatedTempDir = $false
 if ([string]::IsNullOrWhiteSpace($ProofDir)) {
-    $ProofDir = Join-Path $env:TEMP ("trusted-oss-demo-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+    $tempRoot = if ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
+    $ProofDir = Join-Path $tempRoot ("trusted-oss-demo-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
     $CreatedTempDir = $true
 }
 New-Item -ItemType Directory -Path $ProofDir -Force | Out-Null
@@ -487,7 +488,7 @@ try {
     $orasCmd = Get-Command oras -ErrorAction SilentlyContinue
     if ($null -eq $orasCmd) {
         Write-Host ""
-        Write-Host "  [WARN] 'oras' CLI was not found on PATH. Install with: winget install ORASProject.ORAS" -ForegroundColor Yellow
+        Write-Host "  [WARN] 'oras' CLI was not found on PATH. Install via 'winget install ORASProject.ORAS' (Windows) or 'brew install oras' (macOS/Linux)." -ForegroundColor Yellow
         Write-Host "         Stage 2 will require 'oras' to run ORAS discovery & blob fetch." -ForegroundColor Yellow
     } else {
         $orasVer = (& oras version 2>&1 | Select-String "Version:" | Select-Object -First 1)
@@ -550,7 +551,7 @@ try {
     # --------------------------------------------------------------------------
     Write-Banner "STAGE 2 — RE-REQUEST VIA ORAS & VERIFY SBOM + CBOM (OCI 1.1 REFERRERS)"
     if ($null -eq $orasCmd) {
-        throw "The 'oras' CLI is required for Stage 2. Install it via 'winget install ORASProject.ORAS' and re-run."
+        throw "The 'oras' CLI is required for Stage 2. Install via 'winget install ORASProject.ORAS' (Windows) or 'brew install oras' (macOS/Linux) and re-run."
     }
 
     Write-Section "2.1 Resolve Immutable Manifest Digest via ORAS"
@@ -767,6 +768,10 @@ try {
         Write-Section "3.3 Local Classical GPG (RSA-3072) Verification"
         $gpgHome = Join-Path $ProofDir "gnupg"
         New-Item -ItemType Directory -Path $gpgHome -Force | Out-Null
+        if ($PSVersionTable.PSVersion.Major -ge 6 -and -not $IsWindows) {
+            $chmodCmd = Get-Command chmod -ErrorAction SilentlyContinue
+            if ($null -ne $chmodCmd) { & chmod 700 $gpgHome }
+        }
         $prevGpgHome = $env:GNUPGHOME
         $env:GNUPGHOME = $gpgHome
         try {
@@ -782,10 +787,25 @@ try {
         Write-Host "  [INFO] Skipping local 'gpg --verify' (gpg not found on PATH)." -ForegroundColor DarkYellow
     }
 
-    $pythonExe = Join-Path $RepoRoot ".venv\Scripts\python.exe"
-    if (-not (Test-Path $pythonExe)) {
-        $pyCmd = Get-Command python -ErrorAction SilentlyContinue
-        $pythonExe = if ($null -ne $pyCmd) { $pyCmd.Source } else { "" }
+    $pythonCandidates = @(
+        (Join-Path (Join-Path (Join-Path $RepoRoot ".venv") "Scripts") "python.exe"),
+        (Join-Path (Join-Path (Join-Path $RepoRoot ".venv") "bin") "python")
+    )
+    $pythonExe = ""
+    foreach ($cand in $pythonCandidates) {
+        if (Test-Path $cand) {
+            $pythonExe = $cand
+            break
+        }
+    }
+    if (-not $pythonExe) {
+        foreach ($cmdName in @("python3", "python")) {
+            $pyCmd = Get-Command $cmdName -ErrorAction SilentlyContinue
+            if ($null -ne $pyCmd) {
+                $pythonExe = $pyCmd.Source
+                break
+            }
+        }
     }
 
     if ($pythonExe -and (Test-Path $PqcVerifyScript) -and $allSigsFetched) {
