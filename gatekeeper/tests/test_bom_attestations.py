@@ -888,3 +888,61 @@ def test_inspect_oci_layers_wolfi_usrmerge_apk_db(tmp_path: Path):
         ("openssl-4.0-libcrypto", "4.0.3-r8"),
     }
     assert len(res["apk_packages"]) == 3
+
+
+def test_virtual_oci_namespace_referrers_and_blobs(tmp_path: Path):
+    """Verify /v2/virtual/{namespace}/{repo}/referrers and /blobs resolve and enforce path containment."""
+    import hashlib
+
+    settings = Settings(
+        OSS_DATA_ROOT=tmp_path,
+        CLAMAV_REQUIRED=False,
+        CVE_SCANNER_MODE="none",
+        GATEKEEPER_ADMIN_TOKEN="test-secret-token-1234",
+        PQC_SIGNING_ENABLED=False,
+        BOM_GENERATION_ENABLED=True,
+        CVE_RESCAN_INTERVAL_SECONDS=0,
+    )
+    manifests_dir = (
+        settings.oss_data_root
+        / "harbor"
+        / "registry"
+        / "ghcr-cache"
+        / "jsoehner"
+        / "enterprise-command-center"
+        / "manifests"
+    )
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+    manifest_bytes = b'{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}'
+    manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+    (manifests_dir / "sha-f84ba00").write_bytes(manifest_bytes)
+    (manifests_dir / "sha-f84ba00.sha256").write_text(manifest_sha, encoding="utf-8")
+
+    cbom_bytes = b'{"bomFormat":"CycloneDX","specVersion":"1.6","components":[]}'
+    sbom_bytes = b'{"bomFormat":"CycloneDX","specVersion":"1.6","metadata":{}}'
+    cbom_sha = hashlib.sha256(cbom_bytes).hexdigest()
+    (manifests_dir / "sha-f84ba00.cbom.cdx.json").write_bytes(cbom_bytes)
+    (manifests_dir / "sha-f84ba00.sbom.cdx.json").write_bytes(sbom_bytes)
+
+    app.state.settings = settings
+    client = TestClient(app)
+
+    ref_resp = client.get(
+        f"/v2/virtual/ghcr-cache/jsoehner/enterprise-command-center/referrers/sha256:{manifest_sha}"
+    )
+    assert ref_resp.status_code == 200
+    ref_data = ref_resp.json()
+    assert len(ref_data["manifests"]) == 2
+    assert {m["annotations"]["io.cyclonedx.type"] for m in ref_data["manifests"]} == {"cbom", "sbom"}
+
+    blob_url = f"/v2/virtual/ghcr-cache/jsoehner/enterprise-command-center/blobs/sha256:{cbom_sha}"
+    head_resp = client.head(blob_url)
+    assert head_resp.status_code == 200
+    assert head_resp.headers.get("docker-content-digest") == f"sha256:{cbom_sha}"
+
+    get_resp = client.get(blob_url)
+    assert get_resp.status_code == 200
+    assert get_resp.content == cbom_bytes
+
+    trav_resp = client.get(f"/v2/virtual/../etc/referrers/sha256:{manifest_sha}")
+    assert trav_resp.status_code in (400, 404)

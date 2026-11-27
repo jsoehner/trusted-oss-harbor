@@ -3425,6 +3425,8 @@ async def trigger_backfill_boms(
 
 def _resolve_oci_manifests_dir(settings: Settings, namespace: str, repo_path: str) -> Path:
     """Safely resolve an OCI namespace/repo manifests directory inside harbor/registry."""
+    if namespace == "virtual" and "/" in repo_path:
+        namespace, repo_path = repo_path.split("/", 1)
     registry_root = settings.oss_data_root / "harbor" / "registry"
     try:
         cache_root = (

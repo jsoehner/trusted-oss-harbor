@@ -455,7 +455,7 @@ For Windows operators (PowerShell 5.1 and PowerShell 7+), the repository include
 
 #### Key Features
 - **Single `<repo>:<tag>` Parameter (`-Image`)**: Accepts `repo:tag` (e.g., `chainguard/jre:latest`), `repo@sha256:...`, or `repo` (defaults to `:latest`) as a positional or named argument.
-- **Auto-Derived `<repo>-cache` Namespace**: Automatically derives `-Namespace` from the leading repository segment plus `-cache` (e.g., `chainguard/jre:latest` $\rightarrow$ `chainguard-cache`), with optional explicit `-Namespace` override (e.g., `-Namespace "docker-cache"` for `apache/airflow:slim-latest-python3.12`).
+- **Registry-Host Normalization & Auto-Derived `<repo>-cache` Namespace**: Strips known upstream registry hosts and maps them to Gatekeeper virtual aliases when `-Namespace` is omitted (`ghcr.io` $\rightarrow$ `ghcr-cache`, `cgr.dev` $\rightarrow$ `chainguard-cache`, `docker.io` / `registry-1.docker.io` / `index.docker.io` $\rightarrow$ `docker-cache` with automatic `library/` prefixing for single-segment official repos, and `quay.io` $\rightarrow$ `quay-cache`), falling back to `<repo>-cache` (e.g., `chainguard/jre:latest` $\rightarrow$ `chainguard-cache`) or an explicit `-Namespace` override.
 - **No-Parameter Usage Banner**: Running with no arguments echoes usage syntax and copy-pasteable examples to the console without making network calls.
 - **Collapsed Headers & `[DOWNLOAD]` Status**: Collapses HTTP response headers into a single status line (`HTTP 200 OK (cache: HIT | 1111 bytes | application/vnd.oci.image.index.v1+json)`) and logs a `[DOWNLOAD]` status line for every saved manifest, SBOM, CBOM, public key, and detached signature.
 - **Parsed `Key : Value` Summaries & Verbosity Controls (`-Detailed`, `-RawJson`, `-ShowHeaders`)**: Parses all JSON responses (`/healthz`, `/v2/`, manifest platforms, ORAS referrers, SBOM packages, CBOM risk posture, `/catalog/vulnerabilities`, `/catalog/advisories`, `/catalog/crypto-risk`, and `/audit/provenance`) into compact, color-coded `Key : Value` summaries by default. Pass `-Detailed` to expand the full SBOM package list and all catalog entries, `-RawJson` to also dump full raw JSON bodies, and `-ShowHeaders` to expand all raw HTTP response headers plus `oras --debug` wire traces.
@@ -476,6 +476,9 @@ For Windows operators (PowerShell 5.1 and PowerShell 7+), the repository include
 
 # Explicit namespace override for Docker Hub org repos + keep downloaded proof files
 .\scripts\demo_container_acquisition_oras.ps1 "apache/airflow:slim-latest-python3.12" -Namespace "docker-cache" -KeepProofDir
+
+# Fully qualified upstream reference (auto-maps 'ghcr.io' -> 'ghcr-cache' virtual route)
+.\scripts\demo_container_acquisition_oras.ps1 "ghcr.io/jsoehner/enterprise-command-center:sha-f84ba00" -Detailed
 ```
 
 > [!TIP]
@@ -487,7 +490,7 @@ For Windows operators (PowerShell 5.1 and PowerShell 7+), the repository include
 > ```
 
 > [!NOTE]
-> **OCI 1.1 Referrers `Content-Type` Conformance (`oras` v1.4+):** `gatekeeper/app/main.py` (`get_oci_referrers`) serves `Content-Type: application/vnd.oci.image.index.v1+json` per the OCI Distribution Spec v1.1 so `oras discover` v1.4+ populates referrers natively. Against older deployed instances returning `application/json`, `scripts/demo_container_acquisition_oras.ps1` automatically logs a note, queries `/v2/{namespace}/{repo}/referrers/{digest}` directly, and continues with `oras blob fetch`.
+> **OCI 1.1 Referrers & Virtual Namespace Routing (`oras` v1.4+):** `gatekeeper/app/main.py` (`get_oci_referrers`) serves `Content-Type: application/vnd.oci.image.index.v1+json` per the OCI Distribution Spec v1.1 so `oras discover` populates referrers natively. `_resolve_oci_manifests_dir()` also unwraps `/v2/virtual/{namespace}/{repo}/referrers/{digest}` and `/blobs/{digest}` while preserving strict path containment so virtual repositories behave uniformly under ORAS. Against older deployed Gatekeeper instances where `oras discover` on `/v2/virtual/...` returns no referrers, `scripts/demo_container_acquisition_oras.ps1` falls back gracefully to `GET /v2/{namespace}/{repo}/referrers/{digest}` and continues with `oras blob fetch`.
 
 ---
 

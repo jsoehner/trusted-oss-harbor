@@ -25,6 +25,9 @@
 
 .EXAMPLE
     .\scripts\demo_container_acquisition_oras.ps1 "apache/airflow:slim-latest-python3.12" -Namespace "docker-cache" -Detailed -TranscriptPath ".\demo-output.log"
+
+.EXAMPLE
+    .\scripts\demo_container_acquisition_oras.ps1 "ghcr.io/jsoehner/enterprise-command-center:sha-f84ba00" -Detailed
 #>
 [CmdletBinding()]
 param(
@@ -72,6 +75,9 @@ if ($PSBoundParameters.Count -eq 0) {
     Write-Host ""
     Write-Host "  # Override namespace explicitly and save the full request/response transcript" -ForegroundColor DarkGray
     Write-Host "  .\scripts\demo_container_acquisition_oras.ps1 `"apache/airflow:slim-latest-python3.12`" -Namespace `"docker-cache`" -Detailed -TranscriptPath `".\demo-output.log`"" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "  # Registry host prefix is normalized automatically (e.g., ghcr.io -> ghcr-cache)" -ForegroundColor DarkGray
+    Write-Host "  .\scripts\demo_container_acquisition_oras.ps1 `"ghcr.io/jsoehner/enterprise-command-center:sha-f84ba00`" -Detailed" -ForegroundColor Green
     Write-Host ""
     exit 0
 }
@@ -439,7 +445,32 @@ if ($trimmedImage -match '^([^@]+)@(sha256:[a-fA-F0-9]{64})$') {
     $RefSeparator = ":"
 }
 
+$RegistryAliasMap = @{
+    "ghcr.io"              = "ghcr-cache"
+    "cgr.dev"              = "chainguard-cache"
+    "docker.io"            = "docker-cache"
+    "registry-1.docker.io" = "docker-cache"
+    "index.docker.io"      = "docker-cache"
+    "quay.io"              = "quay-cache"
+}
+
 $NamespaceSource = "explicit"
+$repoParts = $Repo -split "/"
+if ($repoParts.Count -ge 2) {
+    $firstSeg = $repoParts[0].ToLowerInvariant()
+    if ($RegistryAliasMap.ContainsKey($firstSeg)) {
+        $matchedHost = $firstSeg
+        $Repo = ($repoParts[1..($repoParts.Count - 1)] -join "/")
+        if ($matchedHost -in @("docker.io", "registry-1.docker.io", "index.docker.io") -and ($Repo -notmatch "/")) {
+            $Repo = "library/$Repo"
+        }
+        if ([string]::IsNullOrWhiteSpace($Namespace)) {
+            $Namespace = $RegistryAliasMap[$matchedHost]
+            $NamespaceSource = "mapped from registry host '$matchedHost'"
+        }
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($Namespace)) {
     $repoBase = ($Repo -split "/")[0].ToLowerInvariant()
     $Namespace = if ($repoBase.EndsWith("-cache")) { $repoBase } else { "${repoBase}-cache" }
@@ -622,17 +653,22 @@ try {
     Write-Host "  [PASS] Local manifest.json matches resolved digest ($actualManifestSha)." -ForegroundColor Green
 
     $OrasReferrerRef = "${RegistryHost}/${Namespace}/${Repo}@${ManifestDigest}"
+    $OrasDiscoverRef = if ($Namespace -eq "chainguard-cache") { $OrasReferrerRef } else { "${RegistryHost}/virtual/${Namespace}/${Repo}@${ManifestDigest}" }
 
     Write-Section "2.3 Discover Attached CycloneDX 1.6 Referrers (Tree View)"
-    $null = Invoke-LoggedCli -Command "oras" -Arguments (@("discover") + $OrasVerboseArgs + @("--artifact-type", "application/vnd.cyclonedx+json", "--format", "tree", $OrasReferrerRef))
+    $null = Invoke-LoggedCli -Command "oras" -Arguments (@("discover") + $OrasVerboseArgs + @("--artifact-type", "application/vnd.cyclonedx+json", "--format", "tree", $OrasDiscoverRef)) -AllowNonZeroExit
 
     Write-Section "2.4 Discover Attached CycloneDX 1.6 Referrers (Parsed)"
-    $discoverJsonRes = Invoke-LoggedCli -Command "oras" -Arguments (@("discover") + $OrasCommonArgs + @("--artifact-type", "application/vnd.cyclonedx+json", "--format", "json", $OrasReferrerRef)) -QuietOutput:(-not $RawJson)
-    $referrersObj = $discoverJsonRes.Output | ConvertFrom-Json
+    $discoverJsonRes = Invoke-LoggedCli -Command "oras" -Arguments (@("discover") + $OrasCommonArgs + @("--artifact-type", "application/vnd.cyclonedx+json", "--format", "json", $OrasDiscoverRef)) -QuietOutput:(-not $RawJson) -AllowNonZeroExit
 
     $referrerList = @()
-    if ($referrersObj.PSObject.Properties['referrers'] -and $null -ne $referrersObj.referrers) {
-        $referrerList = @($referrersObj.referrers)
+    if ($discoverJsonRes.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($discoverJsonRes.Output)) {
+        try {
+            $referrersObj = $discoverJsonRes.Output | ConvertFrom-Json
+            if ($referrersObj.PSObject.Properties['referrers'] -and $null -ne $referrersObj.referrers) {
+                $referrerList = @($referrersObj.referrers)
+            }
+        } catch {}
     }
 
     if ($referrerList.Count -eq 0) {
